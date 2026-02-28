@@ -122,3 +122,57 @@ add_executable(llama-mtmd-debug debug/mtmd-debug.cpp)
 set_target_properties(llama-mtmd-debug PROPERTIES OUTPUT_NAME llama-mtmd-debug)
 target_link_libraries(llama-mtmd-debug PRIVATE llama-common mtmd Threads::Threads)
 target_compile_features(llama-mtmd-debug PRIVATE cxx_std_17)
+
+# ============================================================
+# EP Vision variant of mtmd-cli
+# Uses Spacemit EP ONNX vision engine instead of CLIP/GGUF
+# ============================================================
+option(MTMD_BUILD_EP_CLI "Build mtmd-cli with Spacemit EP vision support" OFF)
+
+if(MTMD_BUILD_EP_CLI)
+    if(NOT DEFINED SPACEMIT_EP_DIR)
+        message(FATAL_ERROR "SPACEMIT_EP_DIR must be set when MTMD_BUILD_EP_CLI=ON")
+    endif()
+    if(NOT DEFINED ONNXRUNTIME_INC_DIR)
+        message(FATAL_ERROR "ONNXRUNTIME_INC_DIR must be set when MTMD_BUILD_EP_CLI=ON")
+    endif()
+    if(NOT DEFINED ONNXRUNTIME_LIB_DIR)
+        message(FATAL_ERROR "ONNXRUNTIME_LIB_DIR must be set when MTMD_BUILD_EP_CLI=ON")
+    endif()
+
+    set(EP_TARGET llama-mtmd-cli-ep)
+    add_executable(${EP_TARGET}
+        mtmd-cli-ep.cpp
+        ep-vision-wrapper.cpp
+        ${SPACEMIT_EP_DIR}/src/llm/spine_vision_engine.cc
+        ${SPACEMIT_EP_DIR}/src/llm/spine_llm_argparser.cc
+    )
+    set_target_properties(${EP_TARGET} PROPERTIES OUTPUT_NAME llama-mtmd-cli-ep)
+
+    target_include_directories(${EP_TARGET} PRIVATE
+        .
+        ../..
+        ../../vendor
+        ${SPACEMIT_EP_DIR}/src/llm
+        ${ONNXRUNTIME_INC_DIR}
+    )
+
+    target_link_directories(${EP_TARGET} PRIVATE
+        ${ONNXRUNTIME_LIB_DIR}
+    )
+
+    target_link_libraries(${EP_TARGET} PRIVATE
+        llama-common
+        llama
+        ggml
+        onnxruntime
+        dl
+        Threads::Threads
+    )
+
+    target_compile_features(${EP_TARGET} PRIVATE cxx_std_17)
+
+    if(LLAMA_TOOLS_INSTALL)
+        install(TARGETS ${EP_TARGET} RUNTIME)
+    endif()
+endif()
