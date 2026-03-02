@@ -1,6 +1,7 @@
 #include "llama-vocab.h"
 
 #include "ggml.h"
+#include "ggml-profile.h"
 #include "gguf.h"
 #include "llama-impl.h"
 #include "llama-model-loader.h"
@@ -4090,7 +4091,10 @@ int32_t llama_tokenize(
                      int32_t   n_tokens_max,
                         bool   add_special,
                         bool   parse_special) {
-    return vocab->tokenize(text, text_len, tokens, n_tokens_max, add_special, parse_special);
+    ggml_trace_log_begin("llama_tokenize", "Tokenizer", NULL);
+    int32_t result = vocab->tokenize(text, text_len, tokens, n_tokens_max, add_special, parse_special);
+    ggml_trace_log_end("llama_tokenize", "Tokenizer", NULL);
+    return result;
 }
 
 int32_t llama_token_to_piece(

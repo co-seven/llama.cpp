@@ -10,6 +10,7 @@
 #include "llama-model.h"
 #include "llama-ext.h"
 #include "llama.h"
+#include "ggml-profile.h"
 
 #include <cinttypes>
 #include <cmath>
@@ -3761,10 +3762,20 @@ int32_t llama_encode(
 int32_t llama_decode(
         llama_context * ctx,
           llama_batch   batch) {
+    // Distinguish between prefill and decode phases
+    const char * phase_name = (batch.n_tokens > 1) ? "llama_decode_prefill" : "llama_decode_generate";
+
+    char args[128];
+    snprintf(args, sizeof(args), "\"n_tokens\":%d", batch.n_tokens);
+
+    ggml_trace_log_begin(phase_name, "Decode", args);
+
     const int ret = ctx->decode(batch);
     if (ret != 0 && ret != 1) {
         LLAMA_LOG_ERROR("%s: failed to decode, ret = %d\n", __func__, ret);
     }
+
+    ggml_trace_log_end(phase_name, "Decode", NULL);
 
     return ret;
 }
