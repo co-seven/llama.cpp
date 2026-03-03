@@ -15,9 +15,10 @@
 #include <vector>
 #include <string>
 #include <algorithm>
-#include <fstream>
 #include <limits.h>
 #include <cinttypes>
+#include <cctype>
+#include <utility>
 
 #if defined (__unix__) || (defined (__APPLE__) && defined (__MACH__))
 #include <signal.h>
@@ -37,8 +38,8 @@ static volatile bool g_is_interrupted = false;
 static void show_additional_info(int /*argc*/, char ** argv) {
     LOG(
         "Multimodal CLI with Spacemit EP vision engine\n\n"
-        "Usage: %s [options] -m <model> --ep-config <config_dir> --image <image.bin> -p <prompt>\n\n"
-        "  -m and --ep-config are required\n"
+        "Usage: %s [options] -m <model> --mmproj <ep_config_dir> --image <image.bin> -p <prompt>\n\n"
+        "  -m and --mmproj are required (or set EP_CONFIG_DIR)\n"
         "  --image and -p are optional, if NOT provided, the CLI will run in chat mode\n",
         argv[0]
     );
@@ -61,152 +62,384 @@ static void sigint_handler(int signo) {
 #endif
 
 // ============================================================
-// Token embedding loading and text encoding utilities
-// (Adapted from EP's SpineLLMEngine::EncodeUserText)
+// Prompt chunking utilities
+// text/image are evaluated in order, aligned with mtmd chunk strategy
 // ============================================================
 
-static bool load_token_embeddings(const std::string & path,
-                                  int64_t vocab_size,
-                                  int64_t hidden_size,
-                                  std::vector<float> & out) {
-    const size_t total = vocab_size * hidden_size;
-    out.resize(total);
-    std::ifstream file(path, std::ios::binary);
-    if (!file.is_open()) {
-        LOG_ERR("Failed to open token embedding file: %s\n", path.c_str());
-        return false;
-    }
-    file.read(reinterpret_cast<char *>(out.data()), total * sizeof(float));
-    if (!file) {
-        LOG_ERR("Token embedding file incomplete: %s\n", path.c_str());
-        return false;
-    }
-    return true;
-}
+static const std::string k_media_marker = "<__media__>";
+static const std::string k_legacy_image_marker = "<__image__>";
 
-// Split text at <image> marker, tokenize both parts, look up token embeddings
-struct text_encode_result {
-    std::vector<float> embeddings;
-    int n_before = 0;
-    int n_after  = 0;
+static void replace_all(std::string & s, const std::string & from, const std::string & to);
+static std::vector<std::string> split_keep_marker(const std::string & input, const std::string & marker);
+
+enum class ep_chunk_type {
+    text,
+    image,
 };
 
-static text_encode_result encode_user_text(
-        const llama_vocab * vocab,
-        const std::string & text,
-        bool add_bos,
-        const std::vector<float> & token_embeddings,
-        int64_t hidden_size) {
-    text_encode_result result;
+struct ep_prompt_chunk {
+    ep_chunk_type type = ep_chunk_type::text;
+    std::vector<llama_token> tokens_text;
+    std::string image_path;
+};
 
-    // Split at <image>
-    std::string before_image, after_image;
-    size_t image_pos = text.find("<image>");
-    if (image_pos != std::string::npos) {
-        before_image = text.substr(0, image_pos);
-        size_t after_pos = image_pos + 7;
-        if (after_pos < text.length() && text[after_pos] == '\n') {
-            after_pos++;
-        }
-        after_image = text.substr(after_pos);
-    } else {
-        before_image = text;
-    }
+enum class ep_image_boundary_mode {
+    native,      // follow native mtmd model-family rules
+    auto_detect, // probe vocab for known token pairs
+    none,        // do not inject image boundary tokens
+};
 
-    // Tokenize before part
-    std::vector<llama_token> before_tokens(before_image.size() + 64);
-    int n_before = llama_tokenize(vocab, before_image.c_str(),
-        static_cast<int>(before_image.length()),
-        before_tokens.data(), static_cast<int>(before_tokens.size()),
-        add_bos, true);
-    if (n_before < 0) {
-        before_tokens.resize(-n_before);
-        n_before = llama_tokenize(vocab, before_image.c_str(),
-            static_cast<int>(before_image.length()),
-            before_tokens.data(), static_cast<int>(before_tokens.size()),
-            add_bos, true);
-    }
-    before_tokens.resize(n_before);
+enum class ep_media_anchor_mode {
+    auto_mode, // apply on known architectures for multi-image prompts
+    on,        // always apply for multi-image prompts
+    off,       // disable prompt canonicalization
+};
 
-    // Tokenize after part
-    std::vector<llama_token> after_tokens;
-    int n_after = 0;
-    if (!after_image.empty()) {
-        after_tokens.resize(after_image.size() + 64);
-        n_after = llama_tokenize(vocab, after_image.c_str(),
-            static_cast<int>(after_image.length()),
-            after_tokens.data(), static_cast<int>(after_tokens.size()),
-            false, true);
-        if (n_after < 0) {
-            after_tokens.resize(-n_after);
-            n_after = llama_tokenize(vocab, after_image.c_str(),
-                static_cast<int>(after_image.length()),
-                after_tokens.data(), static_cast<int>(after_tokens.size()),
-                false, true);
-        }
-        after_tokens.resize(n_after);
-    }
-
-    result.n_before = n_before;
-    result.n_after  = n_after;
-
-    // Look up token embedding matrix
-    int total = n_before + n_after;
-    result.embeddings.resize(total * hidden_size);
-
-    for (int i = 0; i < n_before; ++i) {
-        const float * src = &token_embeddings[before_tokens[i] * hidden_size];
-        float * dst = &result.embeddings[i * hidden_size];
-        std::copy_n(src, hidden_size, dst);
-    }
-    for (int i = 0; i < n_after; ++i) {
-        const float * src = &token_embeddings[after_tokens[i] * hidden_size];
-        float * dst = &result.embeddings[(n_before + i) * hidden_size];
-        std::copy_n(src, hidden_size, dst);
-    }
-
-    return result;
+static std::string to_lower_ascii(std::string s) {
+    std::transform(s.begin(), s.end(), s.begin(), [](unsigned char c) {
+        return (char)std::tolower(c);
+    });
+    return s;
 }
 
-// ============================================================
-// Multimodal embedding fusion
-// [before_text_embd] + [image_embd] + [after_text_embd]
-// (Adapted from EP's SpineLLMEngine::MultimodalEmbeddingFusion)
-// ============================================================
-
-static std::vector<float> fuse_multimodal_embeddings(
-        const std::vector<float> & image_embd,
-        const text_encode_result & text_result,
-        int64_t hidden_size) {
-    size_t n_image  = image_embd.size() / hidden_size;
-    size_t n_before = text_result.n_before;
-    size_t n_after  = text_result.n_after;
-    size_t total    = n_before + n_image + n_after;
-
-    std::vector<float> fused(total * hidden_size);
-    size_t offset = 0;
-
-    // [before_text_embd]
-    std::copy_n(text_result.embeddings.data(),
-                n_before * hidden_size,
-                fused.data() + offset);
-    offset += n_before * hidden_size;
-
-    // [image_embd]
-    std::copy(image_embd.begin(), image_embd.end(),
-              fused.data() + offset);
-    offset += image_embd.size();
-
-    // [after_text_embd]
-    if (n_after > 0) {
-        std::copy_n(text_result.embeddings.data() + n_before * hidden_size,
-                    n_after * hidden_size,
-                    fused.data() + offset);
+static ep_image_boundary_mode ep_image_boundary_mode_from_env() {
+    const char * env = std::getenv("MTMD_EP_IMAGE_BOUNDARY");
+    if (env == nullptr || env[0] == '\0') {
+        return ep_image_boundary_mode::native;
     }
 
-    LOG_INF("Multimodal fusion: [text:%zu] + [image:%zu] + [text:%zu] = %zu tokens\n",
-            n_before, n_image, n_after, total);
-    return fused;
+    const std::string value = to_lower_ascii(env);
+    if (value == "native") {
+        return ep_image_boundary_mode::native;
+    }
+    if (value == "auto" || value == "detect") {
+        return ep_image_boundary_mode::auto_detect;
+    }
+    if (value == "none" || value == "off" || value == "0") {
+        return ep_image_boundary_mode::none;
+    }
+
+    LOG_WRN("[EP-v3] unknown MTMD_EP_IMAGE_BOUNDARY='%s', fallback to 'native'\n", env);
+    return ep_image_boundary_mode::native;
+}
+
+static const char * ep_image_boundary_mode_name(ep_image_boundary_mode mode) {
+    switch (mode) {
+        case ep_image_boundary_mode::native:      return "native";
+        case ep_image_boundary_mode::auto_detect: return "auto";
+        case ep_image_boundary_mode::none:        return "none";
+    }
+    return "native";
+}
+
+static bool contains_icase(const std::string & text, const std::string & pattern) {
+    return to_lower_ascii(text).find(to_lower_ascii(pattern)) != std::string::npos;
+}
+
+static ep_media_anchor_mode ep_media_anchor_mode_from_env() {
+    const char * env = std::getenv("MTMD_EP_MEDIA_ANCHOR");
+    if (env == nullptr || env[0] == '\0') {
+        return ep_media_anchor_mode::off;
+    }
+    const std::string value = to_lower_ascii(env);
+    if (value == "auto") {
+        return ep_media_anchor_mode::auto_mode;
+    }
+    if (value == "on" || value == "1" || value == "true") {
+        return ep_media_anchor_mode::on;
+    }
+    if (value == "off" || value == "0" || value == "false") {
+        return ep_media_anchor_mode::off;
+    }
+    LOG_WRN("[EP-v3] unknown MTMD_EP_MEDIA_ANCHOR='%s', fallback to 'off'\n", env);
+    return ep_media_anchor_mode::off;
+}
+
+static const char * ep_media_anchor_mode_name(ep_media_anchor_mode mode) {
+    switch (mode) {
+        case ep_media_anchor_mode::auto_mode: return "auto";
+        case ep_media_anchor_mode::on:        return "on";
+        case ep_media_anchor_mode::off:       return "off";
+    }
+    return "auto";
+}
+
+static std::vector<llama_token> tokenize_exact_special(llama_context * lctx, const std::string & token_text) {
+    auto toks = common_tokenize(lctx, token_text, /*add_special*/ false, /*parse_special*/ true);
+    if (toks.size() != 1) {
+        return {};
+    }
+    // Ensure this is a true special-token hit, not byte-level fallback.
+    if (common_token_to_piece(lctx, toks[0]) != token_text) {
+        return {};
+    }
+    return toks;
+}
+
+static std::pair<std::vector<llama_token>, std::vector<llama_token>> detect_image_boundary_tokens(llama_context * lctx) {
+    // Keep order aligned with mtmd.cpp init_vision() common projector families.
+    static const std::vector<std::pair<std::string, std::string>> candidates = {
+        {"<|vision_start|>", "<|vision_end|>"},
+        {"<|image_start|>",  "<|image_end|>"},
+        {"<start_of_image>", "<end_of_image>"},
+        {"<img>",            "</img>"},
+        {"<|begin_of_image|>", "<|end_of_image|>"},
+        {"<|IMAGE_START|>",  "<|IMAGE_END|>"},
+        {"<|im_start|>",     "<|im_end|>"},
+        {"<image>",          "</image>"},
+    };
+
+    for (const auto & [beg_s, end_s] : candidates) {
+        auto beg = tokenize_exact_special(lctx, beg_s);
+        auto end = tokenize_exact_special(lctx, end_s);
+        if (!beg.empty() && !end.empty()) {
+            return {std::move(beg), std::move(end)};
+        }
+    }
+    return {};
+}
+
+static bool should_apply_media_anchor(const std::string & arch_name, size_t n_images, ep_media_anchor_mode mode) {
+    if (n_images < 2) {
+        return false;
+    }
+    switch (mode) {
+        case ep_media_anchor_mode::off:
+            return false;
+        case ep_media_anchor_mode::on:
+            return true;
+        case ep_media_anchor_mode::auto_mode:
+            return contains_icase(arch_name, "llavaqwen2forcausallm") || contains_icase(arch_name, "llavaqwen2");
+    }
+    return false;
+}
+
+static std::string canonicalize_multimage_prompt(
+        const std::string & prompt,
+        size_t n_images,
+        const std::string & arch_name,
+        ep_media_anchor_mode mode,
+        bool & changed) {
+    changed = false;
+    if (!should_apply_media_anchor(arch_name, n_images, mode)) {
+        return prompt;
+    }
+
+    std::string normalized = prompt;
+    replace_all(normalized, k_legacy_image_marker, k_media_marker);
+
+    const auto parts = split_keep_marker(normalized, k_media_marker);
+    size_t marker_count = 0;
+    for (const auto & p : parts) {
+        if (p == k_media_marker) {
+            marker_count++;
+        }
+    }
+
+    if (marker_count != n_images || marker_count < 2) {
+        return normalized;
+    }
+
+    std::string output;
+    output.reserve(normalized.size() + marker_count * 48 + 64);
+    output += "Please align images by order index. ";
+    output += "Image #1 maps to the first media slot, Image #2 to the second, and so on.\n";
+
+    size_t image_idx = 0;
+    for (const auto & part : parts) {
+        if (part == k_media_marker) {
+            image_idx++;
+            output += "[Image ";
+            output += std::to_string(image_idx);
+            output += " Begin]\n";
+            output += k_media_marker;
+            output += "\n[Image ";
+            output += std::to_string(image_idx);
+            output += " End]\n";
+        } else {
+            output += part;
+        }
+    }
+
+    changed = (output != normalized);
+    return output;
+}
+
+static std::pair<std::vector<llama_token>, std::vector<llama_token>>
+detect_image_boundary_tokens_native(llama_context * lctx, const std::string & arch_name) {
+    // Match native mtmd behavior in mtmd.cpp::init_vision().
+    if (contains_icase(arch_name, "qwen2vl") || contains_icase(arch_name, "qwen2_5_vl") ||
+        contains_icase(arch_name, "qwen3vl") || contains_icase(arch_name, "youtuvl")) {
+        return {
+            tokenize_exact_special(lctx, "<|vision_start|>"),
+            tokenize_exact_special(lctx, "<|vision_end|>")
+        };
+    }
+    if (contains_icase(arch_name, "llama4")) {
+        return {
+            tokenize_exact_special(lctx, "<|image_start|>"),
+            tokenize_exact_special(lctx, "<|image_end|>")
+        };
+    }
+    if (contains_icase(arch_name, "gemma3")) {
+        return {
+            tokenize_exact_special(lctx, "<start_of_image>"),
+            tokenize_exact_special(lctx, "<end_of_image>")
+        };
+    }
+    if (contains_icase(arch_name, "internvl")) {
+        return {
+            tokenize_exact_special(lctx, "<img>"),
+            tokenize_exact_special(lctx, "</img>")
+        };
+    }
+    if (contains_icase(arch_name, "glm4v")) {
+        return {
+            tokenize_exact_special(lctx, "<|begin_of_image|>"),
+            tokenize_exact_special(lctx, "<|end_of_image|>")
+        };
+    }
+    if (contains_icase(arch_name, "paddleocr")) {
+        return {
+            tokenize_exact_special(lctx, "<|IMAGE_START|>"),
+            tokenize_exact_special(lctx, "<|IMAGE_END|>")
+        };
+    }
+    if (contains_icase(arch_name, "lightonocr")) {
+        return {
+            tokenize_exact_special(lctx, "<|im_start|>"),
+            tokenize_exact_special(lctx, "<|im_end|>")
+        };
+    }
+    return {};
+}
+
+static std::pair<std::vector<llama_token>, std::vector<llama_token>>
+resolve_image_boundary_tokens(llama_context * lctx,
+                              const std::string & arch_name,
+                              ep_image_boundary_mode mode) {
+    if (mode == ep_image_boundary_mode::none) {
+        return {};
+    }
+    if (mode == ep_image_boundary_mode::auto_detect) {
+        return detect_image_boundary_tokens(lctx);
+    }
+    return detect_image_boundary_tokens_native(lctx, arch_name);
+}
+
+static void replace_all(std::string & s, const std::string & from, const std::string & to) {
+    if (from.empty()) {
+        return;
+    }
+    size_t pos = 0;
+    while ((pos = s.find(from, pos)) != std::string::npos) {
+        s.replace(pos, from.size(), to);
+        pos += to.size();
+    }
+}
+
+static std::vector<std::string> split_keep_marker(const std::string & input, const std::string & marker) {
+    std::vector<std::string> out;
+    if (input.empty()) {
+        return out;
+    }
+
+    size_t start = 0;
+    while (true) {
+        size_t pos = input.find(marker, start);
+        if (pos == std::string::npos) {
+            out.push_back(input.substr(start));
+            break;
+        }
+        if (pos > start) {
+            out.push_back(input.substr(start, pos - start));
+        }
+        out.push_back(marker);
+        start = pos + marker.size();
+    }
+    return out;
+}
+
+static void append_text_chunk(std::vector<ep_prompt_chunk> & chunks, std::vector<llama_token> && tokens) {
+    if (tokens.empty()) {
+        return;
+    }
+    if (!chunks.empty() && chunks.back().type == ep_chunk_type::text) {
+        auto & dst = chunks.back().tokens_text;
+        dst.insert(dst.end(), tokens.begin(), tokens.end());
+        return;
+    }
+
+    ep_prompt_chunk chunk;
+    chunk.type = ep_chunk_type::text;
+    chunk.tokens_text = std::move(tokens);
+    chunks.emplace_back(std::move(chunk));
+}
+
+static bool tokenize_to_ep_chunks(
+        const llama_vocab * vocab,
+        const std::string & formatted_chat,
+        bool add_special,
+        bool parse_special,
+        const std::vector<std::string> & image_paths,
+        std::vector<ep_prompt_chunk> & out_chunks) {
+    out_chunks.clear();
+
+    std::string input = formatted_chat;
+    replace_all(input, k_legacy_image_marker, k_media_marker);
+
+    size_t n_images_used = 0;
+    const auto parts = split_keep_marker(input, k_media_marker);
+    for (const auto & part : parts) {
+        if (part == k_media_marker) {
+            if (n_images_used >= image_paths.size()) {
+                LOG_ERR("Number of images (%zu) does not match number of media markers in prompt\n", image_paths.size());
+                return false;
+            }
+            ep_prompt_chunk chunk;
+            chunk.type = ep_chunk_type::image;
+            chunk.image_path = image_paths[n_images_used++];
+            out_chunks.emplace_back(std::move(chunk));
+        } else {
+            append_text_chunk(out_chunks, common_tokenize(vocab, part, /*add_special*/ false, parse_special));
+        }
+    }
+
+    if (n_images_used != image_paths.size()) {
+        LOG_ERR("Number of images (%zu) does not match number of media markers in prompt (%zu)\n",
+                image_paths.size(), n_images_used);
+        return false;
+    }
+
+    if (add_special && llama_vocab_get_add_bos(vocab)) {
+        const llama_token bos = llama_vocab_bos(vocab);
+        if (bos != LLAMA_TOKEN_NULL) {
+            if (!out_chunks.empty() && out_chunks.front().type == ep_chunk_type::text) {
+                out_chunks.front().tokens_text.insert(out_chunks.front().tokens_text.begin(), bos);
+            } else {
+                ep_prompt_chunk bos_chunk;
+                bos_chunk.type = ep_chunk_type::text;
+                bos_chunk.tokens_text = { bos };
+                out_chunks.insert(out_chunks.begin(), std::move(bos_chunk));
+            }
+        }
+    }
+
+    if (add_special && llama_vocab_get_add_eos(vocab)) {
+        const llama_token eos = llama_vocab_eos(vocab);
+        if (eos != LLAMA_TOKEN_NULL) {
+            if (!out_chunks.empty() && out_chunks.back().type == ep_chunk_type::text) {
+                out_chunks.back().tokens_text.push_back(eos);
+            } else {
+                ep_prompt_chunk eos_chunk;
+                eos_chunk.type = ep_chunk_type::text;
+                eos_chunk.tokens_text = { eos };
+                out_chunks.emplace_back(std::move(eos_chunk));
+            }
+        }
+    }
+
+    return true;
 }
 
 // ============================================================
@@ -268,6 +501,44 @@ static int decode_embd(llama_context * lctx,
     return 0;
 }
 
+static int decode_tokens(llama_context * lctx,
+                         const std::vector<llama_token> & tokens,
+                         llama_pos & n_past,
+                         int n_batch,
+                         bool logits_last) {
+    if (tokens.empty()) {
+        return 0;
+    }
+
+    llama_batch batch = llama_batch_init(n_batch, 0, 1);
+    size_t i = 0;
+    while (i < tokens.size()) {
+        batch.n_tokens = 0;
+        for (; i < tokens.size() && batch.n_tokens < n_batch; ++i) {
+            const int32_t j = batch.n_tokens;
+            batch.token[j]     = tokens[i];
+            batch.pos[j]       = n_past + j;
+            batch.n_seq_id[j]  = 1;
+            batch.seq_id[j][0] = 0;
+            batch.logits[j]    = false;
+            batch.n_tokens++;
+        }
+
+        if (logits_last && i == tokens.size()) {
+            batch.logits[batch.n_tokens - 1] = true;
+        }
+
+        if (llama_decode(lctx, batch) != 0) {
+            llama_batch_free(batch);
+            return 1;
+        }
+        n_past += batch.n_tokens;
+    }
+
+    llama_batch_free(batch);
+    return 0;
+}
+
 // ============================================================
 // Context structure
 // ============================================================
@@ -283,9 +554,11 @@ struct mtmd_cli_ep_context {
     llama_batch         batch;
     int                 n_batch;
 
-    // Token embedding matrix for embedding-level fusion
-    std::vector<float> token_embeddings;
     int64_t hidden_size;
+    std::vector<llama_token> tok_img_beg;
+    std::vector<llama_token> tok_img_end;
+    ep_image_boundary_mode img_boundary_mode = ep_image_boundary_mode::native;
+    ep_media_anchor_mode media_anchor_mode = ep_media_anchor_mode::off;
 
     // Pending image binary paths
     std::vector<std::string> pending_images;
@@ -325,23 +598,38 @@ struct mtmd_cli_ep_context {
         // Initialize EP vision context
         ep_ctx = ep_vision_context::create(ep_config_dir);
         hidden_size = ep_ctx->hidden_size();
-
-        // Load token embeddings
-        if (!load_token_embeddings(ep_ctx->token_embedding_path(),
-                                   ep_ctx->vocab_size(),
-                                   hidden_size,
-                                   token_embeddings)) {
-            LOG_ERR("Failed to load token embeddings\n");
+        img_boundary_mode = ep_image_boundary_mode_from_env();
+        media_anchor_mode = ep_media_anchor_mode_from_env();
+        if (hidden_size <= 0 || hidden_size > INT_MAX) {
+            LOG_ERR("FATAL: invalid EP hidden_size (%" PRId64 ")\n", hidden_size);
             exit(1);
         }
 
         // Validate n_embd matches
         int model_n_embd = llama_model_n_embd(model);
-        LOG_INF("[EP-v2] EP vision engine initialized (hidden_size=%" PRId64 ", model_n_embd=%d, arch=%s)\n",
+        LOG_INF("[EP-v3] EP vision engine initialized (hidden_size=%" PRId64 ", model_n_embd=%d, arch=%s)\n",
                 hidden_size, model_n_embd, ep_ctx->architecture().c_str());
         if (model_n_embd != hidden_size) {
             LOG_ERR("FATAL: model n_embd (%d) != EP hidden_size (%" PRId64 ")\n", model_n_embd, hidden_size);
             exit(1);
+        }
+
+        // Align image boundary tokens with native mtmd behavior by default.
+        auto boundaries = resolve_image_boundary_tokens(lctx, ep_ctx->architecture(), img_boundary_mode);
+        tok_img_beg = std::move(boundaries.first);
+        tok_img_end = std::move(boundaries.second);
+        LOG_INF("[EP-v3] image boundary mode: %s\n", ep_image_boundary_mode_name(img_boundary_mode));
+        LOG_INF("[EP-v3] media anchor mode: %s\n", ep_media_anchor_mode_name(media_anchor_mode));
+        if (!tok_img_beg.empty() && !tok_img_end.empty() &&
+            tok_img_beg.front() != LLAMA_TOKEN_NULL && tok_img_end.front() != LLAMA_TOKEN_NULL) {
+            LOG_INF("[EP-v3] image boundary tokens enabled: beg='%s', end='%s'\n",
+                common_token_to_piece(lctx, tok_img_beg.front()).c_str(),
+                common_token_to_piece(lctx, tok_img_end.front()).c_str());
+        } else {
+            LOG_INF("[EP-v3] image boundary tokens disabled for this model (arch=%s)\n",
+                ep_ctx->architecture().c_str());
+            tok_img_beg.clear();
+            tok_img_end.clear();
         }
 
         // Antiprompt for legacy templates
@@ -438,74 +726,73 @@ static std::string chat_add_and_format(mtmd_cli_ep_context & ctx, common_chat_ms
 
 static int eval_message_ep(mtmd_cli_ep_context & ctx, common_chat_msg & msg) {
     bool add_bos = ctx.chat_history.empty();
+
+    if (msg.role == "user" && !ctx.pending_images.empty()) {
+        bool changed = false;
+        msg.content = canonicalize_multimage_prompt(
+            msg.content,
+            ctx.pending_images.size(),
+            ctx.ep_ctx->architecture(),
+            ctx.media_anchor_mode,
+            changed);
+        if (changed) {
+            LOG_INF("[EP-v3] media-anchor canonicalization applied (%zu images)\n", ctx.pending_images.size());
+        }
+    }
+
     auto formatted_chat = chat_add_and_format(ctx, msg);
-    bool has_image = !ctx.pending_images.empty();
 
     if (g_is_interrupted) return 0;
 
-    if (has_image) {
-        // === Multimodal path: embedding-level fusion ===
+    std::vector<ep_prompt_chunk> chunks;
+    if (!tokenize_to_ep_chunks(ctx.vocab, formatted_chat, add_bos, true, ctx.pending_images, chunks)) {
+        return 1;
+    }
 
-        // 1. Replace <__media__> with <image> (EP uses <image> as split marker)
-        std::string ep_text = formatted_chat;
-        const std::string mtmd_marker = "<__media__>";
-        const std::string ep_marker = "<image>";
-        size_t pos = 0;
-        while ((pos = ep_text.find(mtmd_marker, pos)) != std::string::npos) {
-            ep_text.replace(pos, mtmd_marker.length(), ep_marker);
-            pos += ep_marker.length();
+    for (size_t i = 0; i < chunks.size(); ++i) {
+        const bool logits_last = (i == chunks.size() - 1);
+        const auto & chunk = chunks[i];
+        if (chunk.type == ep_chunk_type::text) {
+            if (decode_tokens(ctx.lctx, chunk.tokens_text, ctx.n_past, ctx.n_batch, logits_last) != 0) {
+                LOG_ERR("Failed to decode text chunk %zu\n", i);
+                return 1;
+            }
+            continue;
         }
 
-        // 2. Encode image using EP ONNX vision engine
-        LOG_INF("Encoding image with EP vision engine...\n");
-        std::vector<float> image_embd = ctx.ep_ctx->encode_image(ctx.pending_images[0]);
-        LOG_INF("Image encoded: %zu floats (%zu tokens)\n",
-                image_embd.size(), image_embd.size() / ctx.hidden_size);
-
-        // 3. Encode text (split at <image>, tokenize, look up embeddings)
-        auto text_result = encode_user_text(
-            ctx.vocab, ep_text, add_bos,
-            ctx.token_embeddings, ctx.hidden_size);
-
-        // 4. Fuse embeddings
-        auto fused = fuse_multimodal_embeddings(image_embd, text_result, ctx.hidden_size);
-        int n_fused_tokens = fused.size() / ctx.hidden_size;
-
-        // 5. Decode fused embeddings into LLM
-        int ret = decode_embd(ctx.lctx, fused.data(), n_fused_tokens,
-                              ctx.hidden_size, ctx.n_past, ctx.n_batch, true);
-        if (ret != 0) {
-            LOG_ERR("Failed to decode fused embeddings\n");
+        // image chunk
+        LOG_INF("Encoding image chunk %zu with EP vision engine: %s\n", i, chunk.image_path.c_str());
+        std::vector<float> image_embd = ctx.ep_ctx->encode_image(chunk.image_path);
+        if (image_embd.empty() || image_embd.size() % (size_t)ctx.hidden_size != 0) {
+            LOG_ERR("Invalid image embedding shape from EP (size=%zu, hidden_size=%" PRId64 ")\n",
+                    image_embd.size(), ctx.hidden_size);
             return 1;
         }
 
-        ctx.pending_images.clear();
-    } else {
-        // === Text-only path ===
-        auto tokens = common_tokenize(ctx.lctx, formatted_chat, add_bos, true);
-
-        // Decode tokens in batches
-        llama_batch text_batch = llama_batch_init(ctx.n_batch, 0, 1);
-        size_t i = 0;
-        while (i < tokens.size()) {
-            text_batch.n_tokens = 0;
-            for (; i < tokens.size() && text_batch.n_tokens < ctx.n_batch; i++) {
-                int32_t j = text_batch.n_tokens;
-                text_batch.token[j]       = tokens[i];
-                text_batch.pos[j]         = ctx.n_past++;
-                text_batch.n_seq_id[j]    = 1;
-                text_batch.seq_id[j][0]   = 0;
-                text_batch.logits[j]      = (i == tokens.size() - 1);
-                text_batch.n_tokens++;
-            }
-            if (llama_decode(ctx.lctx, text_batch) != 0) {
-                LOG_ERR("Failed to decode text\n");
-                llama_batch_free(text_batch);
+        const int n_image_tokens = (int)(image_embd.size() / (size_t)ctx.hidden_size);
+        if (!ctx.tok_img_beg.empty()) {
+            if (decode_tokens(ctx.lctx, ctx.tok_img_beg, ctx.n_past, ctx.n_batch, /*logits_last*/ false) != 0) {
+                LOG_ERR("Failed to decode image-begin token chunk %zu\n", i);
                 return 1;
             }
         }
-        llama_batch_free(text_batch);
+
+        const bool logits_on_embd = logits_last && ctx.tok_img_end.empty();
+        if (decode_embd(ctx.lctx, image_embd.data(), n_image_tokens,
+                        (int)ctx.hidden_size, ctx.n_past, ctx.n_batch, logits_on_embd) != 0) {
+            LOG_ERR("Failed to decode image chunk %zu\n", i);
+            return 1;
+        }
+
+        if (!ctx.tok_img_end.empty()) {
+            if (decode_tokens(ctx.lctx, ctx.tok_img_end, ctx.n_past, ctx.n_batch, logits_last) != 0) {
+                LOG_ERR("Failed to decode image-end token chunk %zu\n", i);
+                return 1;
+            }
+        }
     }
+
+    ctx.pending_images.clear();
 
     LOG("\n");
     return 0;
@@ -517,6 +804,7 @@ static int eval_message_ep(mtmd_cli_ep_context & ctx, common_chat_msg & msg) {
 
 int main(int argc, char ** argv) {
     ggml_time_init();
+    LOG_INF("MTMD_CLI_EP_BUILD_TAG: fastvlm-support-20260303-3 (%s %s)\n", __DATE__, __TIME__);
 
     common_params params;
 
@@ -537,7 +825,7 @@ int main(int argc, char ** argv) {
     }
     if (ep_config_dir.empty()) {
         show_additional_info(argc, argv);
-        LOG_ERR("ERR: Missing --ep-config argument (pass via --mmproj or EP_CONFIG_DIR env)\n");
+        LOG_ERR("ERR: Missing EP config directory (pass via --mmproj or EP_CONFIG_DIR env)\n");
         return 1;
     }
 
