@@ -18,6 +18,7 @@
 #include <limits.h>
 #include <cinttypes>
 #include <cctype>
+#include <cmath>
 #include <utility>
 
 #if defined (__unix__) || (defined (__APPLE__) && defined (__MACH__))
@@ -134,6 +135,33 @@ static const char * ep_image_boundary_mode_name(ep_image_boundary_mode mode) {
 
 static bool contains_icase(const std::string & text, const std::string & pattern) {
     return to_lower_ascii(text).find(to_lower_ascii(pattern)) != std::string::npos;
+}
+
+static bool arch_requires_mrope(const std::string & arch_name) {
+    return contains_icase(arch_name, "qwen2vl") ||
+           contains_icase(arch_name, "qwen2_5_vl") ||
+           contains_icase(arch_name, "qwen3vl") ||
+           contains_icase(arch_name, "glm4v") ||
+           contains_icase(arch_name, "paddleocr");
+}
+
+static std::pair<int, int> infer_image_grid_xy(int n_tokens) {
+    if (n_tokens <= 0) {
+        return {0, 0};
+    }
+
+    // Choose the factor pair closest to square to approximate (nx, ny).
+    int best_y = 1;
+    int best_x = n_tokens;
+    int root = (int) std::sqrt((double) n_tokens);
+    for (int y = root; y >= 1; --y) {
+        if (n_tokens % y == 0) {
+            best_y = y;
+            best_x = n_tokens / y;
+            break;
+        }
+    }
+    return {best_x, best_y};
 }
 
 static ep_media_anchor_mode ep_media_anchor_mode_from_env() {
@@ -445,7 +473,7 @@ static bool tokenize_to_ep_chunks(
 // ============================================================
 // Decode embedding batch into LLM
 // (Adapted from mtmd-helper.cpp decode_embd_batch + mtmd_helper_decode_image_chunk)
-// Uses normal positional encoding (no M-RoPE, as EP currently only supports LLaVA-Qwen2)
+// Supports both normal positional encoding and M-RoPE positional layout.
 // ============================================================
 
 static int decode_embd(llama_context * lctx,
@@ -454,10 +482,14 @@ static int decode_embd(llama_context * lctx,
                        int n_embd,
                        llama_pos & n_past,
                        int n_batch,
-                       bool logits_last) {
-    // Allocate auxiliary arrays (managed manually, not via llama_batch_init)
-    // This follows the same pattern as mtmd-helper.cpp's decode_embd_batch
-    std::vector<llama_pos>      pos(n_tokens);
+                       bool logits_last,
+                       bool use_mrope_pos,
+                       int nx,
+                       int ny) {
+    const int n_pos_per_embd = use_mrope_pos ? 4 : 1;
+
+    // Allocate auxiliary arrays (managed manually, not via llama_batch_init).
+    std::vector<llama_pos>      pos((size_t) n_tokens * n_pos_per_embd);
     std::vector<int32_t>        n_seq_id(n_tokens);
     std::vector<llama_seq_id>   seq_id_0(n_tokens);
     std::vector<llama_seq_id *> seq_ids(n_tokens);
@@ -468,22 +500,63 @@ static int decode_embd(llama_context * lctx,
         seq_ids[i]  = &seq_id_0[i];
     }
 
+    if (use_mrope_pos) {
+        if (nx > 0 && ny > 0 && nx * ny == n_tokens) {
+            for (int y = 0; y < ny; ++y) {
+                for (int x = 0; x < nx; ++x) {
+                    const int i = y * nx + x;
+                    pos[(size_t) i] = n_past;
+                    pos[(size_t) i + n_tokens] = n_past + y;
+                    pos[(size_t) i + 2 * n_tokens] = n_past + x;
+                    pos[(size_t) i + 3 * n_tokens] = 0;
+                }
+            }
+        } else {
+            // Fallback to 1D M-RoPE-style positions if grid inference is inconsistent.
+            for (int i = 0; i < n_tokens; ++i) {
+                pos[(size_t) i] = n_past + i;
+                pos[(size_t) i + n_tokens] = n_past + i;
+                pos[(size_t) i + 2 * n_tokens] = n_past + i;
+                pos[(size_t) i + 3 * n_tokens] = 0;
+            }
+        }
+    } else {
+        for (int i = 0; i < n_tokens; ++i) {
+            pos[(size_t) i] = n_past + i;
+        }
+    }
+
     int processed = 0;
     while (processed < n_tokens) {
         int batch_size = std::min(n_batch, n_tokens - processed);
         bool is_last_batch = (processed + batch_size >= n_tokens);
 
         for (int i = 0; i < batch_size; ++i) {
-            pos[processed + i]      = n_past + i;
+            if (!use_mrope_pos) {
+                pos[processed + i] = n_past + processed + i;
+            }
             n_seq_id[processed + i] = 1;
             logits[processed + i]   = (logits_last && is_last_batch && i == batch_size - 1);
+        }
+
+        llama_pos * pos_ptr = nullptr;
+        std::vector<llama_pos> pos_view;
+        if (use_mrope_pos) {
+            pos_view.reserve((size_t) batch_size * n_pos_per_embd);
+            for (int d = 0; d < n_pos_per_embd; ++d) {
+                const size_t src_idx = (size_t) d * n_tokens + processed;
+                pos_view.insert(pos_view.end(), pos.data() + src_idx, pos.data() + src_idx + batch_size);
+            }
+            pos_ptr = pos_view.data();
+        } else {
+            pos_ptr = pos.data() + processed;
         }
 
         llama_batch batch = {
             /*n_tokens  =*/ batch_size,
             /*token     =*/ nullptr,
             /*embd      =*/ embd + (size_t)processed * n_embd,
-            /*pos       =*/ pos.data()      + processed,
+            /*pos       =*/ pos_ptr,
             /*n_seq_id  =*/ n_seq_id.data() + processed,
             /*seq_id    =*/ seq_ids.data()  + processed,
             /*logits    =*/ logits.data()   + processed,
@@ -495,9 +568,15 @@ static int decode_embd(llama_context * lctx,
             return ret;
         }
 
-        n_past += batch_size;
         processed += batch_size;
     }
+
+    if (use_mrope_pos) {
+        n_past += std::max(nx, ny);
+    } else {
+        n_past += n_tokens;
+    }
+
     return 0;
 }
 
@@ -555,6 +634,7 @@ struct mtmd_cli_ep_context {
     int                 n_batch;
 
     int64_t hidden_size;
+    bool use_mrope_pos = false;
     std::vector<llama_token> tok_img_beg;
     std::vector<llama_token> tok_img_end;
     ep_image_boundary_mode img_boundary_mode = ep_image_boundary_mode::native;
@@ -598,6 +678,7 @@ struct mtmd_cli_ep_context {
         // Initialize EP vision context
         ep_ctx = ep_vision_context::create(ep_config_dir);
         hidden_size = ep_ctx->hidden_size();
+        use_mrope_pos = arch_requires_mrope(ep_ctx->architecture());
         img_boundary_mode = ep_image_boundary_mode_from_env();
         media_anchor_mode = ep_media_anchor_mode_from_env();
         if (hidden_size <= 0 || hidden_size > INT_MAX) {
@@ -620,6 +701,7 @@ struct mtmd_cli_ep_context {
         tok_img_end = std::move(boundaries.second);
         LOG_INF("[EP-v3] image boundary mode: %s\n", ep_image_boundary_mode_name(img_boundary_mode));
         LOG_INF("[EP-v3] media anchor mode: %s\n", ep_media_anchor_mode_name(media_anchor_mode));
+        LOG_INF("[EP-v3] mrope decode mode: %s\n", use_mrope_pos ? "enabled" : "disabled");
         if (!tok_img_beg.empty() && !tok_img_end.empty() &&
             tok_img_beg.front() != LLAMA_TOKEN_NULL && tok_img_end.front() != LLAMA_TOKEN_NULL) {
             LOG_INF("[EP-v3] image boundary tokens enabled: beg='%s', end='%s'\n",
@@ -770,6 +852,16 @@ static int eval_message_ep(mtmd_cli_ep_context & ctx, common_chat_msg & msg) {
         }
 
         const int n_image_tokens = (int)(image_embd.size() / (size_t)ctx.hidden_size);
+        int grid_nx = n_image_tokens;
+        int grid_ny = 1;
+        if (ctx.use_mrope_pos) {
+            auto grid_xy = infer_image_grid_xy(n_image_tokens);
+            grid_nx = grid_xy.first;
+            grid_ny = grid_xy.second;
+            LOG_INF("[EP-v3] inferred image token grid: nx=%d, ny=%d, n_tokens=%d\n",
+                    grid_nx, grid_ny, n_image_tokens);
+        }
+
         if (!ctx.tok_img_beg.empty()) {
             if (decode_tokens(ctx.lctx, ctx.tok_img_beg, ctx.n_past, ctx.n_batch, /*logits_last*/ false) != 0) {
                 LOG_ERR("Failed to decode image-begin token chunk %zu\n", i);
@@ -779,7 +871,8 @@ static int eval_message_ep(mtmd_cli_ep_context & ctx, common_chat_msg & msg) {
 
         const bool logits_on_embd = logits_last && ctx.tok_img_end.empty();
         if (decode_embd(ctx.lctx, image_embd.data(), n_image_tokens,
-                        (int)ctx.hidden_size, ctx.n_past, ctx.n_batch, logits_on_embd) != 0) {
+                        (int)ctx.hidden_size, ctx.n_past, ctx.n_batch, logits_on_embd,
+                        ctx.use_mrope_pos, grid_nx, grid_ny) != 0) {
             LOG_ERR("Failed to decode image chunk %zu\n", i);
             return 1;
         }
