@@ -5,6 +5,7 @@
 #include "server-http.h"
 #include "server-task.h"
 #include "server-queue.h"
+#include "server-ep-vision.h"
 
 #include "build-info.h"
 #include "common.h"
@@ -49,6 +50,12 @@ enum slot_state {
 enum server_state {
     SERVER_STATE_LOADING_MODEL,  // Server is starting up, model not fully loaded yet
     SERVER_STATE_READY,          // Server is ready and model is loaded
+};
+
+enum server_vision_backend_mode {
+    SERVER_VISION_BACKEND_NONE,
+    SERVER_VISION_BACKEND_MTMD,
+    SERVER_VISION_BACKEND_EP,
 };
 
 struct server_slot {
@@ -611,7 +618,9 @@ public:
     llama_model * model_tgt = nullptr;
 
     mtmd_context * mctx = nullptr;
+    server_ep_vision_context * ep_ctx = nullptr;
     const llama_vocab * vocab = nullptr;
+    server_vision_backend_mode vision_backend = SERVER_VISION_BACKEND_NONE;
 
     server_queue    queue_tasks;
     server_response queue_results;
@@ -682,6 +691,19 @@ private:
 
     bool sleeping = false;
 
+    bool has_multimodal() const {
+        return mctx != nullptr || ep_ctx != nullptr;
+    }
+
+    const char * vision_backend_name() const {
+        switch (vision_backend) {
+            case SERVER_VISION_BACKEND_MTMD: return "mtmd";
+            case SERVER_VISION_BACKEND_EP:   return "ep";
+            case SERVER_VISION_BACKEND_NONE: return "none";
+        }
+        return "none";
+    }
+
     void destroy() {
         llama_init.reset();
 
@@ -690,6 +712,9 @@ private:
 
         mtmd_free(mctx);
         mctx = nullptr;
+        server_ep_vision_free(ep_ctx);
+        ep_ctx = nullptr;
+        vision_backend = SERVER_VISION_BACKEND_NONE;
 
         llama_batch_free(batch);
     }
@@ -782,8 +807,35 @@ private:
             params_base.speculative.draft.ctx_dft = ctx_dft.get();
         }
 
-        std::string & mmproj_path = params_base.mmproj.path;
-        if (!mmproj_path.empty()) {
+        const std::string & mmproj_path = params_base.mmproj.path;
+        const std::string & ep_config_dir = params_base.ep_config_dir;
+        const std::string & backend_pref = params_base.vision_backend;
+
+        server_vision_backend_mode selected_backend = SERVER_VISION_BACKEND_NONE;
+        if (backend_pref == "auto") {
+            if (!ep_config_dir.empty()) {
+                selected_backend = SERVER_VISION_BACKEND_EP;
+            } else if (!mmproj_path.empty()) {
+                selected_backend = SERVER_VISION_BACKEND_MTMD;
+            }
+        } else if (backend_pref == "mtmd") {
+            selected_backend = SERVER_VISION_BACKEND_MTMD;
+        } else if (backend_pref == "ep") {
+            selected_backend = SERVER_VISION_BACKEND_EP;
+        } else {
+            SRV_ERR("invalid --vision-backend value: '%s'\n", backend_pref.c_str());
+            return false;
+        }
+
+        if (selected_backend == SERVER_VISION_BACKEND_MTMD) {
+            if (mmproj_path.empty()) {
+                SRV_ERR("%s", "vision backend 'mtmd' selected but --mmproj is empty\n");
+                return false;
+            }
+
+            if (!is_resume) {
+                mtmd_helper_log_set(common_log_default_callback, nullptr);
+            }
             mtmd_context_params mparams = mtmd_context_params_default();
 
             mparams.use_gpu          = params_base.mmproj_use_gpu;
@@ -800,8 +852,26 @@ private:
                 SRV_ERR("failed to load multimodal model, '%s'\n", mmproj_path.c_str());
                 return false;
             }
-            SRV_INF("loaded multimodal model, '%s'\n", mmproj_path.c_str());
+            vision_backend = SERVER_VISION_BACKEND_MTMD;
+            SRV_INF("loaded multimodal model (mtmd), '%s'\n", mmproj_path.c_str());
+        } else if (selected_backend == SERVER_VISION_BACKEND_EP) {
+            if (ep_config_dir.empty()) {
+                SRV_ERR("%s", "vision backend 'ep' selected but --ep-config-dir is empty\n");
+                return false;
+            }
+            try {
+                ep_ctx = server_ep_vision_init(ctx, ep_config_dir);
+            } catch (const std::exception & e) {
+                SRV_ERR("failed to load EP vision backend from '%s': %s\n", ep_config_dir.c_str(), e.what());
+                return false;
+            }
+            vision_backend = SERVER_VISION_BACKEND_EP;
+            SRV_INF("loaded multimodal model (ep), '%s'\n", ep_config_dir.c_str());
+        } else {
+            vision_backend = SERVER_VISION_BACKEND_NONE;
+        }
 
+        if (has_multimodal()) {
             if (params_base.ctx_shift) {
                 params_base.ctx_shift = false;
                 SRV_WRN("%s\n", "ctx_shift is not supported by multimodal, it will be disabled");
@@ -889,8 +959,7 @@ private:
             slot.n_ctx   = n_ctx_slot;
 
             slot.mctx                   = mctx;
-            slot.prompt.tokens.has_mtmd = mctx != nullptr;
-
+            slot.prompt.tokens.has_mtmd = has_multimodal();
             SLT_INF(slot, "new slot, n_ctx = %d\n", slot.n_ctx);
 
             slot.callback_on_release = [this](int id_slot) {
@@ -1038,8 +1107,10 @@ private:
                 /* reasoning_format      */ params_base.reasoning_format,
                 /* chat_template_kwargs  */ params_base.default_template_kwargs,
                 /* tmpls                 */ std::move(chat_templates),
-                /* allow_image           */ mctx ? mtmd_support_vision(mctx) : false,
+                /* allow_image           */ mctx ? mtmd_support_vision(mctx) : (ep_ctx != nullptr),
                 /* allow_audio           */ mctx ? mtmd_support_audio (mctx) : false,
+                /* image_bin_only        */ ep_ctx != nullptr,
+                /* vision_backend        */ vision_backend_name(),
                 /* enable_thinking       */ enable_thinking,
                 /* reasoning_budget      */ params_base.sampling.reasoning_budget_tokens,
                 /* reasoning_budget_msg  */ params_base.sampling.reasoning_budget_message,
@@ -1141,6 +1212,12 @@ private:
 
             // cache prompts only for completion tasks
             update_cache = update_cache && task.type == SERVER_TASK_TYPE_COMPLETION;
+
+            // don't update the cache if the slot's context is empty
+            update_cache = update_cache && tokens.size() > 0;
+
+            // TODO: mtmd does not support prompt cache
+            update_cache = update_cache && !ret->prompt.tokens.has_mtmd;
 
             if (update_cache) {
                 SRV_INF("%s", "updating prompt cache\n");
@@ -1547,7 +1624,7 @@ private:
 
     // if multimodal is enabled, send an error and return false
     bool check_no_mtmd(const int id_task) {
-        if (mctx) {
+        if (has_multimodal()) {
             send_error(id_task, "This feature is not supported by multimodal", ERROR_TYPE_NOT_SUPPORTED);
             return false;
         }
@@ -1741,10 +1818,12 @@ private:
     bool tokenize_cli_input(server_task & task) {
         try {
             auto & prompt = task.cli_prompt;
-            if (mctx != nullptr) {
+            if (ep_ctx != nullptr) {
+                task.tokens = process_ep_prompt(ep_ctx, vocab, prompt, task.cli_files);
+            } else if (mctx != nullptr) {
                 task.tokens = process_mtmd_prompt(mctx, prompt, task.cli_files);
             } else {
-                task.tokens = std::move(tokenize_input_prompts(vocab, mctx, prompt, true, true)[0]);
+                task.tokens = std::move(tokenize_input_prompts(vocab, mctx, ep_ctx, prompt, true, true)[0]);
             }
             task.cli_prompt.clear();
             task.cli_files.clear();
@@ -2162,8 +2241,8 @@ private:
                     continue;
                 }
 
-                if (mctx) {
-                    // we should never reach this because params_base.ctx_shift is automatically disabled if mmproj is loaded
+                if (has_multimodal()) {
+                    // we should never reach this because params_base.ctx_shift is automatically disabled if multimodal is loaded
                     // we don't support ctx_shift because an image chunk may contains multiple tokens
                     GGML_ABORT("not supported by multimodal");
                 }
@@ -2468,7 +2547,7 @@ private:
                                     size_t head_c = n_past; // cache
                                     size_t head_p = n_past; // current prompt
 
-                                    if (mctx) {
+                                    if (has_multimodal()) {
                                         // we should never reach this
                                         GGML_ABORT("not supported by multimodal");
                                     }
@@ -2525,7 +2604,9 @@ private:
                             // the largest pos_min required for a checkpoint to be useful
                             const auto pos_min_thold = std::max(0, pos_next - n_swa);
 
-                            if (n_past > 0 && n_past < slot.prompt.n_tokens()) {
+                            // note: disallow with multimodal contexts for now
+                            //       https://github.com/ggml-org/llama.cpp/issues/17043
+                            if (!slot.prompt.tokens.has_mtmd && n_past > 0 && n_past < slot.prompt.n_tokens()) {
                                 const auto pos_min = llama_memory_seq_pos_min(llama_get_memory(ctx_tgt), slot.id);
                                 if (pos_min == -1) {
                                     SLT_ERR(slot, "n_past = %d, slot.prompt.tokens.size() = %d, seq_id = %d, pos_min = %d\n", n_past, (int) slot.prompt.tokens.size(), slot.id, pos_min);
@@ -2673,6 +2754,32 @@ private:
                            GGML_ABORT("failed to truncate draft context\n");
                        }
                    }
+
+                    // check if we should process the image
+                    if (slot.prompt.n_tokens() < slot.task->n_tokens() && input_tokens[slot.prompt.n_tokens()] == LLAMA_TOKEN_NULL) {
+                        // process the image
+                        size_t n_tokens_out = 0;
+                        int32_t res = input_tokens.process_chunk(ctx, mctx, ep_ctx, slot.prompt.n_tokens(), slot.prompt.tokens.pos_next(), slot.id, n_tokens_out);
+                        if (res != 0) {
+                            SLT_ERR(slot, "failed to process image, res = %d\n", res);
+                            send_error(slot, "failed to process image", ERROR_TYPE_SERVER);
+                            slot.release();
+                            continue;
+                        }
+
+                        slot.n_prompt_tokens_processed += n_tokens_out;
+
+                        // add the image chunk to cache
+                        {
+                            if (input_tokens.is_ep()) {
+                                const auto & chunk = input_tokens.find_ep_chunk(slot.prompt.n_tokens());
+                                slot.prompt.tokens.push_back(chunk); // copy
+                            } else {
+                                const auto & chunk = input_tokens.find_chunk(slot.prompt.n_tokens());
+                                slot.prompt.tokens.push_back(chunk.get()); // copy
+                            }
+                        }
+                    }
 
                     // If using an alora, there may be uncached tokens that come
                     // before the invocation sequence. When this happens, the
@@ -3289,7 +3396,8 @@ server_context_meta server_context::get_meta() const {
         /* model_aliases          */ impl->model_aliases,
         /* model_tags             */ impl->model_tags,
         /* model_path             */ impl->params_base.model.path,
-        /* has_mtmd               */ impl->mctx != nullptr,
+        /* vision_backend         */ impl->vision_backend_name(),
+        /* has_mtmd               */ impl->has_multimodal(),
         /* has_inp_image          */ impl->chat_params.allow_image,
         /* has_inp_audio          */ impl->chat_params.allow_audio,
         /* json_webui_settings    */ impl->json_webui_settings,
@@ -3374,12 +3482,16 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
         // process prompt
         std::vector<server_tokens> inputs;
 
-        if (res_type != TASK_RESPONSE_TYPE_NONE && ctx_server.mctx != nullptr) {
-            // This is the case used by OAI compatible chat path with MTMD. TODO It can be moved to the path below.
-            inputs.push_back(process_mtmd_prompt(ctx_server.mctx, prompt.get<std::string>(), files));
+        if (res_type != TASK_RESPONSE_TYPE_NONE && (ctx_server.mctx != nullptr || ctx_server.ep_ctx != nullptr)) {
+            // OAI-compatible chat path with multimodal backend.
+            if (ctx_server.ep_ctx != nullptr) {
+                inputs.push_back(process_ep_prompt(ctx_server.ep_ctx, ctx_server.vocab, prompt.get<std::string>(), files));
+            } else {
+                inputs.push_back(process_mtmd_prompt(ctx_server.mctx, prompt.get<std::string>(), files));
+            }
         } else {
             // Everything else, including multimodal completions.
-            inputs = tokenize_input_prompts(ctx_server.vocab, ctx_server.mctx, prompt, true, true);
+            inputs = tokenize_input_prompts(ctx_server.vocab, ctx_server.mctx, ctx_server.ep_ctx, prompt, true, true);
         }
 
         // tasks.reserve(inputs.size()); // TODO: this is inaccurate due to child tasks
@@ -3806,6 +3918,7 @@ void server_routes::init_routes() {
             { "total_slots",                 params.n_parallel },
             { "model_alias",                 meta->model_name },
             { "model_path",                  meta->model_path },
+            { "vision_backend",              meta->vision_backend },
             { "modalities",                  json {
                 {"vision", meta->has_inp_image},
                 {"audio",  meta->has_inp_audio},
@@ -3841,6 +3954,35 @@ void server_routes::init_routes() {
         // update any props here
 
         res->ok({{ "success", true }});
+        return res;
+    };
+
+    this->get_api_show = [this](const server_http_req &) {
+        auto res = create_response();
+        std::string tmpl_default = common_chat_templates_source(meta->chat_params.tmpls.get(), "");
+        json data = {
+            {
+                "model_info", {
+                    { "llama.context_length", meta->slot_n_ctx },
+                }
+            },
+            {"modelfile", ""},
+            {"parameters", ""},
+            {"template", tmpl_default},
+            {"details", {
+                {"parent_model", ""},
+                {"format", "gguf"},
+                {"family", ""},
+                {"families", {""}},
+                {"parameter_size", ""},
+                {"quantization_level", ""}
+            }},
+            {"model_info", ""},
+            {"capabilities", meta->has_mtmd ? json({"completion","multimodal"}) : json({"completion"})},
+            {"vision_backend", meta->vision_backend}
+        };
+
+        res->ok(data);
         return res;
     };
 
@@ -3899,7 +4041,7 @@ void server_routes::init_routes() {
         data["input_extra"] = input_extra; // default to empty array if it's not exist
 
         std::string prompt = json_value(data, "prompt", std::string());
-        std::vector<server_tokens> tokenized_prompts = tokenize_input_prompts(ctx_server.vocab, ctx_server.mctx, prompt, false, true);
+        std::vector<server_tokens> tokenized_prompts = tokenize_input_prompts(ctx_server.vocab, ctx_server.mctx, ctx_server.ep_ctx, prompt, false, true);
         SRV_DBG("creating infill tasks, n_prompts = %d\n", (int) tokenized_prompts.size());
         data["prompt"] = format_prompt_infill(
             ctx_server.vocab,
@@ -4076,6 +4218,7 @@ void server_routes::init_routes() {
                     {"description", ""},
                     {"tags", {""}},
                     {"capabilities", meta->has_mtmd ? json({"completion","multimodal"}) : json({"completion"})},
+                    {"vision_backend", meta->vision_backend},
                     {"parameters", ""},
                     {"details", {
                         {"parent_model", ""},
@@ -4319,6 +4462,7 @@ json server_routes::get_model_info() const {
             {"n_embd",      meta->model_n_embd_inp},
             {"n_params",    meta->model_n_params},
             {"size",        meta->model_size},
+            {"vision_backend", meta->vision_backend},
         }},
     };
 }
@@ -4460,7 +4604,7 @@ std::unique_ptr<server_res_generator> server_routes::handle_embeddings_impl(cons
         }
     }
 
-    auto tokenized_prompts = tokenize_input_prompts(ctx_server.vocab, ctx_server.mctx, prompt, true, true);
+    auto tokenized_prompts = tokenize_input_prompts(ctx_server.vocab, ctx_server.mctx, ctx_server.ep_ctx, prompt, true, true);
     for (const auto & tokens : tokenized_prompts) {
         // this check is necessary for models that do not add BOS token to the input
         if (tokens.empty()) {

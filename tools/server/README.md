@@ -325,6 +325,26 @@ The server includes a set of built-in tools that enable the LLM to access the lo
 
 To use this feature, start the server with `--tools all`. You can also enable only specific tools by passing a comma-separated list: `--tools name1,name2,...`. Run `--help` for the full list of available tool names.
 
+### EP vision backend (Spacemit ONNX)
+
+In addition to the default `mmproj` multimodal backend, `llama-server` can be built with an EP vision backend and selected at runtime:
+
+- `--vision-backend auto|mtmd|ep` (default: `auto`)
+- `--ep-config-dir <dir>` for EP config directory (`config.json` + ONNX model files)
+
+Selection behavior in `auto` mode:
+
+- If `--ep-config-dir` is provided, EP is selected.
+- Otherwise, if `--mmproj` is provided, mtmd is selected.
+
+Current EP backend limits:
+
+- vision-only (audio input is not supported)
+- input image data must be preprocessed `.bin` content
+- for `image_url`, use either:
+  - `file://<relative/path>.bin` (requires `--media-path`)
+  - `data:application/octet-stream;base64,<...>`
+
 ## Build
 
 `llama-server` is built alongside everything else from the root of the project

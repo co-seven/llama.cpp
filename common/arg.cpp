@@ -2198,6 +2198,23 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_examples(mmproj_examples).set_env("LLAMA_ARG_MMPROJ_OFFLOAD"));
     add_opt(common_arg(
+        {"--vision-backend"}, "{auto|mtmd|ep}",
+        string_format("multimodal backend selection (default: %s)", params.vision_backend.c_str()),
+        [](common_params & params, const std::string & value) {
+            if (value != "auto" && value != "mtmd" && value != "ep") {
+                throw std::invalid_argument("vision-backend must be one of: auto, mtmd, ep");
+            }
+            params.vision_backend = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_VISION_BACKEND"));
+    add_opt(common_arg(
+        {"--ep-config-dir"}, "DIR",
+        "path to EP config directory (config.json + ONNX model files)",
+        [](common_params & params, const std::string & value) {
+            params.ep_config_dir = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_EP_CONFIG_DIR"));
+    add_opt(common_arg(
         {"--image", "--audio"}, "FILE",
         "path to an image or audio file. use with multimodal models, use comma-separated values for multiple files\n",
         [](common_params & params, const std::string & value) {

@@ -13,6 +13,8 @@ add_library(${TARGET} STATIC
     server-queue.h
     server-common.cpp
     server-common.h
+    server-ep-vision.cpp
+    server-ep-vision.h
     server-context.cpp
     server-context.h
     server-tools.cpp
@@ -26,6 +28,41 @@ endif()
 target_include_directories(${TARGET} PRIVATE ../mtmd)
 target_include_directories(${TARGET} PRIVATE ${CMAKE_SOURCE_DIR})
 target_link_libraries(${TARGET} PUBLIC llama-common mtmd ${CMAKE_THREAD_LIBS_INIT})
+
+option(LLAMA_SERVER_EP_VISION "Build llama-server with Spacemit EP ONNX vision backend support" OFF)
+if(LLAMA_SERVER_EP_VISION)
+    if(NOT DEFINED SPACEMIT_EP_DIR)
+        message(FATAL_ERROR "SPACEMIT_EP_DIR must be set when LLAMA_SERVER_EP_VISION=ON")
+    endif()
+    if(NOT DEFINED ONNXRUNTIME_INC_DIR)
+        message(FATAL_ERROR "ONNXRUNTIME_INC_DIR must be set when LLAMA_SERVER_EP_VISION=ON")
+    endif()
+    if(NOT DEFINED ONNXRUNTIME_LIB_DIR)
+        message(FATAL_ERROR "ONNXRUNTIME_LIB_DIR must be set when LLAMA_SERVER_EP_VISION=ON")
+    endif()
+
+    target_compile_definitions(${TARGET} PRIVATE LLAMA_SERVER_EP_VISION=1)
+    target_sources(${TARGET} PRIVATE
+        ../mtmd/ep-vision-wrapper.cpp
+        ${SPACEMIT_EP_DIR}/src/llm/spine_vision_engine.cc
+        ${SPACEMIT_EP_DIR}/src/llm/spine_llm_argparser.cc
+    )
+    set(ONNXRUNTIME_LIB "")
+    if(EXISTS "${ONNXRUNTIME_LIB_DIR}/libonnxruntime.so")
+        set(ONNXRUNTIME_LIB "${ONNXRUNTIME_LIB_DIR}/libonnxruntime.so")
+    elseif(EXISTS "${ONNXRUNTIME_LIB_DIR}/libonnxruntime.a")
+        set(ONNXRUNTIME_LIB "${ONNXRUNTIME_LIB_DIR}/libonnxruntime.a")
+    else()
+        message(FATAL_ERROR "Could not find libonnxruntime.{so,a} in ONNXRUNTIME_LIB_DIR='${ONNXRUNTIME_LIB_DIR}'")
+    endif()
+
+    target_include_directories(${TARGET} PRIVATE
+        ../mtmd
+        ${SPACEMIT_EP_DIR}/src/llm
+        ${ONNXRUNTIME_INC_DIR}
+    )
+    target_link_libraries(${TARGET} PRIVATE ${ONNXRUNTIME_LIB} dl)
+endif()
 
 
 # llama-server executable

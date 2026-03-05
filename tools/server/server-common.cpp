@@ -255,6 +255,12 @@ llama_pos server_tokens::pos_next(int64_t n_tokens) const {
     if (n_tokens < 0) {
         llama_pos res = tokens.size();
 
+    if (has_ep) {
+        for (const auto & it : map_idx_to_ep_media) {
+            const auto & chunk = it.second;
+            res += chunk.n_pos - chunk.n_tokens;
+        }
+    } else {
         for (auto it = map_idx_to_media.begin(); it != map_idx_to_media.end(); ++it) {
             const auto & chunk = it->second;
             res += mtmd_input_chunk_get_n_pos(chunk.get()) - mtmd_input_chunk_get_n_tokens(chunk.get());
@@ -330,8 +336,14 @@ std::string server_tokens::str() const {
     }
     oss << "\n";
     oss << "image idx: ";
-    for (const auto & it : map_idx_to_media) {
-        oss << it.first << ", ";
+    if (has_ep) {
+        for (const auto & it : map_idx_to_ep_media) {
+            oss << it.first << ", ";
+        }
+    } else {
+        for (const auto & it : map_idx_to_media) {
+            oss << it.first << ", ";
+        }
     }
     return oss.str();
 }
@@ -342,6 +354,14 @@ const mtmd::input_chunk_ptr & server_tokens::find_chunk(size_t idx) const {
         return it->second;
     }
     throw std::runtime_error("Chunk not found");
+}
+
+const server_ep_image_chunk & server_tokens::find_ep_chunk(size_t idx) const {
+    auto it = map_idx_to_ep_media.find(idx);
+    if (it != map_idx_to_ep_media.end()) {
+        return it->second;
+    }
+    throw std::runtime_error("EP chunk not found");
 }
 
 void server_tokens::push_back(llama_token tok) {
@@ -373,6 +393,16 @@ void server_tokens::push_back(const mtmd_input_chunk * chunk) {
     }
 }
 
+void server_tokens::push_back(const server_ep_image_chunk & chunk) {
+    GGML_ASSERT(has_mtmd);
+    has_ep = true;
+    const size_t start_idx = tokens.size();
+    for (int32_t i = 0; i < chunk.n_tokens; ++i) {
+        tokens.emplace_back(LLAMA_TOKEN_NULL);
+    }
+    map_idx_to_ep_media[start_idx] = chunk;
+}
+
 void server_tokens::push_back(server_tokens & tokens) {
     size_t start_idx = size();
     for (size_t i = 0; i < tokens.size(); i++) {
@@ -382,10 +412,18 @@ void server_tokens::push_back(server_tokens & tokens) {
         // Assert if we are copying MTMD chunks to a server_tokens that does not have mtmd.
         // We could also just check, but this will prevent silently dropping MTMD data.
         GGML_ASSERT(has_mtmd);
-        for (auto it = tokens.map_idx_to_media.begin(); it != tokens.map_idx_to_media.end(); ) {
-            auto * chunk = tokens.map_idx_to_media[it->first].get();
-            mtmd::input_chunk_ptr new_chunk(mtmd_input_chunk_copy(chunk));
-            map_idx_to_media[start_idx + it->first] = std::move(new_chunk);
+        if (tokens.has_ep) {
+            has_ep = true;
+            for (const auto & it : tokens.map_idx_to_ep_media) {
+                map_idx_to_ep_media[start_idx + it.first] = it.second;
+            }
+        } else {
+            for (auto it = tokens.map_idx_to_media.begin(); it != tokens.map_idx_to_media.end(); ) {
+                auto * chunk = tokens.map_idx_to_media[it->first].get();
+                mtmd::input_chunk_ptr new_chunk(mtmd_input_chunk_copy(chunk));
+                map_idx_to_media[start_idx + it->first] = std::move(new_chunk);
+                ++it;
+            }
         }
     }
 }
@@ -432,16 +470,31 @@ void server_tokens::keep_first(size_t n) {
             // note that the case where we keep a full image at the end is allowed:
             //   tokens[n - 1] == LLAMA_TOKEN_NULL && tokens[n] != LLAMA_TOKEN_NULL
             if (tokens[n - 1] == LLAMA_TOKEN_NULL && tokens[n] == LLAMA_TOKEN_NULL) {
-                find_chunk(n - 1); // will throw an error if the token is not begin-of-chunk
+                if (has_ep) {
+                    find_ep_chunk(n - 1); // will throw an error if the token is not begin-of-chunk
+                } else {
+                    find_chunk(n - 1); // will throw an error if the token is not begin-of-chunk
+                }
             }
         }
         // remove all image chunks that are not used anymore
-        for (auto it = map_idx_to_media.begin(); it != map_idx_to_media.end(); ) {
-            size_t idx = it->first;
-            if (idx >= n) {
-                it = map_idx_to_media.erase(it);
-            } else {
-                ++it;
+        if (has_ep) {
+            for (auto it = map_idx_to_ep_media.begin(); it != map_idx_to_ep_media.end(); ) {
+                size_t idx = it->first;
+                if (idx >= n) {
+                    it = map_idx_to_ep_media.erase(it);
+                } else {
+                    ++it;
+                }
+            }
+        } else {
+            for (auto it = map_idx_to_media.begin(); it != map_idx_to_media.end(); ) {
+                size_t idx = it->first;
+                if (idx >= n) {
+                    it = map_idx_to_media.erase(it);
+                } else {
+                    ++it;
+                }
             }
         }
     }
@@ -474,21 +527,44 @@ size_t server_tokens::get_common_prefix(const server_tokens & b) const {
         return max_idx;
     }
 
+    if (has_ep != b.has_ep) {
+        for (size_t i = 0; i < max_idx; ++i) {
+            if (tokens[i] != b.tokens[i]) {
+                return i;
+            }
+            if (tokens[i] == LLAMA_TOKEN_NULL) {
+                return i;
+            }
+        }
+        return max_idx;
+    }
+
     for (size_t i = 0; i < max_idx; ++i) {
         const llama_token ai =   tokens[i];
         const llama_token bi = b.tokens[i];
 
         if (ai == LLAMA_TOKEN_NULL && bi == LLAMA_TOKEN_NULL) {
-            const auto & a_chunk =   find_chunk(i);
-            const auto & b_chunk = b.find_chunk(i);
+            std::string id_ai;
+            std::string id_bi;
+            size_t n_tok_a = 0;
+            size_t n_tok_b = 0;
 
-            GGML_ASSERT(a_chunk && b_chunk);
-
-            const std::string id_ai = mtmd_input_chunk_get_id(a_chunk.get());
-            const std::string id_bi = mtmd_input_chunk_get_id(b_chunk.get());
-
-            const size_t n_tok_a = mtmd_input_chunk_get_n_tokens(a_chunk.get());
-            const size_t n_tok_b = mtmd_input_chunk_get_n_tokens(b_chunk.get());
+            if (has_ep) {
+                const auto & a_chunk = find_ep_chunk(i);
+                const auto & b_chunk = b.find_ep_chunk(i);
+                id_ai = a_chunk.id;
+                id_bi = b_chunk.id;
+                n_tok_a = (size_t) a_chunk.n_tokens;
+                n_tok_b = (size_t) b_chunk.n_tokens;
+            } else {
+                const auto & a_chunk = find_chunk(i);
+                const auto & b_chunk = b.find_chunk(i);
+                GGML_ASSERT(a_chunk && b_chunk);
+                id_ai = mtmd_input_chunk_get_id(a_chunk.get());
+                id_bi = mtmd_input_chunk_get_id(b_chunk.get());
+                n_tok_a = mtmd_input_chunk_get_n_tokens(a_chunk.get());
+                n_tok_b = mtmd_input_chunk_get_n_tokens(b_chunk.get());
+            }
 
             if (id_ai == id_bi && n_tok_a == n_tok_b) {
                 GGML_ASSERT(n_tok_a > 0 && "Invalid media chunk"); // should never happen
@@ -518,10 +594,17 @@ bool server_tokens::validate(const struct llama_context * ctx) const {
         const auto & t = tokens[i];
         if (t == LLAMA_TOKEN_NULL) {
             try {
-                const auto & chunk = find_chunk(i);
-                size_t n_tokens = mtmd_input_chunk_get_n_tokens(chunk.get());
-                i += n_tokens - 1; // will be +1 by the for loop
+                size_t n_tokens = 0;
+                if (has_ep) {
+                    const auto & chunk = find_ep_chunk(i);
+                    n_tokens = (size_t) chunk.n_tokens;
+                } else {
+                    const auto & chunk = find_chunk(i);
+                    n_tokens = mtmd_input_chunk_get_n_tokens(chunk.get());
+                }
+                i += n_tokens - 1;
             } catch (const std::exception & e) {
+                GGML_UNUSED(e);
                 return false;
             }
         } else if (t < 0 || t >= n_vocab) {
@@ -534,42 +617,77 @@ bool server_tokens::validate(const struct llama_context * ctx) const {
 int32_t server_tokens::process_chunk(
             llama_context * ctx,
             mtmd_context * mctx,
+            const server_ep_vision_context * ep_ctx,
             size_t idx,
             llama_pos pos,
             int32_t seq_id,
             size_t & n_tokens_out) const {
-    const auto & chunk = find_chunk(idx);
-    const char * name = mtmd_input_chunk_get_type(chunk.get()) == MTMD_INPUT_CHUNK_TYPE_IMAGE
-                        ? "image" : "audio";
-    SRV_INF("processing %s...\n", name);
-    int32_t n_batch = llama_n_batch(ctx);
-    int64_t t0 = ggml_time_ms();
-    llama_pos new_n_past; // unused for now
-    int32_t result = mtmd_helper_eval_chunk_single(mctx, ctx,
-        chunk.get(),
-        pos,
-        seq_id,
-        n_batch,
-        true, // logits last
-        &new_n_past);
-    SRV_INF("%s processed in %" PRId64 " ms\n", name, ggml_time_ms() - t0);
-    if (result != 0) {
-        LOG_ERR("mtmd_helper_eval failed with status %d", result);
-        n_tokens_out = 0;
-        return result;
+    if (has_ep) {
+        const auto & chunk = find_ep_chunk(idx);
+        if (ep_ctx == nullptr) {
+            n_tokens_out = 0;
+            return -1;
+        }
+        SRV_INF("%s", "processing image (ep)...\n");
+        int64_t t0 = ggml_time_ms();
+        llama_pos n_past = pos;
+        int32_t result = server_ep_vision_decode_chunk(
+                ctx,
+                ep_ctx,
+                chunk,
+                n_past,
+                seq_id,
+                llama_n_batch(ctx),
+                true);
+        SRV_INF("image (ep) processed in %" PRId64 " ms\n", ggml_time_ms() - t0);
+        if (result != 0) {
+            LOG_ERR("server_ep_vision_decode_chunk failed with status %d\n", result);
+            n_tokens_out = 0;
+            return result;
+        }
+        n_tokens_out = (size_t) chunk.n_tokens;
+        return 0;
+    } else {
+        const auto & chunk = find_chunk(idx);
+        const char * name = mtmd_input_chunk_get_type(chunk.get()) == MTMD_INPUT_CHUNK_TYPE_IMAGE
+                            ? "image" : "audio";
+        SRV_INF("processing %s...\n", name);
+        int32_t n_batch = llama_n_batch(ctx);
+        int64_t t0 = ggml_time_ms();
+        llama_pos new_n_past; // unused for now
+        int32_t result = mtmd_helper_eval_chunk_single(mctx, ctx,
+            chunk.get(),
+            pos,
+            seq_id,
+            n_batch,
+            true, // logits last
+            &new_n_past);
+        SRV_INF("%s processed in %" PRId64 " ms\n", name, ggml_time_ms() - t0);
+        if (result != 0) {
+            LOG_ERR("mtmd_helper_eval failed with status %d", result);
+            n_tokens_out = 0;
+            return result;
+        }
+        n_tokens_out = mtmd_input_chunk_get_n_tokens(chunk.get());
+        return 0;
     }
-    n_tokens_out = mtmd_input_chunk_get_n_tokens(chunk.get());
-    return 0;
 }
 
 server_tokens server_tokens::clone() const {
     server_tokens res;
     res.has_mtmd = has_mtmd;
+    res.has_ep = has_ep;
     res.tokens   = tokens;
-    for (auto it = map_idx_to_media.begin(); it != map_idx_to_media.end(); ++it) {
-        size_t idx = it->first;
-        const mtmd::input_chunk_ptr & chunk = it->second;
-        res.map_idx_to_media[idx] = mtmd::input_chunk_ptr(mtmd_input_chunk_copy(chunk.get()));
+    if (has_ep) {
+        for (const auto & it : map_idx_to_ep_media) {
+            res.map_idx_to_ep_media[it.first] = it.second;
+        }
+    } else {
+        for (auto it = map_idx_to_media.begin(); it != map_idx_to_media.end(); ++it) {
+            size_t idx = it->first;
+            const mtmd::input_chunk_ptr & chunk = it->second;
+            res.map_idx_to_media[idx] = mtmd::input_chunk_ptr(mtmd_input_chunk_copy(chunk.get()));
+        }
     }
     return res;
 }
@@ -713,6 +831,38 @@ static std::string fnv_hash(const uint8_t * data, size_t len) {
     return std::to_string(hash);
 }
 
+static void replace_all(std::string & s, const std::string & from, const std::string & to) {
+    if (from.empty()) {
+        return;
+    }
+    size_t pos = 0;
+    while ((pos = s.find(from, pos)) != std::string::npos) {
+        s.replace(pos, from.size(), to);
+        pos += to.size();
+    }
+}
+
+static std::vector<std::string> split_keep_marker(const std::string & input, const std::string & marker) {
+    std::vector<std::string> out;
+    size_t pos = 0;
+    while (true) {
+        const size_t mpos = input.find(marker, pos);
+        if (mpos == std::string::npos) {
+            out.emplace_back(input.substr(pos));
+            break;
+        }
+        if (mpos > pos) {
+            out.emplace_back(input.substr(pos, mpos - pos));
+        }
+        out.emplace_back(marker);
+        pos = mpos + marker.size();
+    }
+    if (out.empty()) {
+        out.emplace_back("");
+    }
+    return out;
+}
+
 server_tokens process_mtmd_prompt(mtmd_context * mctx, std::string prompt, std::vector<raw_buffer> files) {
     mtmd::bitmaps bitmaps;
     for (auto & file : files) {
@@ -747,6 +897,60 @@ server_tokens process_mtmd_prompt(mtmd_context * mctx, std::string prompt, std::
     return result;
 }
 
+server_tokens process_ep_prompt(
+        server_ep_vision_context * ep_ctx,
+        const llama_vocab * vocab,
+        std::string prompt,
+        std::vector<raw_buffer> files,
+        bool add_special,
+        bool parse_special) {
+    if (ep_ctx == nullptr) {
+        throw std::runtime_error("EP vision backend is not initialized");
+    }
+
+    static const std::string k_media_marker = "<__media__>";
+    static const std::string k_legacy_marker = "<__image__>";
+
+    replace_all(prompt, k_legacy_marker, k_media_marker);
+    if (!files.empty() && prompt.find(k_media_marker) == std::string::npos) {
+        for (size_t i = 0; i < files.size(); ++i) {
+            prompt = k_media_marker + prompt;
+        }
+    }
+
+    auto parts = split_keep_marker(prompt, k_media_marker);
+    size_t marker_count = 0;
+    for (const auto & p : parts) {
+        if (p == k_media_marker) {
+            marker_count++;
+        }
+    }
+    if (marker_count != files.size()) {
+        throw std::runtime_error("Number of images does not match number of media markers");
+    }
+
+    server_tokens out(llama_tokens{}, true);
+
+    size_t img_idx = 0;
+    bool add_special_once = add_special;
+    for (const auto & part : parts) {
+        if (part == k_media_marker) {
+            auto chunk = server_ep_vision_encode_image_bin(ep_ctx, files[img_idx++]);
+            out.push_back(chunk);
+            add_special_once = false;
+            continue;
+        }
+
+        auto toks = common_tokenize(vocab, part, add_special_once, parse_special);
+        for (auto tok : toks) {
+            out.push_back(tok);
+        }
+        add_special_once = false;
+    }
+
+    return out;
+}
+
 /**
  * break the input "prompt" object into multiple prompt if needed, then tokenize them
  * use tokenize_input_prompts() if the input could be an array.
@@ -756,10 +960,16 @@ server_tokens process_mtmd_prompt(mtmd_context * mctx, std::string prompt, std::
  * - "prompt": [12, 34, "string", 56, 78]
  * - "prompt": { "prompt_string": "string", "multimodal_data": [ "base64" ] }
  */
-static server_tokens tokenize_input_subprompt(const llama_vocab * vocab, mtmd_context * mctx, const json & json_prompt, bool add_special, bool parse_special) {
+static server_tokens tokenize_input_subprompt(
+        const llama_vocab * vocab,
+        mtmd_context * mctx,
+        server_ep_vision_context * ep_ctx,
+        const json & json_prompt,
+        bool add_special,
+        bool parse_special) {
     constexpr char JSON_STRING_PROMPT_KEY[] = "prompt_string";
     constexpr char JSON_MTMD_DATA_KEY[] = "multimodal_data";
-    const bool has_mtmd = mctx != nullptr;
+    const bool has_mtmd = mctx != nullptr || ep_ctx != nullptr;
     if (json_prompt.is_string() || json_is_array_of_mixed_numbers_strings(json_prompt)) {
         // string or mixed
         llama_tokens tmp = tokenize_mixed(vocab, json_prompt, add_special, parse_special);
@@ -779,6 +989,9 @@ static server_tokens tokenize_input_subprompt(const llama_vocab * vocab, mtmd_co
             for (const auto & entry : json_prompt.at(JSON_MTMD_DATA_KEY)) {
                 files.push_back(base64_decode(entry));
             }
+            if (ep_ctx != nullptr) {
+                return process_ep_prompt(ep_ctx, vocab, json_prompt.at(JSON_STRING_PROMPT_KEY), files, add_special, parse_special);
+            }
             return process_mtmd_prompt(mctx, json_prompt.at(JSON_STRING_PROMPT_KEY), files);
         } else {
             // Not multimodal, but contains a subobject.
@@ -790,15 +1003,21 @@ static server_tokens tokenize_input_subprompt(const llama_vocab * vocab, mtmd_co
    }
 }
 
-std::vector<server_tokens> tokenize_input_prompts(const llama_vocab * vocab, mtmd_context * mctx, const json & json_prompt, bool add_special, bool parse_special) {
+std::vector<server_tokens> tokenize_input_prompts(
+        const llama_vocab * vocab,
+        mtmd_context * mctx,
+        server_ep_vision_context * ep_ctx,
+        const json & json_prompt,
+        bool add_special,
+        bool parse_special) {
     std::vector<server_tokens> result;
     if (json_prompt.is_array() && !json_is_array_and_contains_numbers(json_prompt)) {
         result.reserve(json_prompt.size());
         for (const auto & p : json_prompt) {
-            result.push_back(tokenize_input_subprompt(vocab, mctx, p,add_special, parse_special));
+            result.push_back(tokenize_input_subprompt(vocab, mctx, ep_ctx, p, add_special, parse_special));
         }
     } else {
-        result.push_back(tokenize_input_subprompt(vocab, mctx, json_prompt, add_special, parse_special));
+        result.push_back(tokenize_input_subprompt(vocab, mctx, ep_ctx, json_prompt, add_special, parse_special));
     }
     if (result.empty()) {
         throw std::runtime_error("\"prompt\" must not be empty");
@@ -853,7 +1072,8 @@ json oaicompat_completion_params_parse(const json & body) {
 static void handle_media(
         std::vector<raw_buffer> & out_files,
         json & media_obj,
-        const std::string & media_path) {
+        const std::string & media_path,
+        bool image_bin_only) {
     std::string url = json_value(media_obj, "url", std::string());
     if (string_starts_with(url, "http")) {
         // download remote image
@@ -878,6 +1098,9 @@ static void handle_media(
         }
         // load local image file
         std::string file_path = url.substr(7); // remove "file://"
+        if (image_bin_only && !string_ends_with(file_path, ".bin")) {
+            throw std::invalid_argument("EP backend expects .bin file for file:// image_url");
+        }
         raw_buffer data;
         if (!fs_validate_filename(file_path, true)) {
             throw std::invalid_argument("file path is not allowed: " + file_path);
@@ -895,7 +1118,9 @@ static void handle_media(
         std::vector<std::string> parts = string_split<std::string>(url, /*separator*/ ',');
         if (parts.size() != 2) {
             throw std::runtime_error("Invalid url value");
-        } else if (!string_starts_with(parts[0], "data:image/")) {
+        } else if (image_bin_only && !string_starts_with(parts[0], "data:application/octet-stream")) {
+            throw std::runtime_error("EP backend expects data:application/octet-stream;base64");
+        } else if (!image_bin_only && !string_starts_with(parts[0], "data:image/")) {
             throw std::runtime_error("Invalid url format: " + parts[0]);
         } else if (!string_ends_with(parts[0], "base64")) {
             throw std::runtime_error("url must be base64 encoded");
@@ -992,11 +1217,11 @@ json oaicompat_chat_params_parse(
             std::string type      = json_value(p, "type", std::string());
             if (type == "image_url") {
                 if (!opt.allow_image) {
-                    throw std::runtime_error("image input is not supported - hint: if this is unexpected, you may need to provide the mmproj");
+                    throw std::runtime_error("image input is not supported - hint: if this is unexpected, you may need to configure multimodal backend");
                 }
 
                 json image_url = json_value(p, "image_url", json::object());
-                handle_media(out_files, image_url, opt.media_path);
+                handle_media(out_files, image_url, opt.media_path, opt.image_bin_only);
 
                 p["type"] = "media_marker";
                 p["text"] = get_media_marker();
@@ -1004,7 +1229,7 @@ json oaicompat_chat_params_parse(
 
             } else if (type == "input_audio") {
                 if (!opt.allow_audio) {
-                    throw std::runtime_error("audio input is not supported - hint: if this is unexpected, you may need to provide the mmproj");
+                    throw std::runtime_error("audio input is not supported by the active multimodal backend");
                 }
 
                 json input_audio   = json_value(p, "input_audio", json::object());
@@ -1599,12 +1824,12 @@ server_tokens format_prompt_rerank(
         std::string prompt = rerank_prompt;
         string_replace_all(prompt, "{query}"   , query);
         string_replace_all(prompt, "{document}", doc  );
-        server_tokens tokens = tokenize_input_subprompt(vocab, mctx, prompt, false, true);
+        server_tokens tokens = tokenize_input_subprompt(vocab, mctx, nullptr, prompt, false, true);
         result.push_back(tokens);
     } else {
         // Get EOS token - use SEP token as fallback if EOS is not available
-        server_tokens query_tokens = tokenize_input_subprompt(vocab, mctx, query, false, false);
-        server_tokens doc_tokens   = tokenize_input_subprompt(vocab, mctx, doc,   false, false);
+        server_tokens query_tokens = tokenize_input_subprompt(vocab, mctx, nullptr, query, false, false);
+        server_tokens doc_tokens   = tokenize_input_subprompt(vocab, mctx, nullptr, doc,   false, false);
         llama_token eos_token = llama_vocab_eos(vocab);
         if (eos_token == LLAMA_TOKEN_NULL) {
             eos_token = llama_vocab_sep(vocab);

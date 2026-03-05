@@ -556,6 +556,8 @@ struct common_params {
     struct common_params_model mmproj;
     bool mmproj_use_gpu = true;     // use GPU for multimodal model
     bool no_mmproj = false;         // explicitly disable multimodal model
+    std::string vision_backend = "auto"; // multimodal backend: auto|mtmd|ep
+    std::string ep_config_dir;           // EP config dir (config.json + ONNX)
     std::vector<std::string> image; // path to image file(s)
     int image_min_tokens = -1;
     int image_max_tokens = -1;
