@@ -11,6 +11,7 @@
 #include "console.h"
 #include "chat.h"
 #include "ep-vision-wrapper.h"
+#include "ep-vision-preprocess.h"
 
 #include <vector>
 #include <string>
@@ -19,6 +20,9 @@
 #include <cinttypes>
 #include <cctype>
 #include <cmath>
+#include <cstdio>
+#include <fstream>
+#include <stdexcept>
 #include <utility>
 
 #if defined (__unix__) || (defined (__APPLE__) && defined (__MACH__))
@@ -39,7 +43,7 @@ static volatile bool g_is_interrupted = false;
 static void show_additional_info(int /*argc*/, char ** argv) {
     LOG(
         "Multimodal CLI with Spacemit EP vision engine\n\n"
-        "Usage: %s [options] -m <model> --mmproj <ep_config_dir> --image <image.bin> -p <prompt>\n\n"
+        "Usage: %s [options] -m <model> --mmproj <ep_config_dir> --image <image.jpg|image.bin> -p <prompt>\n\n"
         "  -m and --mmproj are required (or set EP_CONFIG_DIR)\n"
         "  --image and -p are optional, if NOT provided, the CLI will run in chat mode\n",
         argv[0]
@@ -386,6 +390,60 @@ static std::vector<std::string> split_keep_marker(const std::string & input, con
         start = pos + marker.size();
     }
     return out;
+}
+
+static std::vector<uint8_t> read_binary_file(const std::string & path) {
+    std::ifstream file(path, std::ios::binary);
+    if (!file) {
+        throw std::runtime_error("Unable to open image file: " + path);
+    }
+
+    return std::vector<uint8_t>((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
+}
+
+static std::string write_temp_bin_file(const std::vector<uint8_t> & data) {
+#if defined(_WIN32)
+    char temp_path[MAX_PATH] = {0};
+    char temp_file[MAX_PATH] = {0};
+
+    if (GetTempPathA(MAX_PATH, temp_path) == 0) {
+        throw std::runtime_error("failed to get temp path");
+    }
+    if (GetTempFileNameA(temp_path, "mep", 0, temp_file) == 0) {
+        throw std::runtime_error("failed to create temp file");
+    }
+
+    FILE * fp = std::fopen(temp_file, "wb");
+    if (!fp) {
+        throw std::runtime_error("failed to open temp file");
+    }
+    const size_t n = std::fwrite(data.data(), 1, data.size(), fp);
+    std::fclose(fp);
+    if (n != data.size()) {
+        std::remove(temp_file);
+        throw std::runtime_error("failed to write temp file");
+    }
+    return std::string(temp_file);
+#else
+    char tmpl[] = "/tmp/llama-mtmd-ep-XXXXXX";
+    const int fd = mkstemp(tmpl);
+    if (fd < 0) {
+        throw std::runtime_error("failed to create temp file");
+    }
+
+    size_t written = 0;
+    while (written < data.size()) {
+        const ssize_t n = write(fd, data.data() + written, data.size() - written);
+        if (n <= 0) {
+            close(fd);
+            std::remove(tmpl);
+            throw std::runtime_error("failed to write temp file");
+        }
+        written += (size_t) n;
+    }
+    close(fd);
+    return std::string(tmpl);
+#endif
 }
 
 static void append_text_chunk(std::vector<ep_prompt_chunk> & chunks, std::vector<llama_token> && tokens) {
@@ -844,7 +902,39 @@ static int eval_message_ep(mtmd_cli_ep_context & ctx, common_chat_msg & msg) {
 
         // image chunk
         LOG_INF("Encoding image chunk %zu with EP vision engine: %s\n", i, chunk.image_path.c_str());
-        std::vector<float> image_embd = ctx.ep_ctx->encode_image(chunk.image_path);
+        std::string ep_input_path = chunk.image_path;
+        std::string temp_input_path;
+        try {
+            const auto image_bytes = read_binary_file(chunk.image_path);
+            auto preproc = ep_vision_preprocess_if_image(image_bytes, ctx.ep_ctx->architecture());
+            if (preproc.was_image) {
+                temp_input_path = write_temp_bin_file(preproc.tensor_bytes);
+                ep_input_path = temp_input_path;
+                LOG_INF("[EP-v3] preprocessed image '%s' -> [1,3,%d,%d] float32 (%s)\n",
+                        chunk.image_path.c_str(),
+                        preproc.target_h,
+                        preproc.target_w,
+                        preproc.normalize_to_01 ? "0..1" : "0..255");
+            }
+        } catch (const std::exception & e) {
+            LOG_ERR("Failed to prepare image '%s': %s\n", chunk.image_path.c_str(), e.what());
+            return 1;
+        }
+
+        std::vector<float> image_embd;
+        try {
+            image_embd = ctx.ep_ctx->encode_image(ep_input_path);
+            if (!temp_input_path.empty()) {
+                std::remove(temp_input_path.c_str());
+            }
+        } catch (const std::exception & e) {
+            if (!temp_input_path.empty()) {
+                std::remove(temp_input_path.c_str());
+            }
+            LOG_ERR("Failed to encode image chunk %zu (%s): %s\n", i, chunk.image_path.c_str(), e.what());
+            return 1;
+        }
+
         if (image_embd.empty() || image_embd.size() % (size_t)ctx.hidden_size != 0) {
             LOG_ERR("Invalid image embedding shape from EP (size=%zu, hidden_size=%" PRId64 ")\n",
                     image_embd.size(), ctx.hidden_size);
@@ -989,7 +1079,7 @@ int main(int argc, char ** argv) {
     } else {
         // Chat mode
         LOG("\n Running in chat mode (EP vision), available commands:");
-        LOG("\n   /image <path>    load a preprocessed image binary");
+        LOG("\n   /image <path>    load an image (.jpg/.png/...) or preprocessed .bin");
         LOG("\n   /clear           clear the chat history");
         LOG("\n   /quit or /exit   exit the program");
         LOG("\n");
@@ -1031,7 +1121,7 @@ int main(int argc, char ** argv) {
                 }
                 std::string media_path = line.substr(7);
                 ctx.add_image(media_path);
-                LOG("%s image binary loaded\n", media_path.c_str());
+                LOG("%s image loaded\n", media_path.c_str());
                 content += "<__media__>";
                 continue;
             } else {

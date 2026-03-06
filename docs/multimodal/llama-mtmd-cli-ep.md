@@ -3,7 +3,7 @@
 `llama-mtmd-cli-ep` 是基于 `llama.cpp` 的多模态命令行推理工具，专为 Spacemit EP ONNX 视觉引擎设计。
 
 - **文本推理**：由 llama.cpp 加载 GGUF 格式的文本模型完成
-- **视觉编码**：由 Spacemit EP ONNX 引擎完成，读取预处理的图像二进制文件（`.bin`）
+- **视觉编码**：由 Spacemit EP ONNX 引擎完成，支持直接输入 `jpg/png`（内部预处理）或预处理的 `.bin`
 - **运行模式**：支持单轮推理和交互聊天两种模式
 
 > **状态说明（重要）**：
@@ -31,7 +31,7 @@
 | 对比项 | 原生 `llama-mtmd-cli` | EP 版 `llama-mtmd-cli-ep` |
 |--------|----------------------|--------------------------|
 | `--mmproj` 指向 | `mmproj.gguf` 文件 | EP 配置目录（含 `config.json` + ONNX 模型） |
-| `--image` 格式 | jpg / png 等常见图片格式 | 预处理后的二进制文件（`.bin`） |
+| `--image` 格式 | jpg / png 等常见图片格式 | `jpg/png`（内部预处理）或预处理后的二进制文件（`.bin`） |
 | 视觉编码后端 | CLIP/GGUF | Spacemit EP ONNX 引擎 |
 | 音频支持 | 支持 | 不支持（仅视觉） |
 
@@ -48,9 +48,9 @@
    - `config.json`：视觉模型配置，其中的 `hidden_size` **必须**与文本模型的 `n_embd` 一致
    - 视觉 ONNX 模型文件（如 `fastvlm_vision.f16.onnx`、`qwen3_vl_vision.q_replaceneg.onnx`）
 
-3. **预处理后的图像二进制文件**
-   - 例如 `input.bin`、`input2.bin`
-   - 这些文件由外部预处理工具生成，不是原始的 jpg/png
+3. **图像输入**
+   - 支持直接传入原始图像文件（如 `input.jpg`、`input.png`）
+   - 也支持传入预处理后的二进制文件（如 `input.bin`、`input2.bin`）
 
 > **注意**：如果 `config.json` 中的 `hidden_size` 与文本模型的 `n_embd` 不一致，程序会报错并退出。
 
@@ -69,7 +69,7 @@
 
 | 参数 | 格式 | 说明 |
 |------|------|------|
-| `--image` | `--image <path>` | 预处理的图像二进制文件路径。支持两种方式指定多个图像：① 逗号分隔 `--image a.bin,b.bin`；② 重复参数 `--image a.bin --image b.bin`。当与 `-p` 同时提供时进入**单轮推理模式**。 |
+| `--image` | `--image <path>` | 图像路径，支持 `jpg/png`（内部预处理）和预处理 `.bin`。支持两种方式指定多个图像：① 逗号分隔 `--image a.jpg,b.jpg`；② 重复参数 `--image a.jpg --image b.jpg`。当与 `-p` 同时提供时进入**单轮推理模式**。 |
 | `-p` | `-p "<提示词>"` | 用户提示词。在提示词中使用 `<__media__>` 标记图像插入位置。当与 `--image` 同时提供时进入**单轮推理模式**。 |
 
 > 当 `--image` 和 `-p` **同时提供**时为单轮推理模式；否则进入交互聊天模式。
@@ -206,7 +206,7 @@ llama-mtmd-cli-ep \
 
 ```
 Running in chat mode (EP vision), available commands:
-  /image <path>    load a preprocessed image binary
+  /image <path>    load an image (.jpg/.png/...) or preprocessed .bin
   /clear           clear the chat history
   /quit or /exit   exit the program
 ```
@@ -215,7 +215,7 @@ Running in chat mode (EP vision), available commands:
 
 | 命令 | 说明 |
 |------|------|
-| `/image <path>` | 加载一个预处理的图像二进制文件，并在当前输入中追加一个 `<__media__>` 标记。可以在发送文本前多次使用来加载多张图片。 |
+| `/image <path>` | 加载一个图像文件（`jpg/png/...`）或预处理 `.bin`，并在当前输入中追加一个 `<__media__>` 标记。可以在发送文本前多次使用来加载多张图片。 |
 | `/clear` | 清空聊天历史和上下文，恢复到初始状态。如有系统提示词会重新评估。 |
 | `/quit` 或 `/exit` | 退出程序。 |
 | `Ctrl+C` | 中断当前生成。再按一次 `Ctrl+C` 退出程序。 |
@@ -426,7 +426,7 @@ llama-mtmd-cli-ep \
 ## 10. 当前限制
 
 - 仅支持视觉输入（图像），**不支持音频输入**
-- 图像输入必须是预处理后的二进制文件（`.bin`），不能直接使用 jpg/png
+- 对于当前已验证链路，`fastvlm` 与 `qwen3vl` 支持直接输入 `jpg/png`（内部预处理）和 `.bin`
 - 端到端仅在 FastVLM、Qwen3VL 上实测通过；其它模型请视为“未验证状态”
 - 建议使用默认的环境变量配置以保持稳定：
   - `MTMD_EP_IMAGE_BOUNDARY=native`

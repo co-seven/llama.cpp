@@ -6,6 +6,8 @@ add_library(mtmd
             mtmd.cpp
             mtmd-audio.cpp
             mtmd-image.cpp
+            ep-vision-preprocess.cpp
+            ep-vision-preprocess.h
             mtmd.h
             mtmd-helper.cpp
             mtmd-helper.h
@@ -163,6 +165,7 @@ if(MTMD_BUILD_EP_CLI)
 
     target_link_libraries(${EP_TARGET} PRIVATE
         llama-common
+        mtmd
         llama
         ggml
         onnxruntime

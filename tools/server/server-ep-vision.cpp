@@ -17,6 +17,7 @@
 
 #if defined(LLAMA_SERVER_EP_VISION)
 #include "../mtmd/ep-vision-wrapper.h"
+#include "../mtmd/ep-vision-preprocess.h"
 #endif
 
 #if defined(_WIN32)
@@ -432,7 +433,19 @@ server_ep_image_chunk server_ep_vision_encode_image_bin(
 
 #if defined(LLAMA_SERVER_EP_VISION)
     std::lock_guard<std::mutex> lock(ctx->mu);
-    const std::string tmp_file = write_temp_bin_file(data);
+
+    std::vector<uint8_t> ep_input = data;
+    auto preproc = ep_vision_preprocess_if_image(data, ctx->architecture);
+    if (preproc.was_image) {
+        ep_input = std::move(preproc.tensor_bytes);
+        LOG_INF("[server-ep] preprocessed image for arch=%s -> [1,3,%d,%d] float32 (%s)\n",
+                ctx->architecture.c_str(),
+                preproc.target_h,
+                preproc.target_w,
+                preproc.normalize_to_01 ? "0..1" : "0..255");
+    }
+
+    const std::string tmp_file = write_temp_bin_file(ep_input);
 
     server_ep_image_chunk out;
     try {

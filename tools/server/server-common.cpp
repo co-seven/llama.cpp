@@ -12,6 +12,8 @@
 #include <random>
 #include <sstream>
 #include <fstream>
+#include <algorithm>
+#include <cctype>
 
 json format_error_response(const std::string & message, const enum error_type type) {
     std::string type_str;
@@ -1074,6 +1076,19 @@ static void handle_media(
         json & media_obj,
         const std::string & media_path,
         bool image_bin_only) {
+    auto is_ep_supported_image_file = [](const std::string & path) {
+        std::string lower = path;
+        std::transform(lower.begin(), lower.end(), lower.begin(), [](unsigned char c) {
+            return (char) std::tolower(c);
+        });
+        return string_ends_with(lower, ".jpg") ||
+               string_ends_with(lower, ".jpeg") ||
+               string_ends_with(lower, ".png") ||
+               string_ends_with(lower, ".webp") ||
+               string_ends_with(lower, ".bmp") ||
+               string_ends_with(lower, ".gif");
+    };
+
     std::string url = json_value(media_obj, "url", std::string());
     if (string_starts_with(url, "http")) {
         // download remote image
@@ -1098,8 +1113,8 @@ static void handle_media(
         }
         // load local image file
         std::string file_path = url.substr(7); // remove "file://"
-        if (image_bin_only && !string_ends_with(file_path, ".bin")) {
-            throw std::invalid_argument("EP backend expects .bin file for file:// image_url");
+        if (image_bin_only && !string_ends_with(file_path, ".bin") && !is_ep_supported_image_file(file_path)) {
+            throw std::invalid_argument("EP backend expects file:// image_url to be .bin or image file (.jpg/.jpeg/.png/.webp/.bmp/.gif)");
         }
         raw_buffer data;
         if (!fs_validate_filename(file_path, true)) {
@@ -1118,8 +1133,10 @@ static void handle_media(
         std::vector<std::string> parts = string_split<std::string>(url, /*separator*/ ',');
         if (parts.size() != 2) {
             throw std::runtime_error("Invalid url value");
-        } else if (image_bin_only && !string_starts_with(parts[0], "data:application/octet-stream")) {
-            throw std::runtime_error("EP backend expects data:application/octet-stream;base64");
+        } else if (image_bin_only &&
+                   !string_starts_with(parts[0], "data:application/octet-stream") &&
+                   !string_starts_with(parts[0], "data:image/")) {
+            throw std::runtime_error("EP backend expects data:application/octet-stream;base64 or data:image/*;base64");
         } else if (!image_bin_only && !string_starts_with(parts[0], "data:image/")) {
             throw std::runtime_error("Invalid url format: " + parts[0]);
         } else if (!string_ends_with(parts[0], "base64")) {
