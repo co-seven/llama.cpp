@@ -67,7 +67,7 @@ llama-server \
   --vision-backend ep \
   --ep-config-dir /path/to/ep_config_dir \
   --media-path /path/to/media_root/ \
-  -c 1024 -b 128 -ctk q4_0 -ctv q8_0
+  -c 1024 -b 128 -ctk q4_0 -ctv q8_0 --host 0.0.0.0 --port 8080
 ```
 
 With EP backend, image input can be sent as regular image files (`.jpg`, `.png`, etc.) or preprocessed `.bin` tensors.
