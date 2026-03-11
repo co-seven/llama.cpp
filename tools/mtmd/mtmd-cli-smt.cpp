@@ -42,7 +42,6 @@ static volatile bool g_is_interrupted = false;
 
 static void show_additional_info(int /*argc*/, char ** argv) {
     LOG(
-        "Multimodal CLI with Spacemit SMT vision backend\n\n"
         "Usage: %s [options] -m <model> --vision-backend smt --smt-config-dir <dir> --image <image.jpg|image.bin> -p <prompt>\n\n"
         "  -m and --smt-config-dir are required\n"
         "  --image and -p are optional, if NOT provided, the CLI will run in chat mode\n",
@@ -746,8 +745,6 @@ struct mtmd_cli_ep_context {
 
         // Validate n_embd matches
         int model_n_embd = llama_model_n_embd(model);
-        LOG_INF("[SMT] vision engine initialized (hidden_size=%" PRId64 ", model_n_embd=%d, arch=%s)\n",
-                hidden_size, model_n_embd, ep_ctx->architecture().c_str());
         if (model_n_embd != hidden_size) {
             LOG_ERR("FATAL: model n_embd (%d) != SMT hidden_size (%" PRId64 ")\n", model_n_embd, hidden_size);
             exit(1);
@@ -757,17 +754,9 @@ struct mtmd_cli_ep_context {
         auto boundaries = resolve_image_boundary_tokens(lctx, ep_ctx->architecture(), img_boundary_mode);
         tok_img_beg = std::move(boundaries.first);
         tok_img_end = std::move(boundaries.second);
-        LOG_INF("[SMT] image boundary mode: %s\n", ep_image_boundary_mode_name(img_boundary_mode));
-        LOG_INF("[SMT] media anchor mode: %s\n", ep_media_anchor_mode_name(media_anchor_mode));
-        LOG_INF("[SMT] mrope decode mode: %s\n", use_mrope_pos ? "enabled" : "disabled");
         if (!tok_img_beg.empty() && !tok_img_end.empty() &&
             tok_img_beg.front() != LLAMA_TOKEN_NULL && tok_img_end.front() != LLAMA_TOKEN_NULL) {
-            LOG_INF("[SMT] image boundary tokens enabled: beg='%s', end='%s'\n",
-                common_token_to_piece(lctx, tok_img_beg.front()).c_str(),
-                common_token_to_piece(lctx, tok_img_end.front()).c_str());
         } else {
-            LOG_INF("[SMT] image boundary tokens disabled for this model (arch=%s)\n",
-                ep_ctx->architecture().c_str());
             tok_img_beg.clear();
             tok_img_end.clear();
         }
@@ -875,9 +864,7 @@ static int eval_message_ep(mtmd_cli_ep_context & ctx, common_chat_msg & msg) {
             ctx.ep_ctx->architecture(),
             ctx.media_anchor_mode,
             changed);
-        if (changed) {
-            LOG_INF("[SMT] media-anchor canonicalization applied (%zu images)\n", ctx.pending_images.size());
-        }
+        GGML_UNUSED(changed);
     }
 
     auto formatted_chat = chat_add_and_format(ctx, msg);
@@ -901,7 +888,6 @@ static int eval_message_ep(mtmd_cli_ep_context & ctx, common_chat_msg & msg) {
         }
 
         // image chunk
-        LOG_INF("Encoding image chunk %zu with SMT vision engine: %s\n", i, chunk.image_path.c_str());
         std::string ep_input_path = chunk.image_path;
         std::string temp_input_path;
         try {
@@ -910,11 +896,6 @@ static int eval_message_ep(mtmd_cli_ep_context & ctx, common_chat_msg & msg) {
             if (preproc.was_image) {
                 temp_input_path = write_temp_bin_file(preproc.tensor_bytes);
                 ep_input_path = temp_input_path;
-                LOG_INF("[SMT] preprocessed image '%s' -> [1,3,%d,%d] float32 (%s)\n",
-                        chunk.image_path.c_str(),
-                        preproc.target_h,
-                        preproc.target_w,
-                        preproc.normalize_to_01 ? "0..1" : "0..255");
             }
         } catch (const std::exception & e) {
             LOG_ERR("Failed to prepare image '%s': %s\n", chunk.image_path.c_str(), e.what());
@@ -948,8 +929,6 @@ static int eval_message_ep(mtmd_cli_ep_context & ctx, common_chat_msg & msg) {
             auto grid_xy = infer_image_grid_xy(n_image_tokens);
             grid_nx = grid_xy.first;
             grid_ny = grid_xy.second;
-            LOG_INF("[SMT] inferred image token grid: nx=%d, ny=%d, n_tokens=%d\n",
-                    grid_nx, grid_ny, n_image_tokens);
         }
 
         if (!ctx.tok_img_beg.empty()) {
@@ -1030,8 +1009,6 @@ int mtmd_cli_smt_run(int argc, char ** argv, common_params params) {
         msg.content = params.system_prompt;
         return eval_message_ep(ctx, msg);
     };
-
-    LOG_WRN("Multimodal CLI with Spacemit SMT vision backend\n");
 
     if (eval_system_prompt_if_present()) {
         return 1;

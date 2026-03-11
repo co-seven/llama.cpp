@@ -408,10 +408,6 @@ server_ep_vision_context * server_ep_vision_init(
     ctx->tok_img_beg = std::move(boundaries.first);
     ctx->tok_img_end = std::move(boundaries.second);
 
-    LOG_INF("[server-smt] initialized (hidden_size=%d, arch=%s, mrope=%s)\n",
-            ctx->hidden_size,
-            ctx->architecture.c_str(),
-            ctx->use_mrope_pos ? "on" : "off");
     return ctx.release();
 #else
     GGML_UNUSED(lctx);
@@ -438,11 +434,6 @@ server_ep_image_chunk server_ep_vision_encode_image_bin(
     auto preproc = ep_vision_preprocess_if_image(data, ctx->architecture);
     if (preproc.was_image) {
         ep_input = std::move(preproc.tensor_bytes);
-        LOG_INF("[server-smt] preprocessed image for arch=%s -> [1,3,%d,%d] float32 (%s)\n",
-                ctx->architecture.c_str(),
-                preproc.target_h,
-                preproc.target_w,
-                preproc.normalize_to_01 ? "0..1" : "0..255");
     }
 
     const std::string tmp_file = write_temp_bin_file(ep_input);
