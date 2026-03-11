@@ -6,8 +6,6 @@ add_library(mtmd
             mtmd.cpp
             mtmd-audio.cpp
             mtmd-image.cpp
-            ep-vision-preprocess.cpp
-            ep-vision-preprocess.h
             mtmd.h
             mtmd-helper.cpp
             mtmd-helper.h
@@ -125,57 +123,50 @@ set_target_properties(llama-mtmd-debug PROPERTIES OUTPUT_NAME llama-mtmd-debug)
 target_link_libraries(llama-mtmd-debug PRIVATE llama-common mtmd Threads::Threads)
 target_compile_features(llama-mtmd-debug PRIVATE cxx_std_17)
 
-# ============================================================
-# EP Vision variant of mtmd-cli
-# Uses Spacemit EP ONNX vision engine instead of CLIP/GGUF
-# ============================================================
-option(MTMD_BUILD_EP_CLI "Build mtmd-cli with Spacemit EP vision support" OFF)
-
-if(MTMD_BUILD_EP_CLI)
-    if(NOT DEFINED SPACEMIT_EP_DIR)
-        message(FATAL_ERROR "SPACEMIT_EP_DIR must be set when MTMD_BUILD_EP_CLI=ON")
-    endif()
-    if(NOT DEFINED ONNXRUNTIME_INC_DIR)
-        message(FATAL_ERROR "ONNXRUNTIME_INC_DIR must be set when MTMD_BUILD_EP_CLI=ON")
-    endif()
-    if(NOT DEFINED ONNXRUNTIME_LIB_DIR)
-        message(FATAL_ERROR "ONNXRUNTIME_LIB_DIR must be set when MTMD_BUILD_EP_CLI=ON")
+if(LLAMA_SERVER_SMT_VISION)
+    if(NOT DEFINED SPACEMIT_ORT_DIR)
+        message(FATAL_ERROR "SPACEMIT_ORT_DIR must be set when LLAMA_SERVER_SMT_VISION=ON")
     endif()
 
-    set(EP_TARGET llama-mtmd-cli-ep)
-    add_executable(${EP_TARGET}
-        mtmd-cli-ep.cpp
+    set(SPACEMIT_ORT_INC_DIR "${SPACEMIT_ORT_DIR}/include")
+    set(SPACEMIT_ORT_LIB_DIR "${SPACEMIT_ORT_DIR}/lib")
+    set(SPACEMIT_ORT_SAMPLE_DIR "${SPACEMIT_ORT_DIR}/samples")
+
+    if(NOT EXISTS "${SPACEMIT_ORT_SAMPLE_DIR}/spine_vision_engine.cc")
+        message(FATAL_ERROR "Could not find spine_vision_engine.cc in SPACEMIT_ORT_DIR='${SPACEMIT_ORT_DIR}'")
+    endif()
+    if(NOT EXISTS "${SPACEMIT_ORT_SAMPLE_DIR}/spine_llm_argparser.cc")
+        message(FATAL_ERROR "Could not find spine_llm_argparser.cc in SPACEMIT_ORT_DIR='${SPACEMIT_ORT_DIR}'")
+    endif()
+
+    if(EXISTS "${SPACEMIT_ORT_LIB_DIR}/libonnxruntime.so")
+        set(ONNXRUNTIME_LIB "${SPACEMIT_ORT_LIB_DIR}/libonnxruntime.so")
+    elseif(EXISTS "${SPACEMIT_ORT_LIB_DIR}/libonnxruntime.a")
+        set(ONNXRUNTIME_LIB "${SPACEMIT_ORT_LIB_DIR}/libonnxruntime.a")
+    else()
+        message(FATAL_ERROR "Could not find libonnxruntime.{so,a} in SPACEMIT_ORT_DIR='${SPACEMIT_ORT_DIR}'")
+    endif()
+
+    target_sources(${TARGET} PRIVATE
+        mtmd-cli-smt.cpp
+        ep-vision-preprocess.cpp
         ep-vision-wrapper.cpp
-        ${SPACEMIT_EP_DIR}/src/llm/spine_vision_engine.cc
-        ${SPACEMIT_EP_DIR}/src/llm/spine_llm_argparser.cc
+        ${SPACEMIT_ORT_SAMPLE_DIR}/spine_vision_engine.cc
+        ${SPACEMIT_ORT_SAMPLE_DIR}/spine_llm_argparser.cc
     )
-    set_target_properties(${EP_TARGET} PROPERTIES OUTPUT_NAME llama-mtmd-cli-ep)
 
-    target_include_directories(${EP_TARGET} PRIVATE
+    target_include_directories(${TARGET} PRIVATE
         .
         ../..
         ../../vendor
-        ${SPACEMIT_EP_DIR}/src/llm
-        ${ONNXRUNTIME_INC_DIR}
+        ${SPACEMIT_ORT_SAMPLE_DIR}
+        ${SPACEMIT_ORT_INC_DIR}
     )
 
-    target_link_directories(${EP_TARGET} PRIVATE
-        ${ONNXRUNTIME_LIB_DIR}
-    )
-
-    target_link_libraries(${EP_TARGET} PRIVATE
-        llama-common
-        mtmd
-        llama
-        ggml
-        onnxruntime
+    target_link_libraries(${TARGET} PRIVATE
+        ${ONNXRUNTIME_LIB}
         dl
-        Threads::Threads
     )
 
-    target_compile_features(${EP_TARGET} PRIVATE cxx_std_17)
-
-    if(LLAMA_TOOLS_INSTALL)
-        install(TARGETS ${EP_TARGET} RUNTIME)
-    endif()
+    target_compile_definitions(${TARGET} PRIVATE LLAMA_SERVER_SMT_VISION=1)
 endif()

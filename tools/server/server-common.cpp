@@ -363,7 +363,7 @@ const server_ep_image_chunk & server_tokens::find_ep_chunk(size_t idx) const {
     if (it != map_idx_to_ep_media.end()) {
         return it->second;
     }
-    throw std::runtime_error("EP chunk not found");
+    throw std::runtime_error("SMT chunk not found");
 }
 
 void server_tokens::push_back(llama_token tok) {
@@ -630,7 +630,7 @@ int32_t server_tokens::process_chunk(
             n_tokens_out = 0;
             return -1;
         }
-        SRV_INF("%s", "processing image (ep)...\n");
+        SRV_INF("%s", "processing image (smt)...\n");
         int64_t t0 = ggml_time_ms();
         llama_pos n_past = pos;
         int32_t result = server_ep_vision_decode_chunk(
@@ -641,7 +641,7 @@ int32_t server_tokens::process_chunk(
                 seq_id,
                 llama_n_batch(ctx),
                 true);
-        SRV_INF("image (ep) processed in %" PRId64 " ms\n", ggml_time_ms() - t0);
+        SRV_INF("image (smt) processed in %" PRId64 " ms\n", ggml_time_ms() - t0);
         if (result != 0) {
             LOG_ERR("server_ep_vision_decode_chunk failed with status %d\n", result);
             n_tokens_out = 0;
@@ -907,7 +907,7 @@ server_tokens process_ep_prompt(
         bool add_special,
         bool parse_special) {
     if (ep_ctx == nullptr) {
-        throw std::runtime_error("EP vision backend is not initialized");
+        throw std::runtime_error("SMT vision backend is not initialized");
     }
 
     static const std::string k_media_marker = "<__media__>";
@@ -1114,7 +1114,7 @@ static void handle_media(
         // load local image file
         std::string file_path = url.substr(7); // remove "file://"
         if (image_bin_only && !string_ends_with(file_path, ".bin") && !is_ep_supported_image_file(file_path)) {
-            throw std::invalid_argument("EP backend expects file:// image_url to be .bin or image file (.jpg/.jpeg/.png/.webp/.bmp/.gif)");
+            throw std::invalid_argument("SMT backend expects file:// image_url to be .bin or image file (.jpg/.jpeg/.png/.webp/.bmp/.gif)");
         }
         raw_buffer data;
         if (!fs_validate_filename(file_path, true)) {
@@ -1136,7 +1136,7 @@ static void handle_media(
         } else if (image_bin_only &&
                    !string_starts_with(parts[0], "data:application/octet-stream") &&
                    !string_starts_with(parts[0], "data:image/")) {
-            throw std::runtime_error("EP backend expects data:application/octet-stream;base64 or data:image/*;base64");
+            throw std::runtime_error("SMT backend expects data:application/octet-stream;base64 or data:image/*;base64");
         } else if (!image_bin_only && !string_starts_with(parts[0], "data:image/")) {
             throw std::runtime_error("Invalid url format: " + parts[0]);
         } else if (!string_ends_with(parts[0], "base64")) {

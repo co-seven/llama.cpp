@@ -38,6 +38,19 @@ static volatile bool g_is_interrupted = false;
  */
 
 static void show_additional_info(int /*argc*/, char ** argv) {
+#if defined(LLAMA_SERVER_SMT_VISION)
+    LOG(
+        "Experimental CLI for multimodal\n\n"
+        "Usage: %s [options] -m <model> [--mmproj <mmproj> | --smt-config-dir <dir>] --image <image> --audio <audio> -p <prompt>\n\n"
+        "  -m is required\n"
+        "  --mmproj is required for the mtmd backend\n"
+        "  --smt-config-dir is required for the smt backend\n"
+        "  -hf user/repo can replace both -m and --mmproj in most cases\n"
+        "  --image, --audio and -p are optional, if NOT provided, the CLI will run in chat mode\n"
+        "  to disable using GPU for mmproj model, add --no-mmproj-offload\n",
+        argv[0]
+    );
+#else
     LOG(
         "Experimental CLI for multimodal\n\n"
         "Usage: %s [options] -m <model> --mmproj <mmproj> --image <image> --audio <audio> -p <prompt>\n\n"
@@ -47,7 +60,12 @@ static void show_additional_info(int /*argc*/, char ** argv) {
         "  to disable using GPU for mmproj model, add --no-mmproj-offload\n",
         argv[0]
     );
+#endif
 }
+
+#if defined(LLAMA_SERVER_SMT_VISION)
+int mtmd_cli_smt_run(int argc, char ** argv, common_params params);
+#endif
 
 #if defined (__unix__) || (defined (__APPLE__) && defined (__MACH__)) || defined (_WIN32)
 static void sigint_handler(int signo) {
@@ -287,6 +305,13 @@ int main(int argc, char ** argv) {
         return 1;
     }
 
+#if defined(LLAMA_SERVER_SMT_VISION)
+    if (params.vision_backend == "smt" || !params.smt_config_dir.empty()) {
+        return mtmd_cli_smt_run(argc, argv, std::move(params));
+    }
+#endif
+
+    common_init();
     mtmd_helper_log_set(common_log_default_callback, nullptr);
 
     if (params.mmproj.path.empty()) {

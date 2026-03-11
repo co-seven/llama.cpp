@@ -55,7 +55,9 @@ enum server_state {
 enum server_vision_backend_mode {
     SERVER_VISION_BACKEND_NONE,
     SERVER_VISION_BACKEND_MTMD,
-    SERVER_VISION_BACKEND_EP,
+#if defined(LLAMA_SERVER_SMT_VISION)
+    SERVER_VISION_BACKEND_SMT,
+#endif
 };
 
 struct server_slot {
@@ -698,7 +700,9 @@ private:
     const char * vision_backend_name() const {
         switch (vision_backend) {
             case SERVER_VISION_BACKEND_MTMD: return "mtmd";
-            case SERVER_VISION_BACKEND_EP:   return "ep";
+#if defined(LLAMA_SERVER_SMT_VISION)
+            case SERVER_VISION_BACKEND_SMT:  return "smt";
+#endif
             case SERVER_VISION_BACKEND_NONE: return "none";
         }
         return "none";
@@ -808,20 +812,28 @@ private:
         }
 
         const std::string & mmproj_path = params_base.mmproj.path;
-        const std::string & ep_config_dir = params_base.ep_config_dir;
         const std::string & backend_pref = params_base.vision_backend;
 
         server_vision_backend_mode selected_backend = SERVER_VISION_BACKEND_NONE;
         if (backend_pref == "auto") {
-            if (!ep_config_dir.empty()) {
-                selected_backend = SERVER_VISION_BACKEND_EP;
+#if defined(LLAMA_SERVER_SMT_VISION)
+            const std::string & smt_config_dir = params_base.smt_config_dir;
+            if (!smt_config_dir.empty()) {
+                selected_backend = SERVER_VISION_BACKEND_SMT;
             } else if (!mmproj_path.empty()) {
                 selected_backend = SERVER_VISION_BACKEND_MTMD;
             }
+#else
+            if (!mmproj_path.empty()) {
+                selected_backend = SERVER_VISION_BACKEND_MTMD;
+            }
+#endif
         } else if (backend_pref == "mtmd") {
             selected_backend = SERVER_VISION_BACKEND_MTMD;
-        } else if (backend_pref == "ep") {
-            selected_backend = SERVER_VISION_BACKEND_EP;
+#if defined(LLAMA_SERVER_SMT_VISION)
+        } else if (backend_pref == "smt") {
+            selected_backend = SERVER_VISION_BACKEND_SMT;
+#endif
         } else {
             SRV_ERR("invalid --vision-backend value: '%s'\n", backend_pref.c_str());
             return false;
@@ -854,19 +866,23 @@ private:
             }
             vision_backend = SERVER_VISION_BACKEND_MTMD;
             SRV_INF("loaded multimodal model (mtmd), '%s'\n", mmproj_path.c_str());
-        } else if (selected_backend == SERVER_VISION_BACKEND_EP) {
-            if (ep_config_dir.empty()) {
-                SRV_ERR("%s", "vision backend 'ep' selected but --ep-config-dir is empty\n");
+
+#if defined(LLAMA_SERVER_SMT_VISION)
+        } else if (selected_backend == SERVER_VISION_BACKEND_SMT) {
+            const std::string & smt_config_dir = params_base.smt_config_dir;
+            if (smt_config_dir.empty()) {
+                SRV_ERR("%s", "vision backend 'smt' selected but --smt-config-dir is empty\n");
                 return false;
             }
             try {
-                ep_ctx = server_ep_vision_init(ctx, ep_config_dir);
+                ep_ctx = server_ep_vision_init(ctx, smt_config_dir);
             } catch (const std::exception & e) {
-                SRV_ERR("failed to load EP vision backend from '%s': %s\n", ep_config_dir.c_str(), e.what());
+                SRV_ERR("failed to load SMT vision backend from '%s': %s\n", smt_config_dir.c_str(), e.what());
                 return false;
             }
-            vision_backend = SERVER_VISION_BACKEND_EP;
-            SRV_INF("loaded multimodal model (ep), '%s'\n", ep_config_dir.c_str());
+            vision_backend = SERVER_VISION_BACKEND_SMT;
+            SRV_INF("loaded multimodal model (smt), '%s'\n", smt_config_dir.c_str());
+#endif
         } else {
             vision_backend = SERVER_VISION_BACKEND_NONE;
         }

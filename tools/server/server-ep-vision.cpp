@@ -15,7 +15,7 @@
 #include <utility>
 #include <vector>
 
-#if defined(LLAMA_SERVER_EP_VISION)
+#if defined(LLAMA_SERVER_SMT_VISION)
 #include "../mtmd/ep-vision-wrapper.h"
 #include "../mtmd/ep-vision-preprocess.h"
 #endif
@@ -29,7 +29,7 @@
 #endif
 
 struct server_ep_vision_context {
-#if defined(LLAMA_SERVER_EP_VISION)
+#if defined(LLAMA_SERVER_SMT_VISION)
     std::unique_ptr<ep_vision_context> ep;
 #endif
     std::mutex mu;
@@ -192,7 +192,7 @@ static ep_image_boundary_mode ep_image_boundary_mode_from_env() {
         return ep_image_boundary_mode::none;
     }
 
-    LOG_WRN("[server-ep] unknown MTMD_EP_IMAGE_BOUNDARY='%s', fallback to 'native'\n", env);
+    LOG_WRN("[server-smt] unknown MTMD_EP_IMAGE_BOUNDARY='%s', fallback to 'native'\n", env);
     return ep_image_boundary_mode::native;
 }
 
@@ -397,7 +397,7 @@ static int decode_embd(
 server_ep_vision_context * server_ep_vision_init(
         llama_context * lctx,
         const std::string & config_dir) {
-#if defined(LLAMA_SERVER_EP_VISION)
+#if defined(LLAMA_SERVER_SMT_VISION)
     auto ctx = std::make_unique<server_ep_vision_context>();
     ctx->ep = ep_vision_context::create(config_dir);
     ctx->architecture = ctx->ep->architecture();
@@ -408,7 +408,7 @@ server_ep_vision_context * server_ep_vision_init(
     ctx->tok_img_beg = std::move(boundaries.first);
     ctx->tok_img_end = std::move(boundaries.second);
 
-    LOG_INF("[server-ep] initialized (hidden_size=%d, arch=%s, mrope=%s)\n",
+    LOG_INF("[server-smt] initialized (hidden_size=%d, arch=%s, mrope=%s)\n",
             ctx->hidden_size,
             ctx->architecture.c_str(),
             ctx->use_mrope_pos ? "on" : "off");
@@ -416,7 +416,7 @@ server_ep_vision_context * server_ep_vision_init(
 #else
     GGML_UNUSED(lctx);
     GGML_UNUSED(config_dir);
-    throw std::runtime_error("EP vision backend is not compiled. Rebuild with LLAMA_SERVER_EP_VISION=ON.");
+    throw std::runtime_error("SMT vision backend is not compiled. Rebuild with LLAMA_SERVER_SMT_VISION=ON.");
 #endif
 }
 
@@ -428,17 +428,17 @@ server_ep_image_chunk server_ep_vision_encode_image_bin(
         server_ep_vision_context * ctx,
         const std::vector<uint8_t> & data) {
     if (ctx == nullptr) {
-        throw std::runtime_error("EP context is null");
+        throw std::runtime_error("SMT context is null");
     }
 
-#if defined(LLAMA_SERVER_EP_VISION)
+#if defined(LLAMA_SERVER_SMT_VISION)
     std::lock_guard<std::mutex> lock(ctx->mu);
 
     std::vector<uint8_t> ep_input = data;
     auto preproc = ep_vision_preprocess_if_image(data, ctx->architecture);
     if (preproc.was_image) {
         ep_input = std::move(preproc.tensor_bytes);
-        LOG_INF("[server-ep] preprocessed image for arch=%s -> [1,3,%d,%d] float32 (%s)\n",
+        LOG_INF("[server-smt] preprocessed image for arch=%s -> [1,3,%d,%d] float32 (%s)\n",
                 ctx->architecture.c_str(),
                 preproc.target_h,
                 preproc.target_w,
@@ -457,7 +457,7 @@ server_ep_image_chunk server_ep_vision_encode_image_bin(
     }
 
     if (ctx->hidden_size <= 0 || out.embd.empty() || out.embd.size() % (size_t) ctx->hidden_size != 0) {
-        throw std::runtime_error("Invalid EP embedding shape");
+        throw std::runtime_error("Invalid SMT embedding shape");
     }
 
     const int32_t n_image_tokens = (int32_t) (out.embd.size() / (size_t) ctx->hidden_size);
@@ -473,7 +473,7 @@ server_ep_image_chunk server_ep_vision_encode_image_bin(
     return out;
 #else
     GGML_UNUSED(data);
-    throw std::runtime_error("EP vision backend is not compiled. Rebuild with LLAMA_SERVER_EP_VISION=ON.");
+    throw std::runtime_error("SMT vision backend is not compiled. Rebuild with LLAMA_SERVER_SMT_VISION=ON.");
 #endif
 }
 

@@ -29,37 +29,42 @@ target_include_directories(${TARGET} PRIVATE ../mtmd)
 target_include_directories(${TARGET} PRIVATE ${CMAKE_SOURCE_DIR})
 target_link_libraries(${TARGET} PUBLIC llama-common mtmd ${CMAKE_THREAD_LIBS_INIT})
 
-option(LLAMA_SERVER_EP_VISION "Build llama-server with Spacemit EP ONNX vision backend support" OFF)
-if(LLAMA_SERVER_EP_VISION)
-    if(NOT DEFINED SPACEMIT_EP_DIR)
-        message(FATAL_ERROR "SPACEMIT_EP_DIR must be set when LLAMA_SERVER_EP_VISION=ON")
-    endif()
-    if(NOT DEFINED ONNXRUNTIME_INC_DIR)
-        message(FATAL_ERROR "ONNXRUNTIME_INC_DIR must be set when LLAMA_SERVER_EP_VISION=ON")
-    endif()
-    if(NOT DEFINED ONNXRUNTIME_LIB_DIR)
-        message(FATAL_ERROR "ONNXRUNTIME_LIB_DIR must be set when LLAMA_SERVER_EP_VISION=ON")
+if(LLAMA_SERVER_SMT_VISION)
+    if(NOT DEFINED SPACEMIT_ORT_DIR)
+        message(FATAL_ERROR "SPACEMIT_ORT_DIR must be set when LLAMA_SERVER_SMT_VISION=ON")
     endif()
 
-    target_compile_definitions(${TARGET} PRIVATE LLAMA_SERVER_EP_VISION=1)
+    set(SPACEMIT_ORT_INC_DIR "${SPACEMIT_ORT_DIR}/include")
+    set(SPACEMIT_ORT_LIB_DIR "${SPACEMIT_ORT_DIR}/lib")
+    set(SPACEMIT_ORT_SAMPLE_DIR "${SPACEMIT_ORT_DIR}/samples")
+
+    if(NOT EXISTS "${SPACEMIT_ORT_SAMPLE_DIR}/spine_vision_engine.cc")
+        message(FATAL_ERROR "Could not find spine_vision_engine.cc in SPACEMIT_ORT_DIR='${SPACEMIT_ORT_DIR}'")
+    endif()
+    if(NOT EXISTS "${SPACEMIT_ORT_SAMPLE_DIR}/spine_llm_argparser.cc")
+        message(FATAL_ERROR "Could not find spine_llm_argparser.cc in SPACEMIT_ORT_DIR='${SPACEMIT_ORT_DIR}'")
+    endif()
+
+    target_compile_definitions(${TARGET} PRIVATE LLAMA_SERVER_SMT_VISION=1)
     target_sources(${TARGET} PRIVATE
+        ../mtmd/ep-vision-preprocess.cpp
         ../mtmd/ep-vision-wrapper.cpp
-        ${SPACEMIT_EP_DIR}/src/llm/spine_vision_engine.cc
-        ${SPACEMIT_EP_DIR}/src/llm/spine_llm_argparser.cc
+        ${SPACEMIT_ORT_SAMPLE_DIR}/spine_vision_engine.cc
+        ${SPACEMIT_ORT_SAMPLE_DIR}/spine_llm_argparser.cc
     )
     set(ONNXRUNTIME_LIB "")
-    if(EXISTS "${ONNXRUNTIME_LIB_DIR}/libonnxruntime.so")
-        set(ONNXRUNTIME_LIB "${ONNXRUNTIME_LIB_DIR}/libonnxruntime.so")
-    elseif(EXISTS "${ONNXRUNTIME_LIB_DIR}/libonnxruntime.a")
-        set(ONNXRUNTIME_LIB "${ONNXRUNTIME_LIB_DIR}/libonnxruntime.a")
+    if(EXISTS "${SPACEMIT_ORT_LIB_DIR}/libonnxruntime.so")
+        set(ONNXRUNTIME_LIB "${SPACEMIT_ORT_LIB_DIR}/libonnxruntime.so")
+    elseif(EXISTS "${SPACEMIT_ORT_LIB_DIR}/libonnxruntime.a")
+        set(ONNXRUNTIME_LIB "${SPACEMIT_ORT_LIB_DIR}/libonnxruntime.a")
     else()
-        message(FATAL_ERROR "Could not find libonnxruntime.{so,a} in ONNXRUNTIME_LIB_DIR='${ONNXRUNTIME_LIB_DIR}'")
+        message(FATAL_ERROR "Could not find libonnxruntime.{so,a} in SPACEMIT_ORT_DIR='${SPACEMIT_ORT_DIR}'")
     endif()
 
     target_include_directories(${TARGET} PRIVATE
         ../mtmd
-        ${SPACEMIT_EP_DIR}/src/llm
-        ${ONNXRUNTIME_INC_DIR}
+        ${SPACEMIT_ORT_SAMPLE_DIR}
+        ${SPACEMIT_ORT_INC_DIR}
     )
     target_link_libraries(${TARGET} PRIVATE ${ONNXRUNTIME_LIB} dl)
 endif()

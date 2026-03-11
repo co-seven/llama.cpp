@@ -1,5 +1,5 @@
-// llama-mtmd-cli-ep: Multimodal CLI using Spacemit EP ONNX vision engine
-// Based on mtmd-cli.cpp, replaces CLIP/GGUF vision encoding with EP's ONNX vision engine
+// Multimodal CLI SMT backend using Spacemit EP ONNX vision engine
+// Integrated into llama-mtmd-cli and selected via --vision-backend smt
 // LLM inference logic (loading, sampling, generation) is reused from the original mtmd-cli
 
 #include "arg.h"
@@ -42,9 +42,9 @@ static volatile bool g_is_interrupted = false;
 
 static void show_additional_info(int /*argc*/, char ** argv) {
     LOG(
-        "Multimodal CLI with Spacemit EP vision engine\n\n"
-        "Usage: %s [options] -m <model> --mmproj <ep_config_dir> --image <image.jpg|image.bin> -p <prompt>\n\n"
-        "  -m and --mmproj are required (or set EP_CONFIG_DIR)\n"
+        "Multimodal CLI with Spacemit SMT vision backend\n\n"
+        "Usage: %s [options] -m <model> --vision-backend smt --smt-config-dir <dir> --image <image.jpg|image.bin> -p <prompt>\n\n"
+        "  -m and --smt-config-dir are required\n"
         "  --image and -p are optional, if NOT provided, the CLI will run in chat mode\n",
         argv[0]
     );
@@ -124,7 +124,7 @@ static ep_image_boundary_mode ep_image_boundary_mode_from_env() {
         return ep_image_boundary_mode::none;
     }
 
-    LOG_WRN("[EP-v3] unknown MTMD_EP_IMAGE_BOUNDARY='%s', fallback to 'native'\n", env);
+    LOG_WRN("[SMT] unknown MTMD_EP_IMAGE_BOUNDARY='%s', fallback to 'native'\n", env);
     return ep_image_boundary_mode::native;
 }
 
@@ -183,7 +183,7 @@ static ep_media_anchor_mode ep_media_anchor_mode_from_env() {
     if (value == "off" || value == "0" || value == "false") {
         return ep_media_anchor_mode::off;
     }
-    LOG_WRN("[EP-v3] unknown MTMD_EP_MEDIA_ANCHOR='%s', fallback to 'off'\n", env);
+    LOG_WRN("[SMT] unknown MTMD_EP_MEDIA_ANCHOR='%s', fallback to 'off'\n", env);
     return ep_media_anchor_mode::off;
 }
 
@@ -733,23 +733,23 @@ struct mtmd_cli_ep_context {
         use_jinja = params.use_jinja;
         chat_history.clear();
 
-        // Initialize EP vision context
+        // Initialize SMT vision context
         ep_ctx = ep_vision_context::create(ep_config_dir);
         hidden_size = ep_ctx->hidden_size();
         use_mrope_pos = arch_requires_mrope(ep_ctx->architecture());
         img_boundary_mode = ep_image_boundary_mode_from_env();
         media_anchor_mode = ep_media_anchor_mode_from_env();
         if (hidden_size <= 0 || hidden_size > INT_MAX) {
-            LOG_ERR("FATAL: invalid EP hidden_size (%" PRId64 ")\n", hidden_size);
+            LOG_ERR("FATAL: invalid SMT hidden_size (%" PRId64 ")\n", hidden_size);
             exit(1);
         }
 
         // Validate n_embd matches
         int model_n_embd = llama_model_n_embd(model);
-        LOG_INF("[EP-v3] EP vision engine initialized (hidden_size=%" PRId64 ", model_n_embd=%d, arch=%s)\n",
+        LOG_INF("[SMT] vision engine initialized (hidden_size=%" PRId64 ", model_n_embd=%d, arch=%s)\n",
                 hidden_size, model_n_embd, ep_ctx->architecture().c_str());
         if (model_n_embd != hidden_size) {
-            LOG_ERR("FATAL: model n_embd (%d) != EP hidden_size (%" PRId64 ")\n", model_n_embd, hidden_size);
+            LOG_ERR("FATAL: model n_embd (%d) != SMT hidden_size (%" PRId64 ")\n", model_n_embd, hidden_size);
             exit(1);
         }
 
@@ -757,16 +757,16 @@ struct mtmd_cli_ep_context {
         auto boundaries = resolve_image_boundary_tokens(lctx, ep_ctx->architecture(), img_boundary_mode);
         tok_img_beg = std::move(boundaries.first);
         tok_img_end = std::move(boundaries.second);
-        LOG_INF("[EP-v3] image boundary mode: %s\n", ep_image_boundary_mode_name(img_boundary_mode));
-        LOG_INF("[EP-v3] media anchor mode: %s\n", ep_media_anchor_mode_name(media_anchor_mode));
-        LOG_INF("[EP-v3] mrope decode mode: %s\n", use_mrope_pos ? "enabled" : "disabled");
+        LOG_INF("[SMT] image boundary mode: %s\n", ep_image_boundary_mode_name(img_boundary_mode));
+        LOG_INF("[SMT] media anchor mode: %s\n", ep_media_anchor_mode_name(media_anchor_mode));
+        LOG_INF("[SMT] mrope decode mode: %s\n", use_mrope_pos ? "enabled" : "disabled");
         if (!tok_img_beg.empty() && !tok_img_end.empty() &&
             tok_img_beg.front() != LLAMA_TOKEN_NULL && tok_img_end.front() != LLAMA_TOKEN_NULL) {
-            LOG_INF("[EP-v3] image boundary tokens enabled: beg='%s', end='%s'\n",
+            LOG_INF("[SMT] image boundary tokens enabled: beg='%s', end='%s'\n",
                 common_token_to_piece(lctx, tok_img_beg.front()).c_str(),
                 common_token_to_piece(lctx, tok_img_end.front()).c_str());
         } else {
-            LOG_INF("[EP-v3] image boundary tokens disabled for this model (arch=%s)\n",
+            LOG_INF("[SMT] image boundary tokens disabled for this model (arch=%s)\n",
                 ep_ctx->architecture().c_str());
             tok_img_beg.clear();
             tok_img_end.clear();
@@ -876,7 +876,7 @@ static int eval_message_ep(mtmd_cli_ep_context & ctx, common_chat_msg & msg) {
             ctx.media_anchor_mode,
             changed);
         if (changed) {
-            LOG_INF("[EP-v3] media-anchor canonicalization applied (%zu images)\n", ctx.pending_images.size());
+            LOG_INF("[SMT] media-anchor canonicalization applied (%zu images)\n", ctx.pending_images.size());
         }
     }
 
@@ -901,7 +901,7 @@ static int eval_message_ep(mtmd_cli_ep_context & ctx, common_chat_msg & msg) {
         }
 
         // image chunk
-        LOG_INF("Encoding image chunk %zu with EP vision engine: %s\n", i, chunk.image_path.c_str());
+        LOG_INF("Encoding image chunk %zu with SMT vision engine: %s\n", i, chunk.image_path.c_str());
         std::string ep_input_path = chunk.image_path;
         std::string temp_input_path;
         try {
@@ -910,7 +910,7 @@ static int eval_message_ep(mtmd_cli_ep_context & ctx, common_chat_msg & msg) {
             if (preproc.was_image) {
                 temp_input_path = write_temp_bin_file(preproc.tensor_bytes);
                 ep_input_path = temp_input_path;
-                LOG_INF("[EP-v3] preprocessed image '%s' -> [1,3,%d,%d] float32 (%s)\n",
+                LOG_INF("[SMT] preprocessed image '%s' -> [1,3,%d,%d] float32 (%s)\n",
                         chunk.image_path.c_str(),
                         preproc.target_h,
                         preproc.target_w,
@@ -936,7 +936,7 @@ static int eval_message_ep(mtmd_cli_ep_context & ctx, common_chat_msg & msg) {
         }
 
         if (image_embd.empty() || image_embd.size() % (size_t)ctx.hidden_size != 0) {
-            LOG_ERR("Invalid image embedding shape from EP (size=%zu, hidden_size=%" PRId64 ")\n",
+            LOG_ERR("Invalid image embedding shape from SMT (size=%zu, hidden_size=%" PRId64 ")\n",
                     image_embd.size(), ctx.hidden_size);
             return 1;
         }
@@ -948,7 +948,7 @@ static int eval_message_ep(mtmd_cli_ep_context & ctx, common_chat_msg & msg) {
             auto grid_xy = infer_image_grid_xy(n_image_tokens);
             grid_nx = grid_xy.first;
             grid_ny = grid_xy.second;
-            LOG_INF("[EP-v3] inferred image token grid: nx=%d, ny=%d, n_tokens=%d\n",
+            LOG_INF("[SMT] inferred image token grid: nx=%d, ny=%d, n_tokens=%d\n",
                     grid_nx, grid_ny, n_image_tokens);
         }
 
@@ -985,34 +985,19 @@ static int eval_message_ep(mtmd_cli_ep_context & ctx, common_chat_msg & msg) {
 // Main function
 // ============================================================
 
-int main(int argc, char ** argv) {
+int mtmd_cli_smt_run(int argc, char ** argv, common_params params) {
     ggml_time_init();
-    LOG_INF("MTMD_CLI_EP_BUILD_TAG: fastvlm-support-20260303-3 (%s %s)\n", __DATE__, __TIME__);
-
-    common_params params;
-
-    if (!common_params_parse(argc, argv, params, LLAMA_EXAMPLE_MTMD, show_additional_info)) {
-        return 1;
-    }
+    LOG_INF("MTMD_CLI_SMT_BUILD_TAG: spacemit-smt (%s %s)\n", __DATE__, __TIME__);
 
     common_init();
 
-    // Use --mmproj as EP config directory path
-    std::string ep_config_dir = params.mmproj.path;
-    if (ep_config_dir.empty()) {
-        // Fallback: check environment variable
-        const char * env = std::getenv("EP_CONFIG_DIR");
-        if (env) {
-            ep_config_dir = env;
-        }
-    }
-    if (ep_config_dir.empty()) {
+    if (params.smt_config_dir.empty()) {
         show_additional_info(argc, argv);
-        LOG_ERR("ERR: Missing EP config directory (pass via --mmproj or EP_CONFIG_DIR env)\n");
+        LOG_ERR("ERR: Missing --smt-config-dir argument\n");
         return 1;
     }
 
-    mtmd_cli_ep_context ctx(params, ep_config_dir);
+    mtmd_cli_ep_context ctx(params, params.smt_config_dir);
 
     bool is_single_turn = !params.prompt.empty() && !params.image.empty();
     int n_predict = params.n_predict < 0 ? INT_MAX : params.n_predict;
@@ -1046,7 +1031,7 @@ int main(int argc, char ** argv) {
         return eval_message_ep(ctx, msg);
     };
 
-    LOG_WRN("Multimodal CLI with Spacemit EP vision engine\n");
+    LOG_WRN("Multimodal CLI with Spacemit SMT vision backend\n");
 
     if (eval_system_prompt_if_present()) {
         return 1;
@@ -1078,7 +1063,7 @@ int main(int argc, char ** argv) {
         }
     } else {
         // Chat mode
-        LOG("\n Running in chat mode (EP vision), available commands:");
+        LOG("\n Running in chat mode (SMT vision), available commands:");
         LOG("\n   /image <path>    load an image (.jpg/.png/...) or preprocessed .bin");
         LOG("\n   /clear           clear the chat history");
         LOG("\n   /quit or /exit   exit the program");

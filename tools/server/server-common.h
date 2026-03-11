@@ -311,8 +311,8 @@ struct server_chat_params {
     common_chat_templates_ptr tmpls;
     bool allow_image;
     bool allow_audio;
-    // Legacy flag name: when true, parsing follows EP vision media rules
-    // (.bin tensors and raw image payloads handled by EP preprocessing path).
+    // Legacy flag name: when true, parsing follows SMT vision media rules
+    // (.bin tensors and raw image payloads handled by SMT preprocessing path).
     bool image_bin_only = false;
     std::string vision_backend = "none";
     bool enable_thinking = true;

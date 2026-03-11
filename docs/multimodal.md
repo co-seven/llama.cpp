@@ -1,8 +1,7 @@
 # Multimodal
 
-llama.cpp supports multimodal input via `libmtmd`. Currently, there are 3 tools support this feature:
+llama.cpp supports multimodal input via `libmtmd`. Currently, there are 2 tools support this feature:
 - [llama-mtmd-cli](../tools/mtmd/README.md)
-- [llama-mtmd-cli-ep](./multimodal/llama-mtmd-cli-ep.md) (Spacemit EP ONNX vision backend)
 - [llama-server](../tools/server/README.md) via OpenAI-compatible `/chat/completions` API
 
 Currently, we support **image** and **audio** input. Audio is highly experimental and may have reduced quality.
@@ -40,49 +39,6 @@ llama-server -hf ggml-org/gemma-3-4b-it-GGUF --no-mmproj-offload
 > - Deepseek-OCR: https://github.com/ggml-org/llama.cpp/pull/17400
 > - Dots.OCR: https://github.com/ggml-org/llama.cpp/pull/17575
 > - HunyuanOCR: https://github.com/ggml-org/llama.cpp/pull/21395
-
-## Spacemit EP vision backend
-
-The EP vision backend is an alternative multimodal path for supported deployments (for example FastVLM and Qwen3VL with Spacemit EP ONNX vision models).
-
-- For detailed `llama-mtmd-cli-ep` behavior and options, see: [llama-mtmd-cli-ep.md](./multimodal/llama-mtmd-cli-ep.md)
-- For server options, see `llama-server --help` (`--vision-backend ep`, `--ep-config-dir <dir>`)
-
-### `llama-mtmd-cli-ep` example
-
-```sh
-llama-mtmd-cli-ep \
-  -m /path/to/qwen3vl-30b-text-q4_1.gguf \
-  --mmproj /path/to/ep_config_dir \
-  --image /path/to/input.jpg \
-  -p "<__media__>Describe this image." \
-  -c 1024 -b 128 -ctk q4_0 -ctv q8_0
-```
-
-### `llama-server` EP example
-
-```sh
-llama-server \
-  -m /path/to/qwen3vl-30b-text-q4_1.gguf \
-  --vision-backend ep \
-  --ep-config-dir /path/to/ep_config_dir \
-  --media-path /path/to/media_root/ \
-  -c 1024 -b 128 -ctk q4_0 -ctv q8_0 --host 0.0.0.0 --port 8080
-```
-
-With EP backend, image input can be sent as regular image files (`.jpg`, `.png`, etc.) or preprocessed `.bin` tensors.
-
-### Qwen3VL-30B practical note
-
-`qwen3vl-30b` is very large. In practice, you should constrain context length and KV cache quantization.
-
-One known workable configuration is:
-
-```sh
--c 1024 -b 128 -ctk q4_0 -ctv q8_0
-```
-
-Other configurations are possible and should be tuned per hardware and workload.
 
 ## Pre-quantized models
 
