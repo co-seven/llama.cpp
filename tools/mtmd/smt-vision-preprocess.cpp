@@ -1,4 +1,4 @@
-#include "ep-vision-preprocess.h"
+#include "smt-vision-preprocess.h"
 
 #include <algorithm>
 #include <cmath>
@@ -32,7 +32,7 @@ struct ep_preproc_spec {
 };
 
 static ep_preproc_spec resolve_preproc_spec(const std::string & architecture) {
-    // Qwen3VL EP ONNX keeps internal (x - 127.5) / 127.5 preprocessing.
+    // Qwen3VL SMT ONNX keeps internal (x - 127.5) / 127.5 preprocessing.
     if (contains_icase(architecture, "qwen3vl")) {
         return {/* target_w */ 768, /* target_h */ 768, /* normalize_to_01 */ false, /* quantize */ true};
     }
@@ -189,10 +189,10 @@ static std::vector<uint8_t> pack_f32_bytes(const std::vector<float> & values) {
 
 } // namespace
 
-ep_vision_preprocess_result ep_vision_preprocess_if_image(
+smt_vision_preprocess_result smt_vision_preprocess_if_image(
         const std::vector<uint8_t> & input,
         const std::string & architecture) {
-    ep_vision_preprocess_result out;
+    smt_vision_preprocess_result out;
     if (input.empty()) {
         return out;
     }
@@ -216,7 +216,7 @@ ep_vision_preprocess_result ep_vision_preprocess_if_image(
         if (spec.target_w <= 0 || spec.target_h <= 0) {
             stbi_image_free(pixels);
             throw std::runtime_error(
-                    "EP image preprocessing for architecture '" + architecture +
+                    "SMT image preprocessing for architecture '" + architecture +
                     "' is not configured yet; please provide preprocessed .bin");
         }
 

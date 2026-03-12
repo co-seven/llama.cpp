@@ -149,8 +149,8 @@ if(LLAMA_SERVER_SMT_VISION)
 
     target_sources(${TARGET} PRIVATE
         mtmd-cli-smt.cpp
-        ep-vision-preprocess.cpp
-        ep-vision-wrapper.cpp
+        smt-vision-preprocess.cpp
+        smt-vision-wrapper.cpp
         ${SPACEMIT_ORT_SAMPLE_DIR}/spine_vision_engine.cc
         ${SPACEMIT_ORT_SAMPLE_DIR}/spine_llm_argparser.cc
     )

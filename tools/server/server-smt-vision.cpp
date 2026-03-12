@@ -1,4 +1,4 @@
-#include "server-ep-vision.h"
+#include "server-smt-vision.h"
 
 #include "common.h"
 #include "log.h"
@@ -16,8 +16,8 @@
 #include <vector>
 
 #if defined(LLAMA_SERVER_SMT_VISION)
-#include "../mtmd/ep-vision-wrapper.h"
-#include "../mtmd/ep-vision-preprocess.h"
+#include "../mtmd/smt-vision-wrapper.h"
+#include "../mtmd/smt-vision-preprocess.h"
 #endif
 
 #if defined(_WIN32)
@@ -28,9 +28,9 @@
 #include <unistd.h>
 #endif
 
-struct server_ep_vision_context {
+struct server_smt_vision_context {
 #if defined(LLAMA_SERVER_SMT_VISION)
-    std::unique_ptr<ep_vision_context> ep;
+    std::unique_ptr<smt_vision_context> smt;
 #endif
     std::mutex mu;
     int32_t hidden_size = 0;
@@ -169,40 +169,40 @@ detect_image_boundary_tokens_auto(llama_context * lctx) {
     return {};
 }
 
-enum class ep_image_boundary_mode {
+enum class smt_image_boundary_mode {
     native,
     auto_detect,
     none,
 };
 
-static ep_image_boundary_mode ep_image_boundary_mode_from_env() {
-    const char * env = std::getenv("MTMD_EP_IMAGE_BOUNDARY");
+static smt_image_boundary_mode smt_image_boundary_mode_from_env() {
+    const char * env = std::getenv("MTMD_SMT_IMAGE_BOUNDARY");
     if (env == nullptr || env[0] == '\0') {
-        return ep_image_boundary_mode::native;
+        return smt_image_boundary_mode::native;
     }
 
     const std::string value = to_lower_ascii(env);
     if (value == "native") {
-        return ep_image_boundary_mode::native;
+        return smt_image_boundary_mode::native;
     }
     if (value == "auto" || value == "detect") {
-        return ep_image_boundary_mode::auto_detect;
+        return smt_image_boundary_mode::auto_detect;
     }
     if (value == "none" || value == "off" || value == "0") {
-        return ep_image_boundary_mode::none;
+        return smt_image_boundary_mode::none;
     }
 
-    LOG_WRN("[server-smt] unknown MTMD_EP_IMAGE_BOUNDARY='%s', fallback to 'native'\n", env);
-    return ep_image_boundary_mode::native;
+    LOG_WRN("[server-smt] unknown MTMD_SMT_IMAGE_BOUNDARY='%s', fallback to 'native'\n", env);
+    return smt_image_boundary_mode::native;
 }
 
 static std::pair<std::vector<llama_token>, std::vector<llama_token>>
 resolve_image_boundary_tokens(llama_context * lctx, const std::string & arch_name) {
-    const auto mode = ep_image_boundary_mode_from_env();
-    if (mode == ep_image_boundary_mode::none) {
+    const auto mode = smt_image_boundary_mode_from_env();
+    if (mode == smt_image_boundary_mode::none) {
         return {};
     }
-    if (mode == ep_image_boundary_mode::auto_detect) {
+    if (mode == smt_image_boundary_mode::auto_detect) {
         return detect_image_boundary_tokens_auto(lctx);
     }
     return detect_image_boundary_tokens_native(lctx, arch_name);
@@ -232,7 +232,7 @@ static std::string write_temp_bin_file(const std::vector<uint8_t> & data) {
     }
     return std::string(temp_file);
 #else
-    char tmpl[] = "/tmp/llama-server-ep-XXXXXX";
+    char tmpl[] = "/tmp/llama-server-smt-XXXXXX";
     const int fd = mkstemp(tmpl);
     if (fd < 0) {
         throw std::runtime_error("failed to create temp file");
@@ -394,14 +394,14 @@ static int decode_embd(
     return 0;
 }
 
-server_ep_vision_context * server_ep_vision_init(
+server_smt_vision_context * server_smt_vision_init(
         llama_context * lctx,
         const std::string & config_dir) {
 #if defined(LLAMA_SERVER_SMT_VISION)
-    auto ctx = std::make_unique<server_ep_vision_context>();
-    ctx->ep = ep_vision_context::create(config_dir);
-    ctx->architecture = ctx->ep->architecture();
-    ctx->hidden_size = (int32_t) ctx->ep->hidden_size();
+    auto ctx = std::make_unique<server_smt_vision_context>();
+    ctx->smt = smt_vision_context::create(config_dir);
+    ctx->architecture = ctx->smt->architecture();
+    ctx->hidden_size = (int32_t) ctx->smt->hidden_size();
     ctx->use_mrope_pos = arch_requires_mrope(ctx->architecture);
 
     auto boundaries = resolve_image_boundary_tokens(lctx, ctx->architecture);
@@ -416,12 +416,12 @@ server_ep_vision_context * server_ep_vision_init(
 #endif
 }
 
-void server_ep_vision_free(server_ep_vision_context * ctx) {
+void server_smt_vision_free(server_smt_vision_context * ctx) {
     delete ctx;
 }
 
-server_ep_image_chunk server_ep_vision_encode_image_bin(
-        server_ep_vision_context * ctx,
+server_smt_image_chunk server_smt_vision_encode_image_bin(
+        server_smt_vision_context * ctx,
         const std::vector<uint8_t> & data) {
     if (ctx == nullptr) {
         throw std::runtime_error("SMT context is null");
@@ -430,17 +430,17 @@ server_ep_image_chunk server_ep_vision_encode_image_bin(
 #if defined(LLAMA_SERVER_SMT_VISION)
     std::lock_guard<std::mutex> lock(ctx->mu);
 
-    std::vector<uint8_t> ep_input = data;
-    auto preproc = ep_vision_preprocess_if_image(data, ctx->architecture);
+    std::vector<uint8_t> smt_input = data;
+    auto preproc = smt_vision_preprocess_if_image(data, ctx->architecture);
     if (preproc.was_image) {
-        ep_input = std::move(preproc.tensor_bytes);
+        smt_input = std::move(preproc.tensor_bytes);
     }
 
-    const std::string tmp_file = write_temp_bin_file(ep_input);
+    const std::string tmp_file = write_temp_bin_file(smt_input);
 
-    server_ep_image_chunk out;
+    server_smt_image_chunk out;
     try {
-        out.embd = ctx->ep->encode_image(tmp_file);
+        out.embd = ctx->smt->encode_image(tmp_file);
         std::remove(tmp_file.c_str());
     } catch (...) {
         std::remove(tmp_file.c_str());
@@ -468,10 +468,10 @@ server_ep_image_chunk server_ep_vision_encode_image_bin(
 #endif
 }
 
-int32_t server_ep_vision_decode_chunk(
+int32_t server_smt_vision_decode_chunk(
         llama_context * lctx,
-        const server_ep_vision_context * ctx,
-        const server_ep_image_chunk & chunk,
+        const server_smt_vision_context * ctx,
+        const server_smt_image_chunk & chunk,
         llama_pos & n_past,
         int32_t seq_id,
         int32_t n_batch,

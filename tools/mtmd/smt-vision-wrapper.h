@@ -1,5 +1,5 @@
-// EP Vision Wrapper - Spacemit EP ONNX vision engine adapter for llama-mtmd-cli
-// Replaces CLIP/GGUF vision encoding with EP's ONNX vision engine
+// SMT vision wrapper for llama-mtmd-cli.
+// Replaces CLIP/GGUF vision encoding with the SpacemiT SMT ONNX vision engine.
 
 #pragma once
 
@@ -8,13 +8,13 @@
 #include <vector>
 #include <cstdint>
 
-struct ep_vision_context {
-    ep_vision_context(const ep_vision_context &) = delete;
-    ep_vision_context & operator=(const ep_vision_context &) = delete;
-    ~ep_vision_context();
+struct smt_vision_context {
+    smt_vision_context(const smt_vision_context &) = delete;
+    smt_vision_context & operator=(const smt_vision_context &) = delete;
+    ~smt_vision_context();
 
-    // Initialize from EP config directory (containing config.json)
-    static std::unique_ptr<ep_vision_context> create(const std::string & config_dir);
+    // Initialize from SMT config directory (containing config.json)
+    static std::unique_ptr<smt_vision_context> create(const std::string & config_dir);
 
     // Encode a preprocessed image binary file using ONNX vision engine
     // Returns image embedding vector (n_tokens * hidden_size floats)
@@ -33,7 +33,7 @@ struct ep_vision_context {
     const std::string & architecture() const;
 
 private:
-    ep_vision_context() = default;
+    smt_vision_context() = default;
     struct impl;
     std::unique_ptr<impl> pimpl_;
 };

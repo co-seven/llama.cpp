@@ -1,4 +1,4 @@
-// Multimodal CLI SMT backend using Spacemit EP ONNX vision engine
+// Multimodal CLI SMT backend using the SpacemiT SMT ONNX vision engine.
 // Integrated into llama-mtmd-cli and selected via --vision-backend smt
 // LLM inference logic (loading, sampling, generation) is reused from the original mtmd-cli
 
@@ -10,8 +10,8 @@
 #include "ggml.h"
 #include "console.h"
 #include "chat.h"
-#include "ep-vision-wrapper.h"
-#include "ep-vision-preprocess.h"
+#include "smt-vision-wrapper.h"
+#include "smt-vision-preprocess.h"
 
 #include <vector>
 #include <string>
@@ -76,24 +76,24 @@ static const std::string k_legacy_image_marker = "<__image__>";
 static void replace_all(std::string & s, const std::string & from, const std::string & to);
 static std::vector<std::string> split_keep_marker(const std::string & input, const std::string & marker);
 
-enum class ep_chunk_type {
+enum class smt_chunk_type {
     text,
     image,
 };
 
-struct ep_prompt_chunk {
-    ep_chunk_type type = ep_chunk_type::text;
+struct smt_prompt_chunk {
+    smt_chunk_type type = smt_chunk_type::text;
     std::vector<llama_token> tokens_text;
     std::string image_path;
 };
 
-enum class ep_image_boundary_mode {
+enum class smt_image_boundary_mode {
     native,      // follow native mtmd model-family rules
     auto_detect, // probe vocab for known token pairs
     none,        // do not inject image boundary tokens
 };
 
-enum class ep_media_anchor_mode {
+enum class smt_media_anchor_mode {
     auto_mode, // apply on known architectures for multi-image prompts
     on,        // always apply for multi-image prompts
     off,       // disable prompt canonicalization
@@ -106,32 +106,32 @@ static std::string to_lower_ascii(std::string s) {
     return s;
 }
 
-static ep_image_boundary_mode ep_image_boundary_mode_from_env() {
-    const char * env = std::getenv("MTMD_EP_IMAGE_BOUNDARY");
+static smt_image_boundary_mode smt_image_boundary_mode_from_env() {
+    const char * env = std::getenv("MTMD_SMT_IMAGE_BOUNDARY");
     if (env == nullptr || env[0] == '\0') {
-        return ep_image_boundary_mode::native;
+        return smt_image_boundary_mode::native;
     }
 
     const std::string value = to_lower_ascii(env);
     if (value == "native") {
-        return ep_image_boundary_mode::native;
+        return smt_image_boundary_mode::native;
     }
     if (value == "auto" || value == "detect") {
-        return ep_image_boundary_mode::auto_detect;
+        return smt_image_boundary_mode::auto_detect;
     }
     if (value == "none" || value == "off" || value == "0") {
-        return ep_image_boundary_mode::none;
+        return smt_image_boundary_mode::none;
     }
 
-    LOG_WRN("[SMT] unknown MTMD_EP_IMAGE_BOUNDARY='%s', fallback to 'native'\n", env);
-    return ep_image_boundary_mode::native;
+    LOG_WRN("[SMT] unknown MTMD_SMT_IMAGE_BOUNDARY='%s', fallback to 'native'\n", env);
+    return smt_image_boundary_mode::native;
 }
 
-static const char * ep_image_boundary_mode_name(ep_image_boundary_mode mode) {
+static const char * smt_image_boundary_mode_name(smt_image_boundary_mode mode) {
     switch (mode) {
-        case ep_image_boundary_mode::native:      return "native";
-        case ep_image_boundary_mode::auto_detect: return "auto";
-        case ep_image_boundary_mode::none:        return "none";
+        case smt_image_boundary_mode::native:      return "native";
+        case smt_image_boundary_mode::auto_detect: return "auto";
+        case smt_image_boundary_mode::none:        return "none";
     }
     return "native";
 }
@@ -167,30 +167,30 @@ static std::pair<int, int> infer_image_grid_xy(int n_tokens) {
     return {best_x, best_y};
 }
 
-static ep_media_anchor_mode ep_media_anchor_mode_from_env() {
-    const char * env = std::getenv("MTMD_EP_MEDIA_ANCHOR");
+static smt_media_anchor_mode smt_media_anchor_mode_from_env() {
+    const char * env = std::getenv("MTMD_SMT_MEDIA_ANCHOR");
     if (env == nullptr || env[0] == '\0') {
-        return ep_media_anchor_mode::off;
+        return smt_media_anchor_mode::off;
     }
     const std::string value = to_lower_ascii(env);
     if (value == "auto") {
-        return ep_media_anchor_mode::auto_mode;
+        return smt_media_anchor_mode::auto_mode;
     }
     if (value == "on" || value == "1" || value == "true") {
-        return ep_media_anchor_mode::on;
+        return smt_media_anchor_mode::on;
     }
     if (value == "off" || value == "0" || value == "false") {
-        return ep_media_anchor_mode::off;
+        return smt_media_anchor_mode::off;
     }
-    LOG_WRN("[SMT] unknown MTMD_EP_MEDIA_ANCHOR='%s', fallback to 'off'\n", env);
-    return ep_media_anchor_mode::off;
+    LOG_WRN("[SMT] unknown MTMD_SMT_MEDIA_ANCHOR='%s', fallback to 'off'\n", env);
+    return smt_media_anchor_mode::off;
 }
 
-static const char * ep_media_anchor_mode_name(ep_media_anchor_mode mode) {
+static const char * smt_media_anchor_mode_name(smt_media_anchor_mode mode) {
     switch (mode) {
-        case ep_media_anchor_mode::auto_mode: return "auto";
-        case ep_media_anchor_mode::on:        return "on";
-        case ep_media_anchor_mode::off:       return "off";
+        case smt_media_anchor_mode::auto_mode: return "auto";
+        case smt_media_anchor_mode::on:        return "on";
+        case smt_media_anchor_mode::off:       return "off";
     }
     return "auto";
 }
@@ -230,16 +230,16 @@ static std::pair<std::vector<llama_token>, std::vector<llama_token>> detect_imag
     return {};
 }
 
-static bool should_apply_media_anchor(const std::string & arch_name, size_t n_images, ep_media_anchor_mode mode) {
+static bool should_apply_media_anchor(const std::string & arch_name, size_t n_images, smt_media_anchor_mode mode) {
     if (n_images < 2) {
         return false;
     }
     switch (mode) {
-        case ep_media_anchor_mode::off:
+        case smt_media_anchor_mode::off:
             return false;
-        case ep_media_anchor_mode::on:
+        case smt_media_anchor_mode::on:
             return true;
-        case ep_media_anchor_mode::auto_mode:
+        case smt_media_anchor_mode::auto_mode:
             return contains_icase(arch_name, "llavaqwen2forcausallm") || contains_icase(arch_name, "llavaqwen2");
     }
     return false;
@@ -249,7 +249,7 @@ static std::string canonicalize_multimage_prompt(
         const std::string & prompt,
         size_t n_images,
         const std::string & arch_name,
-        ep_media_anchor_mode mode,
+        smt_media_anchor_mode mode,
         bool & changed) {
     changed = false;
     if (!should_apply_media_anchor(arch_name, n_images, mode)) {
@@ -348,11 +348,11 @@ detect_image_boundary_tokens_native(llama_context * lctx, const std::string & ar
 static std::pair<std::vector<llama_token>, std::vector<llama_token>>
 resolve_image_boundary_tokens(llama_context * lctx,
                               const std::string & arch_name,
-                              ep_image_boundary_mode mode) {
-    if (mode == ep_image_boundary_mode::none) {
+                              smt_image_boundary_mode mode) {
+    if (mode == smt_image_boundary_mode::none) {
         return {};
     }
-    if (mode == ep_image_boundary_mode::auto_detect) {
+    if (mode == smt_image_boundary_mode::auto_detect) {
         return detect_image_boundary_tokens(lctx);
     }
     return detect_image_boundary_tokens_native(lctx, arch_name);
@@ -424,7 +424,7 @@ static std::string write_temp_bin_file(const std::vector<uint8_t> & data) {
     }
     return std::string(temp_file);
 #else
-    char tmpl[] = "/tmp/llama-mtmd-ep-XXXXXX";
+    char tmpl[] = "/tmp/llama-mtmd-smt-XXXXXX";
     const int fd = mkstemp(tmpl);
     if (fd < 0) {
         throw std::runtime_error("failed to create temp file");
@@ -445,29 +445,29 @@ static std::string write_temp_bin_file(const std::vector<uint8_t> & data) {
 #endif
 }
 
-static void append_text_chunk(std::vector<ep_prompt_chunk> & chunks, std::vector<llama_token> && tokens) {
+static void append_text_chunk(std::vector<smt_prompt_chunk> & chunks, std::vector<llama_token> && tokens) {
     if (tokens.empty()) {
         return;
     }
-    if (!chunks.empty() && chunks.back().type == ep_chunk_type::text) {
+    if (!chunks.empty() && chunks.back().type == smt_chunk_type::text) {
         auto & dst = chunks.back().tokens_text;
         dst.insert(dst.end(), tokens.begin(), tokens.end());
         return;
     }
 
-    ep_prompt_chunk chunk;
-    chunk.type = ep_chunk_type::text;
+    smt_prompt_chunk chunk;
+    chunk.type = smt_chunk_type::text;
     chunk.tokens_text = std::move(tokens);
     chunks.emplace_back(std::move(chunk));
 }
 
-static bool tokenize_to_ep_chunks(
+static bool tokenize_to_smt_chunks(
         const llama_vocab * vocab,
         const std::string & formatted_chat,
         bool add_special,
         bool parse_special,
         const std::vector<std::string> & image_paths,
-        std::vector<ep_prompt_chunk> & out_chunks) {
+        std::vector<smt_prompt_chunk> & out_chunks) {
     out_chunks.clear();
 
     std::string input = formatted_chat;
@@ -481,8 +481,8 @@ static bool tokenize_to_ep_chunks(
                 LOG_ERR("Number of images (%zu) does not match number of media markers in prompt\n", image_paths.size());
                 return false;
             }
-            ep_prompt_chunk chunk;
-            chunk.type = ep_chunk_type::image;
+            smt_prompt_chunk chunk;
+            chunk.type = smt_chunk_type::image;
             chunk.image_path = image_paths[n_images_used++];
             out_chunks.emplace_back(std::move(chunk));
         } else {
@@ -499,11 +499,11 @@ static bool tokenize_to_ep_chunks(
     if (add_special && llama_vocab_get_add_bos(vocab)) {
         const llama_token bos = llama_vocab_bos(vocab);
         if (bos != LLAMA_TOKEN_NULL) {
-            if (!out_chunks.empty() && out_chunks.front().type == ep_chunk_type::text) {
+            if (!out_chunks.empty() && out_chunks.front().type == smt_chunk_type::text) {
                 out_chunks.front().tokens_text.insert(out_chunks.front().tokens_text.begin(), bos);
             } else {
-                ep_prompt_chunk bos_chunk;
-                bos_chunk.type = ep_chunk_type::text;
+                smt_prompt_chunk bos_chunk;
+                bos_chunk.type = smt_chunk_type::text;
                 bos_chunk.tokens_text = { bos };
                 out_chunks.insert(out_chunks.begin(), std::move(bos_chunk));
             }
@@ -513,11 +513,11 @@ static bool tokenize_to_ep_chunks(
     if (add_special && llama_vocab_get_add_eos(vocab)) {
         const llama_token eos = llama_vocab_eos(vocab);
         if (eos != LLAMA_TOKEN_NULL) {
-            if (!out_chunks.empty() && out_chunks.back().type == ep_chunk_type::text) {
+            if (!out_chunks.empty() && out_chunks.back().type == smt_chunk_type::text) {
                 out_chunks.back().tokens_text.push_back(eos);
             } else {
-                ep_prompt_chunk eos_chunk;
-                eos_chunk.type = ep_chunk_type::text;
+                smt_prompt_chunk eos_chunk;
+                eos_chunk.type = smt_chunk_type::text;
                 eos_chunk.tokens_text = { eos };
                 out_chunks.emplace_back(std::move(eos_chunk));
             }
@@ -679,8 +679,8 @@ static int decode_tokens(llama_context * lctx,
 // Context structure
 // ============================================================
 
-struct mtmd_cli_ep_context {
-    std::unique_ptr<ep_vision_context> ep_ctx;
+struct mtmd_cli_smt_context {
+    std::unique_ptr<smt_vision_context> smt_ctx;
     common_init_result_ptr llama_init;
 
     llama_model       * model;
@@ -694,8 +694,8 @@ struct mtmd_cli_ep_context {
     bool use_mrope_pos = false;
     std::vector<llama_token> tok_img_beg;
     std::vector<llama_token> tok_img_end;
-    ep_image_boundary_mode img_boundary_mode = ep_image_boundary_mode::native;
-    ep_media_anchor_mode media_anchor_mode = ep_media_anchor_mode::off;
+    smt_image_boundary_mode img_boundary_mode = smt_image_boundary_mode::native;
+    smt_media_anchor_mode media_anchor_mode = smt_media_anchor_mode::off;
 
     // Pending image binary paths
     std::vector<std::string> pending_images;
@@ -711,7 +711,7 @@ struct mtmd_cli_ep_context {
     int n_threads    = 1;
     llama_pos n_past = 0;
 
-    mtmd_cli_ep_context(common_params & params, const std::string & ep_config_dir)
+    mtmd_cli_smt_context(common_params & params, const std::string & smt_config_dir)
         : llama_init(common_init_from_params(params))
     {
         model = llama_init->model();
@@ -733,11 +733,11 @@ struct mtmd_cli_ep_context {
         chat_history.clear();
 
         // Initialize SMT vision context
-        ep_ctx = ep_vision_context::create(ep_config_dir);
-        hidden_size = ep_ctx->hidden_size();
-        use_mrope_pos = arch_requires_mrope(ep_ctx->architecture());
-        img_boundary_mode = ep_image_boundary_mode_from_env();
-        media_anchor_mode = ep_media_anchor_mode_from_env();
+        smt_ctx = smt_vision_context::create(smt_config_dir);
+        hidden_size = smt_ctx->hidden_size();
+        use_mrope_pos = arch_requires_mrope(smt_ctx->architecture());
+        img_boundary_mode = smt_image_boundary_mode_from_env();
+        media_anchor_mode = smt_media_anchor_mode_from_env();
         if (hidden_size <= 0 || hidden_size > INT_MAX) {
             LOG_ERR("FATAL: invalid SMT hidden_size (%" PRId64 ")\n", hidden_size);
             exit(1);
@@ -751,12 +751,11 @@ struct mtmd_cli_ep_context {
         }
 
         // Align image boundary tokens with native mtmd behavior by default.
-        auto boundaries = resolve_image_boundary_tokens(lctx, ep_ctx->architecture(), img_boundary_mode);
+        auto boundaries = resolve_image_boundary_tokens(lctx, smt_ctx->architecture(), img_boundary_mode);
         tok_img_beg = std::move(boundaries.first);
         tok_img_end = std::move(boundaries.second);
-        if (!tok_img_beg.empty() && !tok_img_end.empty() &&
-            tok_img_beg.front() != LLAMA_TOKEN_NULL && tok_img_end.front() != LLAMA_TOKEN_NULL) {
-        } else {
+        if (tok_img_beg.empty() || tok_img_end.empty() ||
+            tok_img_beg.front() == LLAMA_TOKEN_NULL || tok_img_end.front() == LLAMA_TOKEN_NULL) {
             tok_img_beg.clear();
             tok_img_end.clear();
         }
@@ -769,7 +768,7 @@ struct mtmd_cli_ep_context {
         }
     }
 
-    ~mtmd_cli_ep_context() {
+    ~mtmd_cli_smt_context() {
         llama_batch_free(batch);
         common_sampler_free(smpl);
     }
@@ -794,7 +793,7 @@ struct mtmd_cli_ep_context {
 // Generate response (reused from mtmd-cli.cpp)
 // ============================================================
 
-static int generate_response(mtmd_cli_ep_context & ctx, int n_predict) {
+static int generate_response(mtmd_cli_smt_context & ctx, int n_predict) {
     llama_tokens generated_tokens;
     for (int i = 0; i < n_predict; i++) {
         if (i > n_predict || !g_is_generating || g_is_interrupted) {
@@ -841,7 +840,7 @@ static int generate_response(mtmd_cli_ep_context & ctx, int n_predict) {
 // Chat formatting (reused from mtmd-cli.cpp)
 // ============================================================
 
-static std::string chat_add_and_format(mtmd_cli_ep_context & ctx, common_chat_msg & new_msg) {
+static std::string chat_add_and_format(mtmd_cli_smt_context & ctx, common_chat_msg & new_msg) {
     auto formatted = common_chat_format_single(ctx.tmpls.get(), ctx.chat_history,
         new_msg, new_msg.role == "user",
         ctx.use_jinja);
@@ -853,7 +852,7 @@ static std::string chat_add_and_format(mtmd_cli_ep_context & ctx, common_chat_ms
 // Eval message - core multimodal processing
 // ============================================================
 
-static int eval_message_ep(mtmd_cli_ep_context & ctx, common_chat_msg & msg) {
+static int eval_message_smt(mtmd_cli_smt_context & ctx, common_chat_msg & msg) {
     bool add_bos = ctx.chat_history.empty();
 
     if (msg.role == "user" && !ctx.pending_images.empty()) {
@@ -861,7 +860,7 @@ static int eval_message_ep(mtmd_cli_ep_context & ctx, common_chat_msg & msg) {
         msg.content = canonicalize_multimage_prompt(
             msg.content,
             ctx.pending_images.size(),
-            ctx.ep_ctx->architecture(),
+            ctx.smt_ctx->architecture(),
             ctx.media_anchor_mode,
             changed);
         GGML_UNUSED(changed);
@@ -871,15 +870,15 @@ static int eval_message_ep(mtmd_cli_ep_context & ctx, common_chat_msg & msg) {
 
     if (g_is_interrupted) return 0;
 
-    std::vector<ep_prompt_chunk> chunks;
-    if (!tokenize_to_ep_chunks(ctx.vocab, formatted_chat, add_bos, true, ctx.pending_images, chunks)) {
+    std::vector<smt_prompt_chunk> chunks;
+    if (!tokenize_to_smt_chunks(ctx.vocab, formatted_chat, add_bos, true, ctx.pending_images, chunks)) {
         return 1;
     }
 
     for (size_t i = 0; i < chunks.size(); ++i) {
         const bool logits_last = (i == chunks.size() - 1);
         const auto & chunk = chunks[i];
-        if (chunk.type == ep_chunk_type::text) {
+        if (chunk.type == smt_chunk_type::text) {
             if (decode_tokens(ctx.lctx, chunk.tokens_text, ctx.n_past, ctx.n_batch, logits_last) != 0) {
                 LOG_ERR("Failed to decode text chunk %zu\n", i);
                 return 1;
@@ -888,14 +887,14 @@ static int eval_message_ep(mtmd_cli_ep_context & ctx, common_chat_msg & msg) {
         }
 
         // image chunk
-        std::string ep_input_path = chunk.image_path;
+        std::string smt_input_path = chunk.image_path;
         std::string temp_input_path;
         try {
             const auto image_bytes = read_binary_file(chunk.image_path);
-            auto preproc = ep_vision_preprocess_if_image(image_bytes, ctx.ep_ctx->architecture());
+            auto preproc = smt_vision_preprocess_if_image(image_bytes, ctx.smt_ctx->architecture());
             if (preproc.was_image) {
                 temp_input_path = write_temp_bin_file(preproc.tensor_bytes);
-                ep_input_path = temp_input_path;
+                smt_input_path = temp_input_path;
             }
         } catch (const std::exception & e) {
             LOG_ERR("Failed to prepare image '%s': %s\n", chunk.image_path.c_str(), e.what());
@@ -904,7 +903,7 @@ static int eval_message_ep(mtmd_cli_ep_context & ctx, common_chat_msg & msg) {
 
         std::vector<float> image_embd;
         try {
-            image_embd = ctx.ep_ctx->encode_image(ep_input_path);
+            image_embd = ctx.smt_ctx->encode_image(smt_input_path);
             if (!temp_input_path.empty()) {
                 std::remove(temp_input_path.c_str());
             }
@@ -976,7 +975,7 @@ int mtmd_cli_smt_run(int argc, char ** argv, common_params params) {
         return 1;
     }
 
-    mtmd_cli_ep_context ctx(params, params.smt_config_dir);
+    mtmd_cli_smt_context ctx(params, params.smt_config_dir);
 
     bool is_single_turn = !params.prompt.empty() && !params.image.empty();
     int n_predict = params.n_predict < 0 ? INT_MAX : params.n_predict;
@@ -1007,7 +1006,7 @@ int mtmd_cli_smt_run(int argc, char ** argv, common_params params) {
         common_chat_msg msg;
         msg.role = "system";
         msg.content = params.system_prompt;
-        return eval_message_ep(ctx, msg);
+        return eval_message_smt(ctx, msg);
     };
 
     if (eval_system_prompt_if_present()) {
@@ -1032,7 +1031,7 @@ int mtmd_cli_smt_run(int argc, char ** argv, common_params params) {
             ctx.add_image(image);
         }
 
-        if (eval_message_ep(ctx, msg)) {
+        if (eval_message_smt(ctx, msg)) {
             return 1;
         }
         if (!g_is_interrupted && generate_response(ctx, n_predict)) {
@@ -1093,7 +1092,7 @@ int mtmd_cli_smt_run(int argc, char ** argv, common_params params) {
             common_chat_msg msg;
             msg.role = "user";
             msg.content = content;
-            int ret = eval_message_ep(ctx, msg);
+            int ret = eval_message_smt(ctx, msg);
             if (ret) {
                 return 1;
             }

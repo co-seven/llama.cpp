@@ -1,7 +1,6 @@
-// EP Vision Wrapper - Spacemit EP ONNX vision engine adapter
-// Wraps SpineVisionModelEngine and SpineLLMArgParser for use in mtmd-cli-ep
+// SMT vision wrapper for llama.cpp SpacemiT integration.
 
-#include "ep-vision-wrapper.h"
+#include "smt-vision-wrapper.h"
 
 #include "spine_vision_engine.h"
 
@@ -217,16 +216,16 @@ static bool load_smt_vision_config(const std::string & config_dir, smt_vision_co
 
 } // namespace
 
-struct ep_vision_context::impl {
+struct smt_vision_context::impl {
     smt_vision_config                                             config;
     std::unique_ptr<onnxruntime::spacemit::SpineVisionModelEngine> vision_engine;
     std::string                                                    arch_name;
 };
 
-ep_vision_context::~ep_vision_context() = default;
+smt_vision_context::~smt_vision_context() = default;
 
-std::unique_ptr<ep_vision_context> ep_vision_context::create(const std::string & config_dir) {
-    auto ctx    = std::unique_ptr<ep_vision_context>(new ep_vision_context());
+std::unique_ptr<smt_vision_context> smt_vision_context::create(const std::string & config_dir) {
+    auto ctx    = std::unique_ptr<smt_vision_context>(new smt_vision_context());
     ctx->pimpl_ = std::make_unique<impl>();
     auto & d    = *ctx->pimpl_;
 
@@ -249,26 +248,26 @@ std::unique_ptr<ep_vision_context> ep_vision_context::create(const std::string &
     return ctx;
 }
 
-std::vector<float> ep_vision_context::encode_image(const std::string & binary_path) {
+std::vector<float> smt_vision_context::encode_image(const std::string & binary_path) {
     auto & d = *pimpl_;
     std::string  path_copy    = binary_path;
     Ort::Value & input_tensor = d.vision_engine->SetInputTensor(path_copy);
     return d.vision_engine->RunSession(input_tensor);
 }
 
-int64_t ep_vision_context::hidden_size() const {
+int64_t smt_vision_context::hidden_size() const {
     return pimpl_->config.hidden_size;
 }
 
-int64_t ep_vision_context::vocab_size() const {
+int64_t smt_vision_context::vocab_size() const {
     return 0;
 }
 
-const std::string & ep_vision_context::token_embedding_path() const {
+const std::string & smt_vision_context::token_embedding_path() const {
     static const std::string empty;
     return empty;
 }
 
-const std::string & ep_vision_context::architecture() const {
+const std::string & smt_vision_context::architecture() const {
     return pimpl_->arch_name;
 }

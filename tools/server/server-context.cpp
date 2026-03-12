@@ -5,7 +5,7 @@
 #include "server-http.h"
 #include "server-task.h"
 #include "server-queue.h"
-#include "server-ep-vision.h"
+#include "server-smt-vision.h"
 
 #include "build-info.h"
 #include "common.h"
@@ -620,7 +620,7 @@ public:
     llama_model * model_tgt = nullptr;
 
     mtmd_context * mctx = nullptr;
-    server_ep_vision_context * ep_ctx = nullptr;
+    server_smt_vision_context * smt_ctx = nullptr;
     const llama_vocab * vocab = nullptr;
     server_vision_backend_mode vision_backend = SERVER_VISION_BACKEND_NONE;
 
@@ -694,7 +694,7 @@ private:
     bool sleeping = false;
 
     bool has_multimodal() const {
-        return mctx != nullptr || ep_ctx != nullptr;
+        return mctx != nullptr || smt_ctx != nullptr;
     }
 
     const char * vision_backend_name() const {
@@ -716,8 +716,8 @@ private:
 
         mtmd_free(mctx);
         mctx = nullptr;
-        server_ep_vision_free(ep_ctx);
-        ep_ctx = nullptr;
+        server_smt_vision_free(smt_ctx);
+        smt_ctx = nullptr;
         vision_backend = SERVER_VISION_BACKEND_NONE;
 
         llama_batch_free(batch);
@@ -812,32 +812,30 @@ private:
         }
 
         const std::string & mmproj_path = params_base.mmproj.path;
-        const std::string & backend_pref = params_base.vision_backend;
 
         server_vision_backend_mode selected_backend = SERVER_VISION_BACKEND_NONE;
-        if (backend_pref == "auto") {
 #if defined(LLAMA_SERVER_SMT_VISION)
+        const std::string & backend_pref = params_base.vision_backend;
+        if (backend_pref == "auto") {
             const std::string & smt_config_dir = params_base.smt_config_dir;
             if (!smt_config_dir.empty()) {
                 selected_backend = SERVER_VISION_BACKEND_SMT;
             } else if (!mmproj_path.empty()) {
                 selected_backend = SERVER_VISION_BACKEND_MTMD;
             }
-#else
-            if (!mmproj_path.empty()) {
-                selected_backend = SERVER_VISION_BACKEND_MTMD;
-            }
-#endif
         } else if (backend_pref == "mtmd") {
             selected_backend = SERVER_VISION_BACKEND_MTMD;
-#if defined(LLAMA_SERVER_SMT_VISION)
         } else if (backend_pref == "smt") {
             selected_backend = SERVER_VISION_BACKEND_SMT;
-#endif
         } else {
             SRV_ERR("invalid --vision-backend value: '%s'\n", backend_pref.c_str());
             return false;
         }
+#else
+        if (!mmproj_path.empty()) {
+            selected_backend = SERVER_VISION_BACKEND_MTMD;
+        }
+#endif
 
         if (selected_backend == SERVER_VISION_BACKEND_MTMD) {
             if (mmproj_path.empty()) {
@@ -875,7 +873,7 @@ private:
                 return false;
             }
             try {
-                ep_ctx = server_ep_vision_init(ctx, smt_config_dir);
+                smt_ctx = server_smt_vision_init(ctx, smt_config_dir);
             } catch (const std::exception & e) {
                 SRV_ERR("failed to load SMT vision backend from '%s': %s\n", smt_config_dir.c_str(), e.what());
                 return false;
@@ -1123,9 +1121,9 @@ private:
                 /* reasoning_format      */ params_base.reasoning_format,
                 /* chat_template_kwargs  */ params_base.default_template_kwargs,
                 /* tmpls                 */ std::move(chat_templates),
-                /* allow_image           */ mctx ? mtmd_support_vision(mctx) : (ep_ctx != nullptr),
+                /* allow_image           */ mctx ? mtmd_support_vision(mctx) : (smt_ctx != nullptr),
                 /* allow_audio           */ mctx ? mtmd_support_audio (mctx) : false,
-                /* image_bin_only        */ ep_ctx != nullptr,
+                /* image_bin_only        */ smt_ctx != nullptr,
                 /* vision_backend        */ vision_backend_name(),
                 /* enable_thinking       */ enable_thinking,
                 /* reasoning_budget      */ params_base.sampling.reasoning_budget_tokens,
@@ -1834,12 +1832,12 @@ private:
     bool tokenize_cli_input(server_task & task) {
         try {
             auto & prompt = task.cli_prompt;
-            if (ep_ctx != nullptr) {
-                task.tokens = process_ep_prompt(ep_ctx, vocab, prompt, task.cli_files);
+            if (smt_ctx != nullptr) {
+                task.tokens = process_smt_prompt(smt_ctx, vocab, prompt, task.cli_files);
             } else if (mctx != nullptr) {
                 task.tokens = process_mtmd_prompt(mctx, prompt, task.cli_files);
             } else {
-                task.tokens = std::move(tokenize_input_prompts(vocab, mctx, ep_ctx, prompt, true, true)[0]);
+                task.tokens = std::move(tokenize_input_prompts(vocab, mctx, smt_ctx, prompt, true, true)[0]);
             }
             task.cli_prompt.clear();
             task.cli_files.clear();
@@ -2775,7 +2773,7 @@ private:
                     if (slot.prompt.n_tokens() < slot.task->n_tokens() && input_tokens[slot.prompt.n_tokens()] == LLAMA_TOKEN_NULL) {
                         // process the image
                         size_t n_tokens_out = 0;
-                        int32_t res = input_tokens.process_chunk(ctx, mctx, ep_ctx, slot.prompt.n_tokens(), slot.prompt.tokens.pos_next(), slot.id, n_tokens_out);
+                        int32_t res = input_tokens.process_chunk(ctx, mctx, smt_ctx, slot.prompt.n_tokens(), slot.prompt.tokens.pos_next(), slot.id, n_tokens_out);
                         if (res != 0) {
                             SLT_ERR(slot, "failed to process image, res = %d\n", res);
                             send_error(slot, "failed to process image", ERROR_TYPE_SERVER);
@@ -2787,8 +2785,8 @@ private:
 
                         // add the image chunk to cache
                         {
-                            if (input_tokens.is_ep()) {
-                                const auto & chunk = input_tokens.find_ep_chunk(slot.prompt.n_tokens());
+                            if (input_tokens.is_smt()) {
+                                const auto & chunk = input_tokens.find_smt_chunk(slot.prompt.n_tokens());
                                 slot.prompt.tokens.push_back(chunk); // copy
                             } else {
                                 const auto & chunk = input_tokens.find_chunk(slot.prompt.n_tokens());
@@ -3498,16 +3496,16 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
         // process prompt
         std::vector<server_tokens> inputs;
 
-        if (res_type != TASK_RESPONSE_TYPE_NONE && (ctx_server.mctx != nullptr || ctx_server.ep_ctx != nullptr)) {
+        if (res_type != TASK_RESPONSE_TYPE_NONE && (ctx_server.mctx != nullptr || ctx_server.smt_ctx != nullptr)) {
             // OAI-compatible chat path with multimodal backend.
-            if (ctx_server.ep_ctx != nullptr) {
-                inputs.push_back(process_ep_prompt(ctx_server.ep_ctx, ctx_server.vocab, prompt.get<std::string>(), files));
+            if (ctx_server.smt_ctx != nullptr) {
+                inputs.push_back(process_smt_prompt(ctx_server.smt_ctx, ctx_server.vocab, prompt.get<std::string>(), files));
             } else {
                 inputs.push_back(process_mtmd_prompt(ctx_server.mctx, prompt.get<std::string>(), files));
             }
         } else {
             // Everything else, including multimodal completions.
-            inputs = tokenize_input_prompts(ctx_server.vocab, ctx_server.mctx, ctx_server.ep_ctx, prompt, true, true);
+            inputs = tokenize_input_prompts(ctx_server.vocab, ctx_server.mctx, ctx_server.smt_ctx, prompt, true, true);
         }
 
         // tasks.reserve(inputs.size()); // TODO: this is inaccurate due to child tasks
@@ -4057,7 +4055,7 @@ void server_routes::init_routes() {
         data["input_extra"] = input_extra; // default to empty array if it's not exist
 
         std::string prompt = json_value(data, "prompt", std::string());
-        std::vector<server_tokens> tokenized_prompts = tokenize_input_prompts(ctx_server.vocab, ctx_server.mctx, ctx_server.ep_ctx, prompt, false, true);
+        std::vector<server_tokens> tokenized_prompts = tokenize_input_prompts(ctx_server.vocab, ctx_server.mctx, ctx_server.smt_ctx, prompt, false, true);
         SRV_DBG("creating infill tasks, n_prompts = %d\n", (int) tokenized_prompts.size());
         data["prompt"] = format_prompt_infill(
             ctx_server.vocab,
@@ -4620,7 +4618,7 @@ std::unique_ptr<server_res_generator> server_routes::handle_embeddings_impl(cons
         }
     }
 
-    auto tokenized_prompts = tokenize_input_prompts(ctx_server.vocab, ctx_server.mctx, ctx_server.ep_ctx, prompt, true, true);
+    auto tokenized_prompts = tokenize_input_prompts(ctx_server.vocab, ctx_server.mctx, ctx_server.smt_ctx, prompt, true, true);
     for (const auto & tokens : tokenized_prompts) {
         // this check is necessary for models that do not add BOS token to the input
         if (tokens.empty()) {

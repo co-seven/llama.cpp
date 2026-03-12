@@ -257,15 +257,91 @@ llama_pos server_tokens::pos_next(int64_t n_tokens) const {
     if (n_tokens < 0) {
         llama_pos res = tokens.size();
 
-    if (has_ep) {
-        for (const auto & it : map_idx_to_ep_media) {
-            const auto & chunk = it.second;
-            res += chunk.n_pos - chunk.n_tokens;
+        if (has_smt) {
+            for (const auto & it : map_idx_to_smt_media) {
+                const auto & chunk = it.second;
+                res += chunk.n_pos - chunk.n_tokens;
+            }
+        } else {
+            for (auto it = map_idx_to_media.begin(); it != map_idx_to_media.end(); ++it) {
+                const auto & chunk = it->second;
+                res += mtmd_input_chunk_get_n_pos(chunk.get()) - mtmd_input_chunk_get_n_tokens(chunk.get());
+            }
         }
-    } else {
-        for (auto it = map_idx_to_media.begin(); it != map_idx_to_media.end(); ++it) {
-            const auto & chunk = it->second;
-            res += mtmd_input_chunk_get_n_pos(chunk.get()) - mtmd_input_chunk_get_n_tokens(chunk.get());
+
+        return res;
+    }
+
+    int64_t idx = 0;
+    llama_pos pos = 0;
+
+    GGML_ASSERT(n_tokens <= (int64_t) tokens.size());
+
+    while (idx < n_tokens) {
+        if (has_smt) {
+            const auto smt_it = map_idx_to_smt_media.find(idx);
+            if (smt_it != map_idx_to_smt_media.end()) {
+                const auto & chunk = smt_it->second;
+                pos += chunk.n_pos;
+                idx += chunk.n_tokens;
+                continue;
+            }
+        } else {
+            const auto media_it = map_idx_to_media.find(idx);
+            if (media_it != map_idx_to_media.end()) {
+                const auto & chunk = media_it->second;
+                const llama_pos n_pos = mtmd_input_chunk_get_n_pos(chunk.get());
+                const size_t n_tok = mtmd_input_chunk_get_n_tokens(chunk.get());
+
+                pos += n_pos;
+                idx += n_tok;
+                continue;
+            }
+        }
+
+        pos++;
+        idx++;
+    }
+
+    return pos;
+}
+
+size_t server_tokens::size_up_to_pos(llama_pos max_pos) const {
+    if (!has_mtmd) {
+        return std::min((size_t) max_pos, tokens.size());
+    }
+
+    size_t idx = 0;
+    llama_pos pos = 0;
+
+    while (idx < tokens.size()) {
+        if (has_smt) {
+            const auto smt_it = map_idx_to_smt_media.find(idx);
+            if (smt_it != map_idx_to_smt_media.end()) {
+                const auto & chunk = smt_it->second;
+                pos += chunk.n_pos;
+                idx += chunk.n_tokens;
+            } else {
+                pos++;
+                idx++;
+            }
+        } else {
+            const auto media_it = map_idx_to_media.find(idx);
+            if (media_it != map_idx_to_media.end()) {
+                const auto & chunk = media_it->second;
+                const llama_pos n_pos = mtmd_input_chunk_get_n_pos(chunk.get());
+                const size_t n_tok = mtmd_input_chunk_get_n_tokens(chunk.get());
+
+                pos += n_pos;
+                idx += n_tok;
+            } else {
+                pos++;
+                idx++;
+            }
+        }
+
+        if (pos >= max_pos) {
+            break;
         }
 
         return res;
@@ -338,8 +414,8 @@ std::string server_tokens::str() const {
     }
     oss << "\n";
     oss << "image idx: ";
-    if (has_ep) {
-        for (const auto & it : map_idx_to_ep_media) {
+    if (has_smt) {
+        for (const auto & it : map_idx_to_smt_media) {
             oss << it.first << ", ";
         }
     } else {
@@ -358,9 +434,9 @@ const mtmd::input_chunk_ptr & server_tokens::find_chunk(size_t idx) const {
     throw std::runtime_error("Chunk not found");
 }
 
-const server_ep_image_chunk & server_tokens::find_ep_chunk(size_t idx) const {
-    auto it = map_idx_to_ep_media.find(idx);
-    if (it != map_idx_to_ep_media.end()) {
+const server_smt_image_chunk & server_tokens::find_smt_chunk(size_t idx) const {
+    auto it = map_idx_to_smt_media.find(idx);
+    if (it != map_idx_to_smt_media.end()) {
         return it->second;
     }
     throw std::runtime_error("SMT chunk not found");
@@ -395,14 +471,14 @@ void server_tokens::push_back(const mtmd_input_chunk * chunk) {
     }
 }
 
-void server_tokens::push_back(const server_ep_image_chunk & chunk) {
+void server_tokens::push_back(const server_smt_image_chunk & chunk) {
     GGML_ASSERT(has_mtmd);
-    has_ep = true;
+    has_smt = true;
     const size_t start_idx = tokens.size();
     for (int32_t i = 0; i < chunk.n_tokens; ++i) {
         tokens.emplace_back(LLAMA_TOKEN_NULL);
     }
-    map_idx_to_ep_media[start_idx] = chunk;
+    map_idx_to_smt_media[start_idx] = chunk;
 }
 
 void server_tokens::push_back(server_tokens & tokens) {
@@ -414,10 +490,10 @@ void server_tokens::push_back(server_tokens & tokens) {
         // Assert if we are copying MTMD chunks to a server_tokens that does not have mtmd.
         // We could also just check, but this will prevent silently dropping MTMD data.
         GGML_ASSERT(has_mtmd);
-        if (tokens.has_ep) {
-            has_ep = true;
-            for (const auto & it : tokens.map_idx_to_ep_media) {
-                map_idx_to_ep_media[start_idx + it.first] = it.second;
+        if (tokens.has_smt) {
+            has_smt = true;
+            for (const auto & it : tokens.map_idx_to_smt_media) {
+                map_idx_to_smt_media[start_idx + it.first] = it.second;
             }
         } else {
             for (auto it = tokens.map_idx_to_media.begin(); it != tokens.map_idx_to_media.end(); ) {
@@ -472,19 +548,19 @@ void server_tokens::keep_first(size_t n) {
             // note that the case where we keep a full image at the end is allowed:
             //   tokens[n - 1] == LLAMA_TOKEN_NULL && tokens[n] != LLAMA_TOKEN_NULL
             if (tokens[n - 1] == LLAMA_TOKEN_NULL && tokens[n] == LLAMA_TOKEN_NULL) {
-                if (has_ep) {
-                    find_ep_chunk(n - 1); // will throw an error if the token is not begin-of-chunk
+                if (has_smt) {
+                    find_smt_chunk(n - 1); // will throw an error if the token is not begin-of-chunk
                 } else {
                     find_chunk(n - 1); // will throw an error if the token is not begin-of-chunk
                 }
             }
         }
         // remove all image chunks that are not used anymore
-        if (has_ep) {
-            for (auto it = map_idx_to_ep_media.begin(); it != map_idx_to_ep_media.end(); ) {
+        if (has_smt) {
+            for (auto it = map_idx_to_smt_media.begin(); it != map_idx_to_smt_media.end(); ) {
                 size_t idx = it->first;
                 if (idx >= n) {
-                    it = map_idx_to_ep_media.erase(it);
+                    it = map_idx_to_smt_media.erase(it);
                 } else {
                     ++it;
                 }
@@ -529,7 +605,7 @@ size_t server_tokens::get_common_prefix(const server_tokens & b) const {
         return max_idx;
     }
 
-    if (has_ep != b.has_ep) {
+    if (has_smt != b.has_smt) {
         for (size_t i = 0; i < max_idx; ++i) {
             if (tokens[i] != b.tokens[i]) {
                 return i;
@@ -551,9 +627,9 @@ size_t server_tokens::get_common_prefix(const server_tokens & b) const {
             size_t n_tok_a = 0;
             size_t n_tok_b = 0;
 
-            if (has_ep) {
-                const auto & a_chunk = find_ep_chunk(i);
-                const auto & b_chunk = b.find_ep_chunk(i);
+            if (has_smt) {
+                const auto & a_chunk = find_smt_chunk(i);
+                const auto & b_chunk = b.find_smt_chunk(i);
                 id_ai = a_chunk.id;
                 id_bi = b_chunk.id;
                 n_tok_a = (size_t) a_chunk.n_tokens;
@@ -597,8 +673,8 @@ bool server_tokens::validate(const struct llama_context * ctx) const {
         if (t == LLAMA_TOKEN_NULL) {
             try {
                 size_t n_tokens = 0;
-                if (has_ep) {
-                    const auto & chunk = find_ep_chunk(i);
+                if (has_smt) {
+                    const auto & chunk = find_smt_chunk(i);
                     n_tokens = (size_t) chunk.n_tokens;
                 } else {
                     const auto & chunk = find_chunk(i);
@@ -619,23 +695,23 @@ bool server_tokens::validate(const struct llama_context * ctx) const {
 int32_t server_tokens::process_chunk(
             llama_context * ctx,
             mtmd_context * mctx,
-            const server_ep_vision_context * ep_ctx,
+            const server_smt_vision_context * smt_ctx,
             size_t idx,
             llama_pos pos,
             int32_t seq_id,
             size_t & n_tokens_out) const {
-    if (has_ep) {
-        const auto & chunk = find_ep_chunk(idx);
-        if (ep_ctx == nullptr) {
+    if (has_smt) {
+        const auto & chunk = find_smt_chunk(idx);
+        if (smt_ctx == nullptr) {
             n_tokens_out = 0;
             return -1;
         }
         SRV_INF("%s", "processing image (smt)...\n");
         int64_t t0 = ggml_time_ms();
         llama_pos n_past = pos;
-        int32_t result = server_ep_vision_decode_chunk(
+        int32_t result = server_smt_vision_decode_chunk(
                 ctx,
-                ep_ctx,
+                smt_ctx,
                 chunk,
                 n_past,
                 seq_id,
@@ -643,7 +719,7 @@ int32_t server_tokens::process_chunk(
                 true);
         SRV_INF("image (smt) processed in %" PRId64 " ms\n", ggml_time_ms() - t0);
         if (result != 0) {
-            LOG_ERR("server_ep_vision_decode_chunk failed with status %d\n", result);
+            LOG_ERR("server_smt_vision_decode_chunk failed with status %d\n", result);
             n_tokens_out = 0;
             return result;
         }
@@ -678,11 +754,11 @@ int32_t server_tokens::process_chunk(
 server_tokens server_tokens::clone() const {
     server_tokens res;
     res.has_mtmd = has_mtmd;
-    res.has_ep = has_ep;
+    res.has_smt = has_smt;
     res.tokens   = tokens;
-    if (has_ep) {
-        for (const auto & it : map_idx_to_ep_media) {
-            res.map_idx_to_ep_media[it.first] = it.second;
+    if (has_smt) {
+        for (const auto & it : map_idx_to_smt_media) {
+            res.map_idx_to_smt_media[it.first] = it.second;
         }
     } else {
         for (auto it = map_idx_to_media.begin(); it != map_idx_to_media.end(); ++it) {
@@ -899,14 +975,14 @@ server_tokens process_mtmd_prompt(mtmd_context * mctx, std::string prompt, std::
     return result;
 }
 
-server_tokens process_ep_prompt(
-        server_ep_vision_context * ep_ctx,
+server_tokens process_smt_prompt(
+        server_smt_vision_context * smt_ctx,
         const llama_vocab * vocab,
         std::string prompt,
         std::vector<raw_buffer> files,
         bool add_special,
         bool parse_special) {
-    if (ep_ctx == nullptr) {
+    if (smt_ctx == nullptr) {
         throw std::runtime_error("SMT vision backend is not initialized");
     }
 
@@ -937,7 +1013,7 @@ server_tokens process_ep_prompt(
     bool add_special_once = add_special;
     for (const auto & part : parts) {
         if (part == k_media_marker) {
-            auto chunk = server_ep_vision_encode_image_bin(ep_ctx, files[img_idx++]);
+            auto chunk = server_smt_vision_encode_image_bin(smt_ctx, files[img_idx++]);
             out.push_back(chunk);
             add_special_once = false;
             continue;
@@ -965,13 +1041,13 @@ server_tokens process_ep_prompt(
 static server_tokens tokenize_input_subprompt(
         const llama_vocab * vocab,
         mtmd_context * mctx,
-        server_ep_vision_context * ep_ctx,
+        server_smt_vision_context * smt_ctx,
         const json & json_prompt,
         bool add_special,
         bool parse_special) {
     constexpr char JSON_STRING_PROMPT_KEY[] = "prompt_string";
     constexpr char JSON_MTMD_DATA_KEY[] = "multimodal_data";
-    const bool has_mtmd = mctx != nullptr || ep_ctx != nullptr;
+    const bool has_mtmd = mctx != nullptr || smt_ctx != nullptr;
     if (json_prompt.is_string() || json_is_array_of_mixed_numbers_strings(json_prompt)) {
         // string or mixed
         llama_tokens tmp = tokenize_mixed(vocab, json_prompt, add_special, parse_special);
@@ -991,8 +1067,8 @@ static server_tokens tokenize_input_subprompt(
             for (const auto & entry : json_prompt.at(JSON_MTMD_DATA_KEY)) {
                 files.push_back(base64_decode(entry));
             }
-            if (ep_ctx != nullptr) {
-                return process_ep_prompt(ep_ctx, vocab, json_prompt.at(JSON_STRING_PROMPT_KEY), files, add_special, parse_special);
+            if (smt_ctx != nullptr) {
+                return process_smt_prompt(smt_ctx, vocab, json_prompt.at(JSON_STRING_PROMPT_KEY), files, add_special, parse_special);
             }
             return process_mtmd_prompt(mctx, json_prompt.at(JSON_STRING_PROMPT_KEY), files);
         } else {
@@ -1008,7 +1084,7 @@ static server_tokens tokenize_input_subprompt(
 std::vector<server_tokens> tokenize_input_prompts(
         const llama_vocab * vocab,
         mtmd_context * mctx,
-        server_ep_vision_context * ep_ctx,
+        server_smt_vision_context * smt_ctx,
         const json & json_prompt,
         bool add_special,
         bool parse_special) {
@@ -1016,10 +1092,10 @@ std::vector<server_tokens> tokenize_input_prompts(
     if (json_prompt.is_array() && !json_is_array_and_contains_numbers(json_prompt)) {
         result.reserve(json_prompt.size());
         for (const auto & p : json_prompt) {
-            result.push_back(tokenize_input_subprompt(vocab, mctx, ep_ctx, p, add_special, parse_special));
+            result.push_back(tokenize_input_subprompt(vocab, mctx, smt_ctx, p, add_special, parse_special));
         }
     } else {
-        result.push_back(tokenize_input_subprompt(vocab, mctx, ep_ctx, json_prompt, add_special, parse_special));
+        result.push_back(tokenize_input_subprompt(vocab, mctx, smt_ctx, json_prompt, add_special, parse_special));
     }
     if (result.empty()) {
         throw std::runtime_error("\"prompt\" must not be empty");
@@ -1076,7 +1152,7 @@ static void handle_media(
         json & media_obj,
         const std::string & media_path,
         bool image_bin_only) {
-    auto is_ep_supported_image_file = [](const std::string & path) {
+    auto is_smt_supported_image_file = [](const std::string & path) {
         std::string lower = path;
         std::transform(lower.begin(), lower.end(), lower.begin(), [](unsigned char c) {
             return (char) std::tolower(c);
@@ -1113,7 +1189,7 @@ static void handle_media(
         }
         // load local image file
         std::string file_path = url.substr(7); // remove "file://"
-        if (image_bin_only && !string_ends_with(file_path, ".bin") && !is_ep_supported_image_file(file_path)) {
+        if (image_bin_only && !string_ends_with(file_path, ".bin") && !is_smt_supported_image_file(file_path)) {
             throw std::invalid_argument("SMT backend expects file:// image_url to be .bin or image file (.jpg/.jpeg/.png/.webp/.bmp/.gif)");
         }
         raw_buffer data;

@@ -13,8 +13,6 @@ add_library(${TARGET} STATIC
     server-queue.h
     server-common.cpp
     server-common.h
-    server-ep-vision.cpp
-    server-ep-vision.h
     server-context.cpp
     server-context.h
     server-tools.cpp
@@ -47,8 +45,10 @@ if(LLAMA_SERVER_SMT_VISION)
 
     target_compile_definitions(${TARGET} PRIVATE LLAMA_SERVER_SMT_VISION=1)
     target_sources(${TARGET} PRIVATE
-        ../mtmd/ep-vision-preprocess.cpp
-        ../mtmd/ep-vision-wrapper.cpp
+        server-smt-vision.cpp
+        server-smt-vision.h
+        ../mtmd/smt-vision-preprocess.cpp
+        ../mtmd/smt-vision-wrapper.cpp
         ${SPACEMIT_ORT_SAMPLE_DIR}/spine_vision_engine.cc
         ${SPACEMIT_ORT_SAMPLE_DIR}/spine_llm_argparser.cc
     )
