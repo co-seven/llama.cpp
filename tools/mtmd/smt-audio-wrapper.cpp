@@ -345,9 +345,10 @@ static bool decode_audio_file(const std::string & path, int target_sample_rate, 
     return !pcmf32_mono.empty();
 }
 
-static OrtStatus * init_spacemit_execution_provider(
+static bool init_spacemit_execution_provider(
         Ort::SessionOptions & options,
-        const std::unordered_map<std::string, std::string> & provider_options) {
+        const std::unordered_map<std::string, std::string> & provider_options,
+        std::string & error_message) {
     std::vector<const char *> keys;
     std::vector<const char *> values;
     keys.reserve(provider_options.size());
@@ -359,26 +360,36 @@ static OrtStatus * init_spacemit_execution_provider(
 
     void * handle = dlopen("libspacemit_ep.so", RTLD_NOW);
     if (!handle) {
-        return nullptr;
+        error_message = std::string("failed to load libspacemit_ep.so: ") + dlerror();
+        return false;
     }
 
     auto * ep_init = reinterpret_cast<OrtStatus * (*)(OrtSessionOptions *, const char * const *, const char * const *, size_t)>(
             dlsym(handle, "OrtSessionOptionsSpaceMITEnvInit"));
     if (!ep_init) {
-        return nullptr;
+        error_message = std::string("failed to find OrtSessionOptionsSpaceMITEnvInit: ") + dlerror();
+        return false;
     }
 
-    return ep_init(options, keys.data(), values.data(), keys.size());
+    if (OrtStatus * status = ep_init(options, keys.data(), values.data(), keys.size())) {
+        error_message = Ort::GetApi().GetErrorMessage(status);
+        Ort::GetApi().ReleaseStatus(status);
+        return false;
+    }
+
+    return true;
 }
 
-static void append_optional_spacemit_ep(Ort::SessionOptions & session_options) {
+static void append_optional_spacemit_ep(Ort::SessionOptions & session_options, const char * session_name) {
     std::unordered_map<std::string, std::string> provider_options;
-    provider_options["SPACEMIT_EP_INTRA_THREAD_NUM"] = "1";
-    if (OrtStatus * status = init_spacemit_execution_provider(session_options, provider_options)) {
-        std::cerr << "[SMT][audio] warning: failed to initialize Spacemit EP: "
-                  << Ort::GetApi().GetErrorMessage(status) << "\n";
-        Ort::GetApi().ReleaseStatus(status);
+    provider_options["SPACEMIT_EP_INTRA_THREAD_NUM"] = "4";
+    std::string error_message;
+    if (!init_spacemit_execution_provider(session_options, provider_options, error_message)) {
+        throw std::runtime_error(std::string("[SMT][audio] failed to initialize Spacemit EP for ") +
+                                 session_name + ": " + error_message);
     }
+    std::cerr << "[SMT][audio] Spacemit EP enabled for " << session_name
+              << " (SPACEMIT_EP_INTRA_THREAD_NUM=4)\n";
 }
 
 static std::vector<const char *> make_name_ptrs(const std::vector<std::string> & names) {
@@ -460,13 +471,13 @@ std::unique_ptr<smt_audio_context> smt_audio_context::create(const std::string &
 
     d.frontend_options.SetGraphOptimizationLevel(GraphOptimizationLevel::ORT_ENABLE_ALL);
     d.backend_options.SetGraphOptimizationLevel(GraphOptimizationLevel::ORT_ENABLE_ALL);
-    d.frontend_options.SetIntraOpNumThreads(1);
-    d.backend_options.SetIntraOpNumThreads(1);
+    d.frontend_options.SetIntraOpNumThreads(4);
+    d.backend_options.SetIntraOpNumThreads(4);
     d.frontend_options.SetInterOpNumThreads(1);
     d.backend_options.SetInterOpNumThreads(1);
 
-    append_optional_spacemit_ep(d.frontend_options);
-    append_optional_spacemit_ep(d.backend_options);
+    append_optional_spacemit_ep(d.frontend_options, "frontend");
+    append_optional_spacemit_ep(d.backend_options, "backend");
 
     d.frontend_session = Ort::Session(d.env, d.config.frontend_model_path.c_str(), d.frontend_options);
     d.backend_session  = Ort::Session(d.env, d.config.backend_model_path.c_str(),  d.backend_options);
