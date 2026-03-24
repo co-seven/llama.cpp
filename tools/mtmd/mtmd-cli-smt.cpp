@@ -83,6 +83,13 @@ enum class smt_chunk_type {
     audio,
 };
 
+enum class smt_init_mode {
+    auto_probe,
+    image_only,
+    audio_only,
+    mixed,
+};
+
 struct smt_prompt_chunk {
     smt_chunk_type type = smt_chunk_type::text;
     std::vector<llama_token> tokens_text;
@@ -442,6 +449,29 @@ static smt_chunk_type detect_media_type_from_file(const std::string & path) {
     return looks_like_audio_file(bytes) ? smt_chunk_type::audio : smt_chunk_type::image;
 }
 
+static smt_init_mode infer_init_mode_from_params(const common_params & params) {
+    bool need_image = false;
+    bool need_audio = false;
+
+    for (const auto & media : params.image) {
+        const auto type = detect_media_type_from_file(media);
+        need_image = need_image || type == smt_chunk_type::image;
+        need_audio = need_audio || type == smt_chunk_type::audio;
+    }
+
+    if (need_image && need_audio) {
+        return smt_init_mode::mixed;
+    }
+    if (need_image) {
+        return smt_init_mode::image_only;
+    }
+    if (need_audio) {
+        return smt_init_mode::audio_only;
+    }
+
+    return smt_init_mode::auto_probe;
+}
+
 static std::string write_temp_bin_file(const std::vector<uint8_t> & data) {
 #if defined(_WIN32)
     char temp_path[MAX_PATH] = {0};
@@ -734,7 +764,7 @@ struct mtmd_cli_smt_context {
     llama_batch         batch;
     int                 n_batch;
 
-    int64_t hidden_size;
+    int64_t hidden_size = 0;
     bool use_mrope_pos = false;
     std::vector<llama_token> tok_img_beg;
     std::vector<llama_token> tok_img_end;
@@ -779,27 +809,68 @@ struct mtmd_cli_smt_context {
         chat_history.clear();
 
         std::string primary_architecture;
+        const smt_init_mode init_mode = infer_init_mode_from_params(params);
+        std::string vision_error;
+        std::string audio_error;
 
-        try {
-            smt_vision_ctx = smt_vision_context::create(smt_config_dir);
-            hidden_size = smt_vision_ctx->hidden_size();
-            primary_architecture = smt_vision_ctx->architecture();
-        } catch (const std::exception &) {
+        const bool try_vision = init_mode == smt_init_mode::auto_probe ||
+                                init_mode == smt_init_mode::image_only ||
+                                init_mode == smt_init_mode::mixed;
+        const bool try_audio = init_mode == smt_init_mode::auto_probe ||
+                               init_mode == smt_init_mode::audio_only ||
+                               init_mode == smt_init_mode::mixed;
+
+        if (try_vision) {
+            try {
+                smt_vision_ctx = smt_vision_context::create(smt_config_dir);
+                hidden_size = smt_vision_ctx->hidden_size();
+                primary_architecture = smt_vision_ctx->architecture();
+            } catch (const std::exception & e) {
+                vision_error = e.what();
+            }
         }
 
-        try {
-            smt_audio_ctx = smt_audio_context::create(smt_config_dir);
-            if (hidden_size == 0) {
-                hidden_size = smt_audio_ctx->hidden_size();
-            } else if (hidden_size != smt_audio_ctx->hidden_size()) {
-                LOG_ERR("FATAL: SMT audio hidden_size (%" PRId64 ") != current SMT hidden_size (%" PRId64 ")\n",
-                        smt_audio_ctx->hidden_size(), hidden_size);
-                exit(1);
+        if (try_audio) {
+            try {
+                smt_audio_ctx = smt_audio_context::create(smt_config_dir);
+                if (hidden_size == 0) {
+                    hidden_size = smt_audio_ctx->hidden_size();
+                } else if (hidden_size != smt_audio_ctx->hidden_size()) {
+                    LOG_ERR("FATAL: SMT audio hidden_size (%" PRId64 ") != current SMT hidden_size (%" PRId64 ")\n",
+                            smt_audio_ctx->hidden_size(), hidden_size);
+                    exit(1);
+                }
+                if (primary_architecture.empty()) {
+                    primary_architecture = smt_audio_ctx->architecture();
+                }
+            } catch (const std::exception & e) {
+                audio_error = e.what();
             }
-            if (primary_architecture.empty()) {
-                primary_architecture = smt_audio_ctx->architecture();
+        }
+
+        if (init_mode == smt_init_mode::image_only && !smt_vision_ctx) {
+            LOG_ERR("FATAL: failed to initialize SMT vision backend from %s: %s\n",
+                    smt_config_dir.c_str(), vision_error.empty() ? "unknown error" : vision_error.c_str());
+            exit(1);
+        }
+
+        if (init_mode == smt_init_mode::audio_only && !smt_audio_ctx) {
+            LOG_ERR("FATAL: failed to initialize SMT audio backend from %s: %s\n",
+                    smt_config_dir.c_str(), audio_error.empty() ? "unknown error" : audio_error.c_str());
+            exit(1);
+        }
+
+        if (init_mode == smt_init_mode::mixed && (!smt_vision_ctx || !smt_audio_ctx)) {
+            LOG_ERR("FATAL: mixed SMT request requires both vision and audio backends\n");
+            if (!smt_vision_ctx) {
+                LOG_ERR("FATAL: vision backend init failed: %s\n",
+                        vision_error.empty() ? "unknown error" : vision_error.c_str());
             }
-        } catch (const std::exception &) {
+            if (!smt_audio_ctx) {
+                LOG_ERR("FATAL: audio backend init failed: %s\n",
+                        audio_error.empty() ? "unknown error" : audio_error.c_str());
+            }
+            exit(1);
         }
 
         if (!smt_vision_ctx && !smt_audio_ctx) {
