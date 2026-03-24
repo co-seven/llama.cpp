@@ -7,8 +7,14 @@
 #include <string>
 #include <vector>
 
+enum class server_smt_media_type : uint8_t {
+    image = 0,
+    audio = 1,
+};
+
 struct server_smt_image_chunk {
     std::string id;
+    server_smt_media_type type = server_smt_media_type::image;
     std::vector<float> embd;
 
     int32_t n_tokens = 0;
@@ -26,6 +32,13 @@ server_smt_vision_context * server_smt_vision_init(
 
 void server_smt_vision_free(server_smt_vision_context * ctx);
 
+bool server_smt_vision_supports_image(const server_smt_vision_context * ctx);
+bool server_smt_vision_supports_audio(const server_smt_vision_context * ctx);
+
+server_smt_image_chunk server_smt_vision_encode_media_bin(
+        server_smt_vision_context * ctx,
+        const std::vector<uint8_t> & data);
+
 server_smt_image_chunk server_smt_vision_encode_image_bin(
         server_smt_vision_context * ctx,
         const std::vector<uint8_t> & data);
@@ -42,16 +55,30 @@ int32_t server_smt_vision_decode_chunk(
 inline server_smt_vision_context * server_smt_vision_init(
         llama_context * /* lctx */,
         const std::string & /* config_dir */) {
-    throw std::runtime_error("SMT vision backend is not compiled");
+    throw std::runtime_error("SMT media backend is not compiled");
 }
 
 inline void server_smt_vision_free(server_smt_vision_context * /* ctx */) {
 }
 
+inline bool server_smt_vision_supports_image(const server_smt_vision_context * /* ctx */) {
+    return false;
+}
+
+inline bool server_smt_vision_supports_audio(const server_smt_vision_context * /* ctx */) {
+    return false;
+}
+
+inline server_smt_image_chunk server_smt_vision_encode_media_bin(
+        server_smt_vision_context * /* ctx */,
+        const std::vector<uint8_t> & /* data */) {
+    throw std::runtime_error("SMT media backend is not compiled");
+}
+
 inline server_smt_image_chunk server_smt_vision_encode_image_bin(
         server_smt_vision_context * /* ctx */,
         const std::vector<uint8_t> & /* data */) {
-    throw std::runtime_error("SMT vision backend is not compiled");
+    throw std::runtime_error("SMT media backend is not compiled");
 }
 
 inline int32_t server_smt_vision_decode_chunk(

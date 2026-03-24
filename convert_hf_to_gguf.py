@@ -3882,7 +3882,7 @@ class Qwen2Model(TextModel):
     def set_vocab(self):
         try:
             self._set_vocab_sentencepiece()
-        except FileNotFoundError:
+        except (FileNotFoundError, ModuleNotFoundError, ImportError):
             self._set_vocab_gpt2()
 
     def set_gguf_parameters(self):
@@ -4835,6 +4835,36 @@ class Qwen3Model(Qwen2Model):
                 if is_tied_head:
                     yield from super().modify_tensors(data_torch, name, bid)
                 return
+
+        yield from super().modify_tensors(data_torch, name, bid)
+
+
+@ModelBase.register("Qwen3ASRForConditionalGeneration")
+class Qwen3ASRTextModel(Qwen3Model):
+    model_arch = gguf.MODEL_ARCH.QWEN3
+
+    def __init__(self, dir_model: Path, *args, **kwargs):
+        hparams = kwargs.pop("hparams", None)
+        if hparams is None:
+            hparams = ModelBase.load_hparams(dir_model, self.is_mistral_format)
+
+        thinker_config = hparams.get("thinker_config", {})
+        text_config = dict(thinker_config.get("text_config", {}))
+        if text_config and text_config.get("architectures") is None and text_config.get("model_type") == "qwen3":
+            text_config["architectures"] = ["Qwen3ForCausalLM"]
+        if text_config:
+            hparams = {**hparams, "text_config": text_config}
+
+        super().__init__(dir_model, *args, hparams=hparams, **kwargs)
+
+    def modify_tensors(self, data_torch: Tensor, name: str, bid: int | None) -> Iterable[tuple[str, Tensor]]:
+        if name.startswith("thinker.audio_tower."):
+            return
+
+        if name.startswith("thinker.model.") or name.startswith("thinker.lm_head."):
+            name = name.removeprefix("thinker.")
+        elif name.startswith("thinker."):
+            return
 
         yield from super().modify_tensors(data_torch, name, bid)
 
@@ -14104,6 +14134,8 @@ def get_model_architecture(hparams: dict[str, Any], model_type: ModelType) -> st
     # TODO @ngxson : this won't work correctly if the model has both audio & vision encoders
     # maybe we should fallback to text model's arch in that case, since not many models have both
     text_config = hparams.get("text_config", {})
+    if model_type == ModelType.TEXT and hparams.get("thinker_config", {}).get("text_config") is not None:
+        text_config = hparams["thinker_config"]["text_config"]
     vision_config = hparams.get("vision_config", {})
     arch = None
     if (arches := hparams.get("architectures")) is not None and len(arches) > 0:
@@ -14121,6 +14153,8 @@ def get_model_architecture(hparams: dict[str, Any], model_type: ModelType) -> st
     # if "architectures" is found in the sub-config, use that instead
     if model_type == ModelType.TEXT and text_config.get("architectures") is not None:
         arch = text_config["architectures"][0]
+    elif model_type == ModelType.TEXT and arch == "Qwen3ASRForConditionalGeneration" and text_config.get("model_type") == "qwen3":
+        arch = "Qwen3ASRForConditionalGeneration"
     elif model_type == ModelType.MMPROJ and vision_config.get("architectures") is not None:
         arch = vision_config["architectures"][0]
     if arch is None:

@@ -6,6 +6,7 @@
 #include "mtmd-helper.h"
 #include "chat.h"
 #include "base64.hpp"
+#include "json-schema-to-grammar.h"
 
 #include "server-common.h"
 
@@ -413,7 +414,7 @@ std::string server_tokens::str() const {
         }
     }
     oss << "\n";
-    oss << "image idx: ";
+    oss << "media idx: ";
     if (has_smt) {
         for (const auto & it : map_idx_to_smt_media) {
             oss << it.first << ", ";
@@ -706,7 +707,8 @@ int32_t server_tokens::process_chunk(
             n_tokens_out = 0;
             return -1;
         }
-        SRV_INF("%s", "processing image (smt)...\n");
+        const char * name = chunk.type == server_smt_media_type::audio ? "audio" : "image";
+        SRV_INF("processing %s prefill (smt)...\n", name);
         int64_t t0 = ggml_time_ms();
         llama_pos n_past = pos;
         int32_t result = server_smt_vision_decode_chunk(
@@ -717,7 +719,7 @@ int32_t server_tokens::process_chunk(
                 seq_id,
                 llama_n_batch(ctx),
                 true);
-        SRV_INF("image (smt) processed in %" PRId64 " ms\n", ggml_time_ms() - t0);
+        SRV_INF("%s prefill (smt) processed in %" PRId64 " ms\n", name, ggml_time_ms() - t0);
         if (result != 0) {
             LOG_ERR("server_smt_vision_decode_chunk failed with status %d\n", result);
             n_tokens_out = 0;
@@ -941,6 +943,124 @@ static std::vector<std::string> split_keep_marker(const std::string & input, con
     return out;
 }
 
+#if defined(LLAMA_SERVER_SMT_VISION)
+static size_t count_substring(const std::string & text, const std::string & pattern) {
+    if (pattern.empty()) {
+        return 0;
+    }
+
+    size_t count = 0;
+    size_t pos = 0;
+    while ((pos = text.find(pattern, pos)) != std::string::npos) {
+        count++;
+        pos += pattern.size();
+    }
+    return count;
+}
+
+static std::string strip_media_markers(const std::string & text) {
+    std::string out = text;
+    replace_all(out, "<__image__>", "<__media__>");
+    replace_all(out, "<__media__>", "");
+    return string_strip(out);
+}
+
+static std::string collect_message_text_without_media(const common_chat_msg & msg, bool * has_media = nullptr) {
+    std::string text;
+    bool last_was_media_marker = false;
+    bool seen_media = false;
+
+    if (!msg.content_parts.empty()) {
+        for (const auto & part : msg.content_parts) {
+            if (part.type == "text") {
+                if (!last_was_media_marker && !text.empty()) {
+                    text += '\n';
+                }
+                text += part.text;
+                last_was_media_marker = false;
+            } else if (part.type == "media_marker") {
+                seen_media = true;
+                last_was_media_marker = true;
+            }
+        }
+    } else {
+        const size_t n_media = count_substring(msg.content, "<__media__>") + count_substring(msg.content, "<__image__>");
+        seen_media = n_media > 0;
+        text = strip_media_markers(msg.content);
+    }
+
+    if (has_media != nullptr) {
+        *has_media = seen_media;
+    }
+    return string_strip(text);
+}
+
+static size_t count_message_media_markers(const common_chat_msg & msg) {
+    if (!msg.content_parts.empty()) {
+        size_t count = 0;
+        for (const auto & part : msg.content_parts) {
+            if (part.type == "media_marker") {
+                count++;
+            }
+        }
+        return count;
+    }
+
+    return count_substring(msg.content, "<__media__>") + count_substring(msg.content, "<__image__>");
+}
+
+static common_chat_params build_qwen3asr_audio_chat_params(const common_chat_templates_inputs & inputs) {
+    std::string system_text;
+    size_t media_marker_count = 0;
+    std::string assistant_prefix;
+
+    for (const auto & msg : inputs.messages) {
+        if (msg.role == "system") {
+            system_text += collect_message_text_without_media(msg);
+        }
+
+        bool has_media = false;
+        std::string text = collect_message_text_without_media(msg, &has_media);
+        media_marker_count += count_message_media_markers(msg);
+        if (msg.role == "user" && has_media) {
+            assistant_prefix = std::move(text);
+        }
+    }
+
+    common_chat_params params;
+    params.prompt = "<|im_start|>system\n";
+    params.prompt += system_text;
+    params.prompt += "<|im_end|>\n";
+    params.prompt += "<|im_start|>user\n";
+    for (size_t i = 0; i < media_marker_count; ++i) {
+        params.prompt += "<__media__>";
+    }
+    params.prompt += "<|im_end|>\n";
+    if (inputs.add_generation_prompt) {
+        params.prompt += "<|im_start|>assistant\n";
+        params.prompt += assistant_prefix;
+    }
+
+    if (!inputs.json_schema.empty()) {
+        params.grammar = json_schema_to_grammar(json::parse(inputs.json_schema));
+    } else {
+        params.grammar = inputs.grammar;
+    }
+
+    return params;
+}
+static bool should_use_qwen3asr_audio_prompt(const server_chat_params & opt, const std::vector<raw_buffer> & out_files) {
+    if (out_files.empty() || !opt.allow_audio || opt.media_backend != "smt" || opt.tmpls == nullptr) {
+        return false;
+    }
+
+    const std::string tmpl_src = common_chat_templates_source(opt.tmpls.get(), "");
+    return tmpl_src.find("<|audio_start|><|audio_pad|><|audio_end|>") != std::string::npos &&
+           tmpl_src.find("<|im_start|>assistant") != std::string::npos &&
+           tmpl_src.find("media_marker") == std::string::npos;
+}
+#endif
+
 server_tokens process_mtmd_prompt(mtmd_context * mctx, std::string prompt, std::vector<raw_buffer> files) {
     mtmd::bitmaps bitmaps;
     for (auto & file : files) {
@@ -983,7 +1103,7 @@ server_tokens process_smt_prompt(
         bool add_special,
         bool parse_special) {
     if (smt_ctx == nullptr) {
-        throw std::runtime_error("SMT vision backend is not initialized");
+        throw std::runtime_error("SMT backend is not initialized");
     }
 
     static const std::string k_media_marker = "<__media__>";
@@ -1004,16 +1124,16 @@ server_tokens process_smt_prompt(
         }
     }
     if (marker_count != files.size()) {
-        throw std::runtime_error("Number of images does not match number of media markers");
+        throw std::runtime_error("Number of media inputs does not match number of media markers");
     }
 
     server_tokens out(llama_tokens{}, true);
 
-    size_t img_idx = 0;
+    size_t media_idx = 0;
     bool add_special_once = add_special;
     for (const auto & part : parts) {
         if (part == k_media_marker) {
-            auto chunk = server_smt_vision_encode_image_bin(smt_ctx, files[img_idx++]);
+            auto chunk = server_smt_vision_encode_media_bin(smt_ctx, files[media_idx++]);
             out.push_back(chunk);
             add_special_once = false;
             continue;
@@ -1419,8 +1539,18 @@ json oaicompat_chat_params_parse(
     }
     inputs.force_pure_content = opt.force_pure_content;
 
-    // Apply chat template to the list of messages
-    auto chat_params = common_chat_templates_apply(opt.tmpls.get(), inputs);
+    // Qwen3-ASR expects audio markers to be lifted into a fixed ASR prompt shape.
+    // The generic OAI path rewrites input_audio to media_marker, which its native
+    // model template does not understand, so bypass the template here.
+    common_chat_params chat_params;
+#if defined(LLAMA_SERVER_SMT_VISION)
+    if (should_use_qwen3asr_audio_prompt(opt, out_files)) {
+        chat_params = build_qwen3asr_audio_chat_params(inputs);
+    } else
+#endif
+    {
+        chat_params = common_chat_templates_apply(opt.tmpls.get(), inputs);
+    }
 
     /* Append assistant prefilled message */
     if (prefill_assistant_message) {

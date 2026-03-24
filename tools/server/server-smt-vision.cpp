@@ -10,12 +10,14 @@
 #include <cstdlib>
 #include <cstdio>
 #include <cstring>
+#include <memory>
 #include <mutex>
 #include <stdexcept>
 #include <utility>
 #include <vector>
 
 #if defined(LLAMA_SERVER_SMT_VISION)
+#include "../mtmd/smt-audio-wrapper.h"
 #include "../mtmd/smt-vision-wrapper.h"
 #include "../mtmd/smt-vision-preprocess.h"
 #endif
@@ -30,13 +32,16 @@
 
 struct server_smt_vision_context {
 #if defined(LLAMA_SERVER_SMT_VISION)
-    std::unique_ptr<smt_vision_context> smt;
+    std::unique_ptr<smt_vision_context> smt_vision;
+    std::unique_ptr<smt_audio_context>  smt_audio;
 #endif
     std::mutex mu;
     int32_t hidden_size = 0;
     bool use_mrope_pos = false;
     std::vector<llama_token> tok_img_beg;
     std::vector<llama_token> tok_img_end;
+    std::vector<llama_token> tok_audio_beg;
+    std::vector<llama_token> tok_audio_end;
     std::string architecture;
 };
 
@@ -67,6 +72,10 @@ static bool arch_requires_mrope(const std::string & arch_name) {
            contains_icase(arch_name, "qwen3vl") ||
            contains_icase(arch_name, "glm4v") ||
            contains_icase(arch_name, "paddleocr");
+}
+
+static bool arch_is_qwen3asr(const std::string & arch_name) {
+    return contains_icase(arch_name, "qwen3asr");
 }
 
 static std::pair<int32_t, int32_t> infer_image_grid_xy(int32_t n_tokens) {
@@ -206,6 +215,32 @@ resolve_image_boundary_tokens(llama_context * lctx, const std::string & arch_nam
         return detect_image_boundary_tokens_auto(lctx);
     }
     return detect_image_boundary_tokens_native(lctx, arch_name);
+}
+
+static std::pair<std::vector<llama_token>, std::vector<llama_token>>
+resolve_audio_boundary_tokens(llama_context * lctx, const std::string & arch_name) {
+    if (!arch_is_qwen3asr(arch_name)) {
+        return {};
+    }
+    return {
+        tokenize_exact_special(lctx, "<|audio_start|>"),
+        tokenize_exact_special(lctx, "<|audio_end|>")
+    };
+}
+
+static bool looks_like_audio_file(const std::vector<uint8_t> & data) {
+    if (data.size() < 12) {
+        return false;
+    }
+
+    const char * buf = reinterpret_cast<const char *>(data.data());
+    const bool is_wav = std::memcmp(buf, "RIFF", 4) == 0 && std::memcmp(buf + 8, "WAVE", 4) == 0;
+    const bool is_mp3 = data.size() >= 3 && (
+        std::memcmp(buf, "ID3", 3) == 0 ||
+        (static_cast<unsigned char>(buf[0]) == 0xFF && (static_cast<unsigned char>(buf[1]) & 0xE0) == 0xE0)
+    );
+    const bool is_flac = std::memcmp(buf, "fLaC", 4) == 0;
+    return is_wav || is_mp3 || is_flac;
 }
 
 static std::string write_temp_bin_file(const std::vector<uint8_t> & data) {
@@ -399,25 +434,67 @@ server_smt_vision_context * server_smt_vision_init(
         const std::string & config_dir) {
 #if defined(LLAMA_SERVER_SMT_VISION)
     auto ctx = std::make_unique<server_smt_vision_context>();
-    ctx->smt = smt_vision_context::create(config_dir);
-    ctx->architecture = ctx->smt->architecture();
-    ctx->hidden_size = (int32_t) ctx->smt->hidden_size();
-    ctx->use_mrope_pos = arch_requires_mrope(ctx->architecture);
+    std::string primary_architecture;
 
-    auto boundaries = resolve_image_boundary_tokens(lctx, ctx->architecture);
-    ctx->tok_img_beg = std::move(boundaries.first);
-    ctx->tok_img_end = std::move(boundaries.second);
+    try {
+        ctx->smt_vision = smt_vision_context::create(config_dir);
+        ctx->hidden_size = (int32_t) ctx->smt_vision->hidden_size();
+        primary_architecture = ctx->smt_vision->architecture();
+        auto boundaries = resolve_image_boundary_tokens(lctx, primary_architecture);
+        ctx->tok_img_beg = std::move(boundaries.first);
+        ctx->tok_img_end = std::move(boundaries.second);
+    } catch (const std::exception &) {
+    }
+
+    try {
+        ctx->smt_audio = smt_audio_context::create(config_dir);
+        if (ctx->hidden_size == 0) {
+            ctx->hidden_size = (int32_t) ctx->smt_audio->hidden_size();
+        } else if (ctx->hidden_size != ctx->smt_audio->hidden_size()) {
+            throw std::runtime_error("SMT image/audio hidden size mismatch");
+        }
+        if (primary_architecture.empty()) {
+            primary_architecture = ctx->smt_audio->architecture();
+        }
+        auto audio_boundaries = resolve_audio_boundary_tokens(lctx, ctx->smt_audio->architecture());
+        ctx->tok_audio_beg = std::move(audio_boundaries.first);
+        ctx->tok_audio_end = std::move(audio_boundaries.second);
+    } catch (const std::exception &) {
+    }
+
+    if (!ctx->smt_vision && !ctx->smt_audio) {
+        throw std::runtime_error("Neither SMT vision nor SMT audio backend is available");
+    }
+
+    ctx->architecture = primary_architecture;
+    ctx->use_mrope_pos = arch_requires_mrope(ctx->architecture);
 
     return ctx.release();
 #else
     GGML_UNUSED(lctx);
     GGML_UNUSED(config_dir);
-    throw std::runtime_error("SMT vision backend is not compiled. Rebuild with LLAMA_SERVER_SMT_VISION=ON.");
+    throw std::runtime_error("SMT media backend is not compiled. Rebuild with LLAMA_SERVER_SMT_VISION=ON.");
 #endif
 }
 
 void server_smt_vision_free(server_smt_vision_context * ctx) {
     delete ctx;
+}
+
+bool server_smt_vision_supports_image(const server_smt_vision_context * ctx) {
+    return ctx != nullptr
+#if defined(LLAMA_SERVER_SMT_VISION)
+        && ctx->smt_vision != nullptr
+#endif
+    ;
+}
+
+bool server_smt_vision_supports_audio(const server_smt_vision_context * ctx) {
+    return ctx != nullptr
+#if defined(LLAMA_SERVER_SMT_VISION)
+        && ctx->smt_audio != nullptr
+#endif
+    ;
 }
 
 server_smt_image_chunk server_smt_vision_encode_image_bin(
@@ -430,6 +507,10 @@ server_smt_image_chunk server_smt_vision_encode_image_bin(
 #if defined(LLAMA_SERVER_SMT_VISION)
     std::lock_guard<std::mutex> lock(ctx->mu);
 
+    if (ctx->smt_vision == nullptr) {
+        throw std::runtime_error("SMT vision backend is not initialized");
+    }
+
     std::vector<uint8_t> smt_input = data;
     auto preproc = smt_vision_preprocess_if_image(data, ctx->architecture);
     if (preproc.was_image) {
@@ -439,8 +520,9 @@ server_smt_image_chunk server_smt_vision_encode_image_bin(
     const std::string tmp_file = write_temp_bin_file(smt_input);
 
     server_smt_image_chunk out;
+    out.type = server_smt_media_type::image;
     try {
-        out.embd = ctx->smt->encode_image(tmp_file);
+        out.embd = ctx->smt_vision->encode_image(tmp_file);
         std::remove(tmp_file.c_str());
     } catch (...) {
         std::remove(tmp_file.c_str());
@@ -464,8 +546,47 @@ server_smt_image_chunk server_smt_vision_encode_image_bin(
     return out;
 #else
     GGML_UNUSED(data);
-    throw std::runtime_error("SMT vision backend is not compiled. Rebuild with LLAMA_SERVER_SMT_VISION=ON.");
+    throw std::runtime_error("SMT media backend is not compiled. Rebuild with LLAMA_SERVER_SMT_VISION=ON.");
 #endif
+}
+
+server_smt_image_chunk server_smt_vision_encode_media_bin(
+        server_smt_vision_context * ctx,
+        const std::vector<uint8_t> & data) {
+#if defined(LLAMA_SERVER_SMT_VISION)
+    if (looks_like_audio_file(data)) {
+        if (ctx == nullptr || ctx->smt_audio == nullptr) {
+            throw std::runtime_error("SMT audio backend is not initialized");
+        }
+
+        std::lock_guard<std::mutex> lock(ctx->mu);
+        const std::string tmp_file = write_temp_bin_file(data);
+
+        server_smt_image_chunk out;
+        out.type = server_smt_media_type::audio;
+        try {
+            out.embd = ctx->smt_audio->encode_audio(tmp_file);
+            std::remove(tmp_file.c_str());
+        } catch (...) {
+            std::remove(tmp_file.c_str());
+            throw;
+        }
+
+        if (ctx->hidden_size <= 0 || out.embd.empty() || out.embd.size() % (size_t) ctx->hidden_size != 0) {
+            throw std::runtime_error("Invalid SMT audio embedding shape");
+        }
+
+        const int32_t n_audio_tokens = (int32_t) (out.embd.size() / (size_t) ctx->hidden_size);
+        out.n_tokens = (int32_t) ctx->tok_audio_beg.size() + n_audio_tokens + (int32_t) ctx->tok_audio_end.size();
+        out.n_pos = out.n_tokens;
+        out.grid_nx = n_audio_tokens;
+        out.grid_ny = 1;
+        out.id = std::string("audio:") + fnv_hash(data.data(), data.size());
+        return out;
+    }
+#endif
+
+    return server_smt_vision_encode_image_bin(ctx, data);
 }
 
 int32_t server_smt_vision_decode_chunk(
@@ -480,35 +601,49 @@ int32_t server_smt_vision_decode_chunk(
         return -1;
     }
 
-    const int32_t n_image_tokens = (int32_t) (chunk.embd.size() / (size_t) ctx->hidden_size);
-    if (n_image_tokens <= 0) {
+    const int32_t n_embd_tokens = (int32_t) (chunk.embd.size() / (size_t) ctx->hidden_size);
+    if (n_embd_tokens <= 0) {
         return -1;
     }
 
-    if (!ctx->tok_img_beg.empty()) {
-        if (decode_tokens(lctx, ctx->tok_img_beg, n_past, seq_id, n_batch, false) != 0) {
+    const std::vector<llama_token> * tok_beg = &ctx->tok_img_beg;
+    const std::vector<llama_token> * tok_end = &ctx->tok_img_end;
+    bool use_mrope_pos = ctx->use_mrope_pos;
+    int32_t grid_nx = chunk.grid_nx;
+    int32_t grid_ny = chunk.grid_ny;
+
+    if (chunk.type == server_smt_media_type::audio) {
+        tok_beg = &ctx->tok_audio_beg;
+        tok_end = &ctx->tok_audio_end;
+        use_mrope_pos = false;
+        grid_nx = n_embd_tokens;
+        grid_ny = 1;
+    }
+
+    if (!tok_beg->empty()) {
+        if (decode_tokens(lctx, *tok_beg, n_past, seq_id, n_batch, false) != 0) {
             return -1;
         }
     }
 
-    const bool logits_on_embd = logits_last && ctx->tok_img_end.empty();
+    const bool logits_on_embd = logits_last && tok_end->empty();
     if (decode_embd(
             lctx,
             chunk.embd.data(),
-            n_image_tokens,
+            n_embd_tokens,
             ctx->hidden_size,
             n_past,
             seq_id,
             n_batch,
             logits_on_embd,
-            ctx->use_mrope_pos,
-            chunk.grid_nx,
-            chunk.grid_ny) != 0) {
+            use_mrope_pos,
+            grid_nx,
+            grid_ny) != 0) {
         return -1;
     }
 
-    if (!ctx->tok_img_end.empty()) {
-        if (decode_tokens(lctx, ctx->tok_img_end, n_past, seq_id, n_batch, logits_last) != 0) {
+    if (!tok_end->empty()) {
+        if (decode_tokens(lctx, *tok_end, n_past, seq_id, n_batch, logits_last) != 0) {
             return -1;
         }
     }

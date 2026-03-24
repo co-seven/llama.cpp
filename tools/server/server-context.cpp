@@ -815,7 +815,7 @@ private:
 
         server_vision_backend_mode selected_backend = SERVER_VISION_BACKEND_NONE;
 #if defined(LLAMA_SERVER_SMT_VISION)
-        const std::string & backend_pref = params_base.vision_backend;
+        const std::string & backend_pref = params_base.media_backend;
         if (backend_pref == "auto") {
             const std::string & smt_config_dir = params_base.smt_config_dir;
             if (!smt_config_dir.empty()) {
@@ -828,7 +828,7 @@ private:
         } else if (backend_pref == "smt") {
             selected_backend = SERVER_VISION_BACKEND_SMT;
         } else {
-            SRV_ERR("invalid --vision-backend value: '%s'\n", backend_pref.c_str());
+            SRV_ERR("invalid --media-backend value: '%s'\n", backend_pref.c_str());
             return false;
         }
 #else
@@ -839,7 +839,7 @@ private:
 
         if (selected_backend == SERVER_VISION_BACKEND_MTMD) {
             if (mmproj_path.empty()) {
-                SRV_ERR("%s", "vision backend 'mtmd' selected but --mmproj is empty\n");
+                SRV_ERR("%s", "media backend 'mtmd' selected but --mmproj is empty\n");
                 return false;
             }
 
@@ -869,13 +869,13 @@ private:
         } else if (selected_backend == SERVER_VISION_BACKEND_SMT) {
             const std::string & smt_config_dir = params_base.smt_config_dir;
             if (smt_config_dir.empty()) {
-                SRV_ERR("%s", "vision backend 'smt' selected but --smt-config-dir is empty\n");
+                SRV_ERR("%s", "media backend 'smt' selected but --smt-config-dir is empty\n");
                 return false;
             }
             try {
                 smt_ctx = server_smt_vision_init(ctx, smt_config_dir);
             } catch (const std::exception & e) {
-                SRV_ERR("failed to load SMT vision backend from '%s': %s\n", smt_config_dir.c_str(), e.what());
+                SRV_ERR("failed to load SMT backend from '%s': %s\n", smt_config_dir.c_str(), e.what());
                 return false;
             }
             vision_backend = SERVER_VISION_BACKEND_SMT;
@@ -1121,10 +1121,10 @@ private:
                 /* reasoning_format      */ params_base.reasoning_format,
                 /* chat_template_kwargs  */ params_base.default_template_kwargs,
                 /* tmpls                 */ std::move(chat_templates),
-                /* allow_image           */ mctx ? mtmd_support_vision(mctx) : (smt_ctx != nullptr),
-                /* allow_audio           */ mctx ? mtmd_support_audio (mctx) : false,
-                /* image_bin_only        */ smt_ctx != nullptr,
-                /* vision_backend        */ vision_backend_name(),
+                /* allow_image           */ mctx ? mtmd_support_vision(mctx) : server_smt_vision_supports_image(smt_ctx),
+                /* allow_audio           */ mctx ? mtmd_support_audio (mctx) : server_smt_vision_supports_audio(smt_ctx),
+                /* image_bin_only        */ server_smt_vision_supports_image(smt_ctx),
+                /* media_backend         */ vision_backend_name(),
                 /* enable_thinking       */ enable_thinking,
                 /* reasoning_budget      */ params_base.sampling.reasoning_budget_tokens,
                 /* reasoning_budget_msg  */ params_base.sampling.reasoning_budget_message,
@@ -3410,7 +3410,7 @@ server_context_meta server_context::get_meta() const {
         /* model_aliases          */ impl->model_aliases,
         /* model_tags             */ impl->model_tags,
         /* model_path             */ impl->params_base.model.path,
-        /* vision_backend         */ impl->vision_backend_name(),
+        /* media_backend         */ impl->vision_backend_name(),
         /* has_mtmd               */ impl->has_multimodal(),
         /* has_inp_image          */ impl->chat_params.allow_image,
         /* has_inp_audio          */ impl->chat_params.allow_audio,
@@ -3932,7 +3932,8 @@ void server_routes::init_routes() {
             { "total_slots",                 params.n_parallel },
             { "model_alias",                 meta->model_name },
             { "model_path",                  meta->model_path },
-            { "vision_backend",              meta->vision_backend },
+            { "media_backend",               meta->media_backend },
+            { "vision_backend",              meta->media_backend },
             { "modalities",                  json {
                 {"vision", meta->has_inp_image},
                 {"audio",  meta->has_inp_audio},
@@ -3993,7 +3994,8 @@ void server_routes::init_routes() {
             }},
             {"model_info", ""},
             {"capabilities", meta->has_mtmd ? json({"completion","multimodal"}) : json({"completion"})},
-            {"vision_backend", meta->vision_backend}
+            {"media_backend", meta->media_backend},
+            {"vision_backend", meta->media_backend}
         };
 
         res->ok(data);
@@ -4232,7 +4234,8 @@ void server_routes::init_routes() {
                     {"description", ""},
                     {"tags", {""}},
                     {"capabilities", meta->has_mtmd ? json({"completion","multimodal"}) : json({"completion"})},
-                    {"vision_backend", meta->vision_backend},
+                    {"media_backend", meta->media_backend},
+                    {"vision_backend", meta->media_backend},
                     {"parameters", ""},
                     {"details", {
                         {"parent_model", ""},

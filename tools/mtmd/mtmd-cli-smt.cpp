@@ -10,6 +10,7 @@
 #include "ggml.h"
 #include "console.h"
 #include "chat.h"
+#include "smt-audio-wrapper.h"
 #include "smt-vision-wrapper.h"
 #include "smt-vision-preprocess.h"
 
@@ -42,9 +43,9 @@ static volatile bool g_is_interrupted = false;
 
 static void show_additional_info(int /*argc*/, char ** argv) {
     LOG(
-        "Usage: %s [options] -m <model> --vision-backend smt --smt-config-dir <dir> --image <image.jpg|image.bin> -p <prompt>\n\n"
+        "Usage: %s [options] -m <model> --media-backend smt --smt-config-dir <dir> [--image <image.jpg|image.bin> | --audio <audio.wav>] -p <prompt>\n\n"
         "  -m and --smt-config-dir are required\n"
-        "  --image and -p are optional, if NOT provided, the CLI will run in chat mode\n",
+        "  --image/--audio and -p are optional, if NOT provided, the CLI will run in chat mode\n",
         argv[0]
     );
 }
@@ -79,12 +80,18 @@ static std::vector<std::string> split_keep_marker(const std::string & input, con
 enum class smt_chunk_type {
     text,
     image,
+    audio,
 };
 
 struct smt_prompt_chunk {
     smt_chunk_type type = smt_chunk_type::text;
     std::vector<llama_token> tokens_text;
-    std::string image_path;
+    std::string media_path;
+};
+
+struct smt_pending_media {
+    smt_chunk_type type = smt_chunk_type::image;
+    std::string path;
 };
 
 enum class smt_image_boundary_mode {
@@ -146,6 +153,10 @@ static bool arch_requires_mrope(const std::string & arch_name) {
            contains_icase(arch_name, "qwen3vl") ||
            contains_icase(arch_name, "glm4v") ||
            contains_icase(arch_name, "paddleocr");
+}
+
+static bool arch_is_qwen3asr(const std::string & arch_name) {
+    return contains_icase(arch_name, "qwen3asr");
 }
 
 static std::pair<int, int> infer_image_grid_xy(int n_tokens) {
@@ -358,6 +369,17 @@ resolve_image_boundary_tokens(llama_context * lctx,
     return detect_image_boundary_tokens_native(lctx, arch_name);
 }
 
+static std::pair<std::vector<llama_token>, std::vector<llama_token>>
+resolve_audio_boundary_tokens(llama_context * lctx, const std::string & arch_name) {
+    if (!arch_is_qwen3asr(arch_name)) {
+        return {};
+    }
+    return {
+        tokenize_exact_special(lctx, "<|audio_start|>"),
+        tokenize_exact_special(lctx, "<|audio_end|>")
+    };
+}
+
 static void replace_all(std::string & s, const std::string & from, const std::string & to) {
     if (from.empty()) {
         return;
@@ -398,6 +420,26 @@ static std::vector<uint8_t> read_binary_file(const std::string & path) {
     }
 
     return std::vector<uint8_t>((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
+}
+
+static bool looks_like_audio_file(const std::vector<uint8_t> & bytes) {
+    if (bytes.size() < 12) {
+        return false;
+    }
+
+    const char * buf = reinterpret_cast<const char *>(bytes.data());
+    const bool is_wav = std::memcmp(buf, "RIFF", 4) == 0 && std::memcmp(buf + 8, "WAVE", 4) == 0;
+    const bool is_mp3 = bytes.size() >= 3 && (
+        std::memcmp(buf, "ID3", 3) == 0 ||
+        (static_cast<unsigned char>(buf[0]) == 0xFF && (static_cast<unsigned char>(buf[1]) & 0xE0) == 0xE0)
+    );
+    const bool is_flac = std::memcmp(buf, "fLaC", 4) == 0;
+    return is_wav || is_mp3 || is_flac;
+}
+
+static smt_chunk_type detect_media_type_from_file(const std::string & path) {
+    const auto bytes = read_binary_file(path);
+    return looks_like_audio_file(bytes) ? smt_chunk_type::audio : smt_chunk_type::image;
 }
 
 static std::string write_temp_bin_file(const std::vector<uint8_t> & data) {
@@ -466,7 +508,7 @@ static bool tokenize_to_smt_chunks(
         const std::string & formatted_chat,
         bool add_special,
         bool parse_special,
-        const std::vector<std::string> & image_paths,
+        const std::vector<smt_pending_media> & media_inputs,
         std::vector<smt_prompt_chunk> & out_chunks) {
     out_chunks.clear();
 
@@ -477,22 +519,23 @@ static bool tokenize_to_smt_chunks(
     const auto parts = split_keep_marker(input, k_media_marker);
     for (const auto & part : parts) {
         if (part == k_media_marker) {
-            if (n_images_used >= image_paths.size()) {
-                LOG_ERR("Number of images (%zu) does not match number of media markers in prompt\n", image_paths.size());
+            if (n_images_used >= media_inputs.size()) {
+                LOG_ERR("Number of media inputs (%zu) does not match number of media markers in prompt\n", media_inputs.size());
                 return false;
             }
             smt_prompt_chunk chunk;
-            chunk.type = smt_chunk_type::image;
-            chunk.image_path = image_paths[n_images_used++];
+            chunk.type = media_inputs[n_images_used].type;
+            chunk.media_path = media_inputs[n_images_used].path;
+            n_images_used++;
             out_chunks.emplace_back(std::move(chunk));
         } else {
             append_text_chunk(out_chunks, common_tokenize(vocab, part, /*add_special*/ false, parse_special));
         }
     }
 
-    if (n_images_used != image_paths.size()) {
-        LOG_ERR("Number of images (%zu) does not match number of media markers in prompt (%zu)\n",
-                image_paths.size(), n_images_used);
+    if (n_images_used != media_inputs.size()) {
+        LOG_ERR("Number of media inputs (%zu) does not match number of media markers in prompt (%zu)\n",
+                media_inputs.size(), n_images_used);
         return false;
     }
 
@@ -680,7 +723,8 @@ static int decode_tokens(llama_context * lctx,
 // ============================================================
 
 struct mtmd_cli_smt_context {
-    std::unique_ptr<smt_vision_context> smt_ctx;
+    std::unique_ptr<smt_vision_context> smt_vision_ctx;
+    std::unique_ptr<smt_audio_context>  smt_audio_ctx;
     common_init_result_ptr llama_init;
 
     llama_model       * model;
@@ -694,11 +738,13 @@ struct mtmd_cli_smt_context {
     bool use_mrope_pos = false;
     std::vector<llama_token> tok_img_beg;
     std::vector<llama_token> tok_img_end;
+    std::vector<llama_token> tok_audio_beg;
+    std::vector<llama_token> tok_audio_end;
     smt_image_boundary_mode img_boundary_mode = smt_image_boundary_mode::native;
     smt_media_anchor_mode media_anchor_mode = smt_media_anchor_mode::off;
 
-    // Pending image binary paths
-    std::vector<std::string> pending_images;
+    // Pending media paths
+    std::vector<smt_pending_media> pending_media;
 
     // Chat template
     common_chat_templates_ptr tmpls;
@@ -732,10 +778,36 @@ struct mtmd_cli_smt_context {
         use_jinja = params.use_jinja;
         chat_history.clear();
 
-        // Initialize SMT vision context
-        smt_ctx = smt_vision_context::create(smt_config_dir);
-        hidden_size = smt_ctx->hidden_size();
-        use_mrope_pos = arch_requires_mrope(smt_ctx->architecture());
+        std::string primary_architecture;
+
+        try {
+            smt_vision_ctx = smt_vision_context::create(smt_config_dir);
+            hidden_size = smt_vision_ctx->hidden_size();
+            primary_architecture = smt_vision_ctx->architecture();
+        } catch (const std::exception &) {
+        }
+
+        try {
+            smt_audio_ctx = smt_audio_context::create(smt_config_dir);
+            if (hidden_size == 0) {
+                hidden_size = smt_audio_ctx->hidden_size();
+            } else if (hidden_size != smt_audio_ctx->hidden_size()) {
+                LOG_ERR("FATAL: SMT audio hidden_size (%" PRId64 ") != current SMT hidden_size (%" PRId64 ")\n",
+                        smt_audio_ctx->hidden_size(), hidden_size);
+                exit(1);
+            }
+            if (primary_architecture.empty()) {
+                primary_architecture = smt_audio_ctx->architecture();
+            }
+        } catch (const std::exception &) {
+        }
+
+        if (!smt_vision_ctx && !smt_audio_ctx) {
+            LOG_ERR("FATAL: neither SMT vision nor SMT audio backend is available in %s\n", smt_config_dir.c_str());
+            exit(1);
+        }
+
+        use_mrope_pos = arch_requires_mrope(primary_architecture);
         img_boundary_mode = smt_image_boundary_mode_from_env();
         media_anchor_mode = smt_media_anchor_mode_from_env();
         if (hidden_size <= 0 || hidden_size > INT_MAX) {
@@ -751,13 +823,26 @@ struct mtmd_cli_smt_context {
         }
 
         // Align image boundary tokens with native mtmd behavior by default.
-        auto boundaries = resolve_image_boundary_tokens(lctx, smt_ctx->architecture(), img_boundary_mode);
-        tok_img_beg = std::move(boundaries.first);
-        tok_img_end = std::move(boundaries.second);
-        if (tok_img_beg.empty() || tok_img_end.empty() ||
-            tok_img_beg.front() == LLAMA_TOKEN_NULL || tok_img_end.front() == LLAMA_TOKEN_NULL) {
-            tok_img_beg.clear();
-            tok_img_end.clear();
+        if (smt_vision_ctx) {
+            auto boundaries = resolve_image_boundary_tokens(lctx, smt_vision_ctx->architecture(), img_boundary_mode);
+            tok_img_beg = std::move(boundaries.first);
+            tok_img_end = std::move(boundaries.second);
+            if (tok_img_beg.empty() || tok_img_end.empty() ||
+                tok_img_beg.front() == LLAMA_TOKEN_NULL || tok_img_end.front() == LLAMA_TOKEN_NULL) {
+                tok_img_beg.clear();
+                tok_img_end.clear();
+            }
+        }
+
+        if (smt_audio_ctx) {
+            auto audio_boundaries = resolve_audio_boundary_tokens(lctx, smt_audio_ctx->architecture());
+            tok_audio_beg = std::move(audio_boundaries.first);
+            tok_audio_end = std::move(audio_boundaries.second);
+            if (tok_audio_beg.empty() || tok_audio_end.empty() ||
+                tok_audio_beg.front() == LLAMA_TOKEN_NULL || tok_audio_end.front() == LLAMA_TOKEN_NULL) {
+                tok_audio_beg.clear();
+                tok_audio_end.clear();
+            }
         }
 
         // Antiprompt for legacy templates
@@ -785,7 +870,37 @@ struct mtmd_cli_smt_context {
     }
 
     void add_image(const std::string & binary_path) {
-        pending_images.push_back(binary_path);
+        pending_media.push_back({ smt_chunk_type::image, binary_path });
+    }
+
+    void add_audio(const std::string & audio_path) {
+        pending_media.push_back({ smt_chunk_type::audio, audio_path });
+    }
+
+    void add_media_auto(const std::string & media_path) {
+        pending_media.push_back({ detect_media_type_from_file(media_path), media_path });
+    }
+
+    size_t pending_image_count() const {
+        size_t count = 0;
+        for (const auto & media : pending_media) {
+            if (media.type == smt_chunk_type::image) {
+                count++;
+            }
+        }
+        return count;
+    }
+
+    bool has_pending_audio_only() const {
+        if (pending_media.empty()) {
+            return false;
+        }
+        for (const auto & media : pending_media) {
+            if (media.type != smt_chunk_type::audio) {
+                return false;
+            }
+        }
+        return true;
     }
 };
 
@@ -848,6 +963,40 @@ static std::string chat_add_and_format(mtmd_cli_smt_context & ctx, common_chat_m
     return formatted;
 }
 
+static std::string collect_system_text(const mtmd_cli_smt_context & ctx) {
+    std::string system_text;
+    for (const auto & msg : ctx.chat_history) {
+        if (msg.role == "system") {
+            system_text += msg.content;
+        }
+    }
+    return system_text;
+}
+
+static std::string strip_media_markers_from_prompt(const std::string & prompt) {
+    std::string text = prompt;
+    replace_all(text, k_legacy_image_marker, k_media_marker);
+    replace_all(text, k_media_marker, "");
+    return string_strip(text);
+}
+
+static std::string format_qwen3asr_audio_prompt(const mtmd_cli_smt_context & ctx, const common_chat_msg & msg) {
+    std::string prompt;
+    prompt.reserve(msg.content.size() + ctx.pending_media.size() * 16 + 128);
+    prompt += "<|im_start|>system\n";
+    prompt += collect_system_text(ctx);
+    prompt += "<|im_end|>\n";
+    prompt += "<|im_start|>user\n";
+    for (const auto & media : ctx.pending_media) {
+        GGML_ASSERT(media.type == smt_chunk_type::audio);
+        prompt += k_media_marker;
+    }
+    prompt += "<|im_end|>\n";
+    prompt += "<|im_start|>assistant\n";
+    prompt += strip_media_markers_from_prompt(msg.content);
+    return prompt;
+}
+
 // ============================================================
 // Eval message - core multimodal processing
 // ============================================================
@@ -855,23 +1004,35 @@ static std::string chat_add_and_format(mtmd_cli_smt_context & ctx, common_chat_m
 static int eval_message_smt(mtmd_cli_smt_context & ctx, common_chat_msg & msg) {
     bool add_bos = ctx.chat_history.empty();
 
-    if (msg.role == "user" && !ctx.pending_images.empty()) {
+    if (msg.role == "user" && ctx.pending_image_count() > 0) {
         bool changed = false;
         msg.content = canonicalize_multimage_prompt(
             msg.content,
-            ctx.pending_images.size(),
-            ctx.smt_ctx->architecture(),
+            ctx.pending_image_count(),
+            ctx.smt_vision_ctx ? ctx.smt_vision_ctx->architecture() : std::string(),
             ctx.media_anchor_mode,
             changed);
         GGML_UNUSED(changed);
     }
 
-    auto formatted_chat = chat_add_and_format(ctx, msg);
+    std::string formatted_chat;
+    const bool use_qwen3asr_prompt =
+        msg.role == "user" &&
+        ctx.smt_audio_ctx &&
+        arch_is_qwen3asr(ctx.smt_audio_ctx->architecture()) &&
+        ctx.has_pending_audio_only();
+    if (use_qwen3asr_prompt) {
+        formatted_chat = format_qwen3asr_audio_prompt(ctx, msg);
+        ctx.chat_history.push_back(msg);
+        add_bos = false;
+    } else {
+        formatted_chat = chat_add_and_format(ctx, msg);
+    }
 
     if (g_is_interrupted) return 0;
 
     std::vector<smt_prompt_chunk> chunks;
-    if (!tokenize_to_smt_chunks(ctx.vocab, formatted_chat, add_bos, true, ctx.pending_images, chunks)) {
+    if (!tokenize_to_smt_chunks(ctx.vocab, formatted_chat, add_bos, true, ctx.pending_media, chunks)) {
         return 1;
     }
 
@@ -886,24 +1047,74 @@ static int eval_message_smt(mtmd_cli_smt_context & ctx, common_chat_msg & msg) {
             continue;
         }
 
+        if (chunk.type == smt_chunk_type::audio) {
+            if (!ctx.smt_audio_ctx) {
+                LOG_ERR("No SMT audio backend is available for '%s'\n", chunk.media_path.c_str());
+                return 1;
+            }
+
+            std::vector<float> audio_embd;
+            try {
+                audio_embd = ctx.smt_audio_ctx->encode_audio(chunk.media_path);
+            } catch (const std::exception & e) {
+                LOG_ERR("Failed to encode audio chunk %zu (%s): %s\n", i, chunk.media_path.c_str(), e.what());
+                return 1;
+            }
+
+            if (audio_embd.empty() || audio_embd.size() % (size_t) ctx.hidden_size != 0) {
+                LOG_ERR("Invalid audio embedding shape from SMT (size=%zu, hidden_size=%" PRId64 ")\n",
+                        audio_embd.size(), ctx.hidden_size);
+                return 1;
+            }
+
+            const int n_audio_tokens = (int) (audio_embd.size() / (size_t) ctx.hidden_size);
+            if (!ctx.tok_audio_beg.empty()) {
+                if (decode_tokens(ctx.lctx, ctx.tok_audio_beg, ctx.n_past, ctx.n_batch, /*logits_last*/ false) != 0) {
+                    LOG_ERR("Failed to decode audio-begin token chunk %zu\n", i);
+                    return 1;
+                }
+            }
+
+            const bool logits_on_embd = logits_last && ctx.tok_audio_end.empty();
+            if (decode_embd(ctx.lctx, audio_embd.data(), n_audio_tokens,
+                            (int) ctx.hidden_size, ctx.n_past, ctx.n_batch, logits_on_embd,
+                            /*use_mrope_pos*/ false, n_audio_tokens, 1) != 0) {
+                LOG_ERR("Failed to decode audio chunk %zu\n", i);
+                return 1;
+            }
+
+            if (!ctx.tok_audio_end.empty()) {
+                if (decode_tokens(ctx.lctx, ctx.tok_audio_end, ctx.n_past, ctx.n_batch, logits_last) != 0) {
+                    LOG_ERR("Failed to decode audio-end token chunk %zu\n", i);
+                    return 1;
+                }
+            }
+            continue;
+        }
+
         // image chunk
-        std::string smt_input_path = chunk.image_path;
+        if (!ctx.smt_vision_ctx) {
+            LOG_ERR("No SMT vision backend is available for '%s'\n", chunk.media_path.c_str());
+            return 1;
+        }
+
+        std::string smt_input_path = chunk.media_path;
         std::string temp_input_path;
         try {
-            const auto image_bytes = read_binary_file(chunk.image_path);
-            auto preproc = smt_vision_preprocess_if_image(image_bytes, ctx.smt_ctx->architecture());
+            const auto image_bytes = read_binary_file(chunk.media_path);
+            auto preproc = smt_vision_preprocess_if_image(image_bytes, ctx.smt_vision_ctx->architecture());
             if (preproc.was_image) {
                 temp_input_path = write_temp_bin_file(preproc.tensor_bytes);
                 smt_input_path = temp_input_path;
             }
         } catch (const std::exception & e) {
-            LOG_ERR("Failed to prepare image '%s': %s\n", chunk.image_path.c_str(), e.what());
+            LOG_ERR("Failed to prepare image '%s': %s\n", chunk.media_path.c_str(), e.what());
             return 1;
         }
 
         std::vector<float> image_embd;
         try {
-            image_embd = ctx.smt_ctx->encode_image(smt_input_path);
+            image_embd = ctx.smt_vision_ctx->encode_image(smt_input_path);
             if (!temp_input_path.empty()) {
                 std::remove(temp_input_path.c_str());
             }
@@ -911,7 +1122,7 @@ static int eval_message_smt(mtmd_cli_smt_context & ctx, common_chat_msg & msg) {
             if (!temp_input_path.empty()) {
                 std::remove(temp_input_path.c_str());
             }
-            LOG_ERR("Failed to encode image chunk %zu (%s): %s\n", i, chunk.image_path.c_str(), e.what());
+            LOG_ERR("Failed to encode image chunk %zu (%s): %s\n", i, chunk.media_path.c_str(), e.what());
             return 1;
         }
 
@@ -953,7 +1164,7 @@ static int eval_message_smt(mtmd_cli_smt_context & ctx, common_chat_msg & msg) {
         }
     }
 
-    ctx.pending_images.clear();
+    ctx.pending_media.clear();
 
     LOG("\n");
     return 0;
@@ -1006,6 +1217,10 @@ int mtmd_cli_smt_run(int argc, char ** argv, common_params params) {
         common_chat_msg msg;
         msg.role = "system";
         msg.content = params.system_prompt;
+        if (ctx.smt_audio_ctx && arch_is_qwen3asr(ctx.smt_audio_ctx->architecture())) {
+            ctx.chat_history.push_back(msg);
+            return 0;
+        }
         return eval_message_smt(ctx, msg);
     };
 
@@ -1027,8 +1242,8 @@ int mtmd_cli_smt_run(int argc, char ** argv, common_params params) {
         msg.role = "user";
         msg.content = params.prompt;
 
-        for (const auto & image : params.image) {
-            ctx.add_image(image);
+        for (const auto & media : params.image) {
+            ctx.add_media_auto(media);
         }
 
         if (eval_message_smt(ctx, msg)) {
@@ -1039,8 +1254,9 @@ int mtmd_cli_smt_run(int argc, char ** argv, common_params params) {
         }
     } else {
         // Chat mode
-        LOG("\n Running in chat mode (SMT vision), available commands:");
+        LOG("\n Running in chat mode (SMT media), available commands:");
         LOG("\n   /image <path>    load an image (.jpg/.png/...) or preprocessed .bin");
+        LOG("\n   /audio <path>    load an audio file (.wav/.mp3/.flac)");
         LOG("\n   /clear           clear the chat history");
         LOG("\n   /quit or /exit   exit the program");
         LOG("\n");
@@ -1074,15 +1290,21 @@ int mtmd_cli_smt_run(int argc, char ** argv, common_params params) {
             }
             g_is_generating = true;
 
-            bool is_image = line == "/image" || line.find("/image ") == 0;
-            if (is_image) {
+            const bool is_image = line == "/image" || line.find("/image ") == 0;
+            const bool is_audio = line == "/audio" || line.find("/audio ") == 0;
+            if (is_image || is_audio) {
                 if (line.size() < 8) {
-                    LOG_ERR("ERR: Missing image filename\n");
+                    LOG_ERR("ERR: Missing media filename\n");
                     continue;
                 }
                 std::string media_path = line.substr(7);
-                ctx.add_image(media_path);
-                LOG("%s image loaded\n", media_path.c_str());
+                if (is_image) {
+                    ctx.add_image(media_path);
+                    LOG("%s image loaded\n", media_path.c_str());
+                } else {
+                    ctx.add_audio(media_path);
+                    LOG("%s audio loaded\n", media_path.c_str());
+                }
                 content += "<__media__>";
                 continue;
             } else {

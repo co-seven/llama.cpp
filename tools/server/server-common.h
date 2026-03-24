@@ -125,7 +125,7 @@ std::vector<size_t> lora_get_enabled_ids(const std::vector<common_adapter_lora_i
 //
 
 /**
- * server_tokens is a helper to manage the input tokens and image for the server.
+ * server_tokens is a helper to manage the input tokens and media for the server.
  * it is made this way to simplify the logic of KV cache management.
  */
 struct server_tokens {
@@ -133,7 +133,7 @@ struct server_tokens {
 
 private: // disallow accessing these members directly, risking out-of-sync
 
-    // map a **start** index in tokens to the image chunk
+    // map a **start** index in tokens to the media chunk
     // note: the order need to be in-sync with tokens
     std::map<size_t, mtmd::input_chunk_ptr> map_idx_to_media;
     std::map<size_t, server_smt_image_chunk> map_idx_to_smt_media;
@@ -310,7 +310,7 @@ struct server_chat_params {
     // Legacy flag name: when true, parsing follows SMT vision media rules
     // (.bin tensors and raw image payloads handled by SMT preprocessing path).
     bool image_bin_only = false;
-    std::string vision_backend = "none";
+    std::string media_backend = "none";
     bool enable_thinking = true;
     int  reasoning_budget = -1;
     std::string reasoning_budget_message;

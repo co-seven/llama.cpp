@@ -170,7 +170,6 @@ static bool load_smt_vision_config(const std::string & config_dir, smt_vision_co
 
     const size_t vision_start = content.find("\"vision_model\":");
     if (vision_start == std::string::npos) {
-        std::cerr << "Error: 'vision_model' section not found.\n";
         return false;
     }
     const size_t vision_block_start = content.find('{', vision_start);

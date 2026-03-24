@@ -306,7 +306,7 @@ int main(int argc, char ** argv) {
     }
 
 #if defined(LLAMA_SERVER_SMT_VISION)
-    if (params.vision_backend == "smt" || !params.smt_config_dir.empty()) {
+    if (params.media_backend == "smt" || !params.smt_config_dir.empty()) {
         return mtmd_cli_smt_run(argc, argv, std::move(params));
     }
 #endif

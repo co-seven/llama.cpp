@@ -1,0 +1,592 @@
+#include "smt-audio-wrapper.h"
+
+#include "mtmd-audio.h"
+
+#include "onnxruntime_cxx_api.h"
+#include "onnxruntime_session_options_config_keys.h"
+
+#include <algorithm>
+#include <array>
+#include <cctype>
+#include <cstdio>
+#include <cstring>
+#include <dirent.h>
+#include <dlfcn.h>
+#include <fstream>
+#include <iostream>
+#include <stdexcept>
+#include <unordered_map>
+
+#define MINIAUDIO_IMPLEMENTATION
+#define MA_NO_ENCODING
+#define MA_NO_DEVICE_IO
+#define MA_NO_RESOURCE_MANAGER
+#define MA_NO_NODE_GRAPH
+#define MA_NO_ENGINE
+#define MA_NO_GENERATION
+#define MA_API static
+#include "miniaudio/miniaudio.h"
+
+namespace onnxruntime {
+extern const OrtApi * g_ort;
+}
+
+namespace {
+
+struct smt_audio_config {
+    std::vector<std::string> architectures;
+    std::string              frontend_model_path;
+    std::string              backend_model_path;
+    int64_t                  d_model      = 0;
+    int64_t                  hidden_size  = 0;
+    int32_t                  num_mel_bins = 128;
+    int32_t                  sample_rate  = 16000;
+    int32_t                  n_fft        = 400;
+    int32_t                  window_len   = 400;
+    int32_t                  hop_len      = 160;
+};
+
+static std::string read_file_to_string(const std::string & path) {
+    std::ifstream file(path);
+    if (!file.is_open()) {
+        return {};
+    }
+    return std::string((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
+}
+
+static size_t find_closing_brace(const std::string & text, size_t start_pos) {
+    int depth = 0;
+    for (size_t index = start_pos; index < text.size(); ++index) {
+        if (text[index] == '{') {
+            ++depth;
+        } else if (text[index] == '}') {
+            --depth;
+            if (depth == 0) {
+                return index;
+            }
+        }
+    }
+    return std::string::npos;
+}
+
+static std::string trim_ascii(std::string value) {
+    while (!value.empty() && std::isspace(static_cast<unsigned char>(value.front()))) {
+        value.erase(value.begin());
+    }
+    while (!value.empty() && std::isspace(static_cast<unsigned char>(value.back()))) {
+        value.pop_back();
+    }
+    return value;
+}
+
+static std::string extract_string_value(const std::string & text, const std::string & key) {
+    const std::string marker = "\"" + key + "\"";
+    const size_t key_pos = text.find(marker);
+    if (key_pos == std::string::npos) {
+        return {};
+    }
+
+    const size_t colon_pos = text.find(':', key_pos + marker.size());
+    if (colon_pos == std::string::npos) {
+        return {};
+    }
+
+    const size_t first_quote = text.find('"', colon_pos + 1);
+    if (first_quote == std::string::npos) {
+        return {};
+    }
+
+    const size_t second_quote = text.find('"', first_quote + 1);
+    if (second_quote == std::string::npos) {
+        return {};
+    }
+
+    return text.substr(first_quote + 1, second_quote - first_quote - 1);
+}
+
+static int64_t extract_int64_value(const std::string & text, const std::string & key, int64_t default_value) {
+    const std::string marker = "\"" + key + "\"";
+    const size_t key_pos = text.find(marker);
+    if (key_pos == std::string::npos) {
+        return default_value;
+    }
+
+    const size_t colon_pos = text.find(':', key_pos + marker.size());
+    if (colon_pos == std::string::npos) {
+        return default_value;
+    }
+
+    size_t value_start = colon_pos + 1;
+    while (value_start < text.size() && std::isspace(static_cast<unsigned char>(text[value_start]))) {
+        ++value_start;
+    }
+
+    size_t value_end = value_start;
+    if (value_end < text.size() && (text[value_end] == '-' || text[value_end] == '+')) {
+        ++value_end;
+    }
+    while (value_end < text.size() && std::isdigit(static_cast<unsigned char>(text[value_end]))) {
+        ++value_end;
+    }
+
+    if (value_end == value_start) {
+        return default_value;
+    }
+
+    try {
+        return std::stoll(text.substr(value_start, value_end - value_start));
+    } catch (...) {
+        return default_value;
+    }
+}
+
+static std::vector<std::string> extract_string_array(const std::string & text, const std::string & key) {
+    std::vector<std::string> values;
+
+    const std::string marker = "\"" + key + "\"";
+    const size_t key_pos = text.find(marker);
+    if (key_pos == std::string::npos) {
+        return values;
+    }
+
+    const size_t bracket_start = text.find('[', key_pos + marker.size());
+    const size_t bracket_end = text.find(']', bracket_start == std::string::npos ? key_pos : bracket_start + 1);
+    if (bracket_start == std::string::npos || bracket_end == std::string::npos || bracket_end <= bracket_start) {
+        return values;
+    }
+
+    std::string content = text.substr(bracket_start + 1, bracket_end - bracket_start - 1);
+    size_t pos = 0;
+    while (pos < content.size()) {
+        const size_t first_quote = content.find('"', pos);
+        if (first_quote == std::string::npos) {
+            break;
+        }
+        const size_t second_quote = content.find('"', first_quote + 1);
+        if (second_quote == std::string::npos) {
+            break;
+        }
+        values.push_back(content.substr(first_quote + 1, second_quote - first_quote - 1));
+        pos = second_quote + 1;
+    }
+
+    return values;
+}
+
+static std::string normalize_path(const std::string & base_dir, const std::string & path) {
+    const std::string trimmed = trim_ascii(path);
+    if (trimmed.empty()) {
+        return {};
+    }
+    if (trimmed.front() == '/') {
+        return trimmed;
+    }
+    return base_dir + "/" + trimmed;
+}
+
+static bool parse_audio_config_block(const std::string & config_dir,
+                                     const std::string & content,
+                                     smt_audio_config & config) {
+    const size_t audio_start = content.find("\"audio_model\":");
+    if (audio_start == std::string::npos) {
+        return false;
+    }
+
+    const size_t audio_block_start = content.find('{', audio_start);
+    const size_t audio_block_end = find_closing_brace(content, audio_block_start);
+    if (audio_block_start == std::string::npos || audio_block_end == std::string::npos) {
+        std::cerr << "Error: Invalid 'audio_model' block.\n";
+        return false;
+    }
+
+    const std::string audio_block = content.substr(audio_block_start, audio_block_end - audio_block_start + 1);
+    config.frontend_model_path = normalize_path(config_dir, extract_string_value(audio_block, "frontend_model_path"));
+    if (config.frontend_model_path.empty()) {
+        config.frontend_model_path = normalize_path(config_dir, extract_string_value(audio_block, "frontend_path"));
+    }
+    config.backend_model_path = normalize_path(config_dir, extract_string_value(audio_block, "backend_model_path"));
+    if (config.backend_model_path.empty()) {
+        config.backend_model_path = normalize_path(config_dir, extract_string_value(audio_block, "backend_path"));
+    }
+
+    config.d_model = extract_int64_value(audio_block, "d_model", config.d_model);
+    config.hidden_size = extract_int64_value(audio_block, "hidden_size", config.hidden_size);
+    if (config.hidden_size <= 0) {
+        config.hidden_size = extract_int64_value(audio_block, "output_dim", config.hidden_size);
+    }
+    config.num_mel_bins = (int32_t) extract_int64_value(audio_block, "num_mel_bins", config.num_mel_bins);
+    config.sample_rate = (int32_t) extract_int64_value(audio_block, "sample_rate", config.sample_rate);
+    config.n_fft = (int32_t) extract_int64_value(audio_block, "n_fft", config.n_fft);
+    config.window_len = (int32_t) extract_int64_value(audio_block, "window_len", config.window_len);
+    config.hop_len = (int32_t) extract_int64_value(audio_block, "hop_len", config.hop_len);
+    config.architectures = extract_string_array(content, "architectures");
+
+    return !config.frontend_model_path.empty() && !config.backend_model_path.empty();
+}
+
+static std::string find_split_metadata_file(const std::string & config_dir) {
+    DIR * dir = opendir(config_dir.c_str());
+    if (dir == nullptr) {
+        return {};
+    }
+
+    std::string found;
+    while (const dirent * entry = readdir(dir)) {
+        if (entry->d_type != DT_REG && entry->d_type != DT_UNKNOWN) {
+            continue;
+        }
+        const std::string name = entry->d_name;
+        if (name.size() >= strlen("-encoder-split-metadata.json") &&
+            name.compare(name.size() - strlen("-encoder-split-metadata.json"),
+                         strlen("-encoder-split-metadata.json"),
+                         "-encoder-split-metadata.json") == 0) {
+            found = config_dir + "/" + name;
+            break;
+        }
+    }
+
+    closedir(dir);
+    return found;
+}
+
+static bool load_smt_audio_config_from_metadata(const std::string & config_dir,
+                                                const std::string & metadata_path,
+                                                smt_audio_config & config) {
+    const std::string content = read_file_to_string(metadata_path);
+    if (content.empty()) {
+        return false;
+    }
+
+    config.frontend_model_path = normalize_path(config_dir, extract_string_value(content, "frontend_onnx"));
+    config.backend_model_path  = normalize_path(config_dir, extract_string_value(content, "backend_onnx"));
+    config.num_mel_bins        = (int32_t) extract_int64_value(content, "num_mel_bins", config.num_mel_bins);
+    config.d_model             = extract_int64_value(content, "d_model", config.d_model);
+    config.hidden_size         = extract_int64_value(content, "output_dim", config.hidden_size);
+    if (config.architectures.empty()) {
+        config.architectures = { "Qwen3ASRForConditionalGeneration" };
+    }
+
+    return !config.frontend_model_path.empty() &&
+           !config.backend_model_path.empty() &&
+           config.d_model > 0 &&
+           config.hidden_size > 0;
+}
+
+static bool load_smt_audio_config(const std::string & config_dir, smt_audio_config & config) {
+    const std::string config_path = config_dir + "/config.json";
+    const std::string config_content = read_file_to_string(config_path);
+    if (!config_content.empty() && parse_audio_config_block(config_dir, config_content, config)) {
+        if (config.hidden_size <= 0) {
+            const size_t text_start = config_content.find("\"text_model\":");
+            if (text_start != std::string::npos) {
+                const size_t text_block_start = config_content.find('{', text_start);
+                const size_t text_block_end = find_closing_brace(config_content, text_block_start);
+                if (text_block_start != std::string::npos && text_block_end != std::string::npos) {
+                    const std::string text_block =
+                        config_content.substr(text_block_start, text_block_end - text_block_start + 1);
+                    config.hidden_size = extract_int64_value(text_block, "hidden_size", config.hidden_size);
+                }
+            }
+        }
+        if (!config.architectures.empty() && config.hidden_size > 0) {
+            return true;
+        }
+    }
+
+    const std::string metadata_path = find_split_metadata_file(config_dir);
+    if (metadata_path.empty()) {
+        return false;
+    }
+
+    return load_smt_audio_config_from_metadata(config_dir, metadata_path, config);
+}
+
+static int floor_div(int value, int divisor) {
+    int quotient = value / divisor;
+    int remainder = value % divisor;
+    if (remainder != 0 && ((remainder > 0) != (divisor > 0))) {
+        --quotient;
+    }
+    return quotient;
+}
+
+static int get_feat_extract_output_lengths(int input_lengths) {
+    const int input_lengths_leave = input_lengths % 100;
+    const int feat_lengths = floor_div(input_lengths_leave - 1, 2) + 1;
+    const int output_lengths =
+        floor_div(floor_div(feat_lengths - 1, 2) + 1 - 1, 2) + 1 + (input_lengths / 100) * 13;
+    return output_lengths;
+}
+
+static bool decode_audio_file(const std::string & path, int target_sample_rate, std::vector<float> & pcmf32_mono) {
+    const int channels = 1;
+    ma_decoder_config decoder_config = ma_decoder_config_init(ma_format_f32, channels, target_sample_rate);
+    ma_decoder decoder;
+
+    if (ma_decoder_init_file(path.c_str(), &decoder_config, &decoder) != MA_SUCCESS) {
+        return false;
+    }
+
+    ma_uint64 frame_count = 0;
+    if (ma_decoder_get_length_in_pcm_frames(&decoder, &frame_count) != MA_SUCCESS) {
+        ma_decoder_uninit(&decoder);
+        return false;
+    }
+
+    pcmf32_mono.resize((size_t) frame_count);
+    ma_uint64 frames_read = 0;
+    if (ma_decoder_read_pcm_frames(&decoder, pcmf32_mono.data(), frame_count, &frames_read) != MA_SUCCESS) {
+        ma_decoder_uninit(&decoder);
+        return false;
+    }
+
+    pcmf32_mono.resize((size_t) frames_read);
+    ma_decoder_uninit(&decoder);
+    return !pcmf32_mono.empty();
+}
+
+static OrtStatus * init_spacemit_execution_provider(
+        Ort::SessionOptions & options,
+        const std::unordered_map<std::string, std::string> & provider_options) {
+    std::vector<const char *> keys;
+    std::vector<const char *> values;
+    keys.reserve(provider_options.size());
+    values.reserve(provider_options.size());
+    for (const auto & entry : provider_options) {
+        keys.push_back(entry.first.c_str());
+        values.push_back(entry.second.c_str());
+    }
+
+    void * handle = dlopen("libspacemit_ep.so", RTLD_NOW);
+    if (!handle) {
+        return nullptr;
+    }
+
+    auto * ep_init = reinterpret_cast<OrtStatus * (*)(OrtSessionOptions *, const char * const *, const char * const *, size_t)>(
+            dlsym(handle, "OrtSessionOptionsSpaceMITEnvInit"));
+    if (!ep_init) {
+        return nullptr;
+    }
+
+    return ep_init(options, keys.data(), values.data(), keys.size());
+}
+
+static void append_optional_spacemit_ep(Ort::SessionOptions & session_options) {
+    std::unordered_map<std::string, std::string> provider_options;
+    provider_options["SPACEMIT_EP_INTRA_THREAD_NUM"] = "1";
+    if (OrtStatus * status = init_spacemit_execution_provider(session_options, provider_options)) {
+        std::cerr << "[SMT][audio] warning: failed to initialize Spacemit EP: "
+                  << Ort::GetApi().GetErrorMessage(status) << "\n";
+        Ort::GetApi().ReleaseStatus(status);
+    }
+}
+
+static std::vector<const char *> make_name_ptrs(const std::vector<std::string> & names) {
+    std::vector<const char *> ptrs;
+    ptrs.reserve(names.size());
+    for (const auto & name : names) {
+        ptrs.push_back(name.c_str());
+    }
+    return ptrs;
+}
+
+static std::vector<std::string> get_io_names(Ort::Session & session, bool inputs) {
+    std::vector<std::string> names;
+    Ort::AllocatorWithDefaultOptions allocator;
+    const size_t count = inputs ? session.GetInputCount() : session.GetOutputCount();
+    names.reserve(count);
+    for (size_t i = 0; i < count; ++i) {
+        auto allocated = inputs ? session.GetInputNameAllocated(i, allocator)
+                                : session.GetOutputNameAllocated(i, allocator);
+        names.emplace_back(allocated.get());
+    }
+    return names;
+}
+
+static Ort::Value make_tensor_f32(const std::vector<int64_t> & shape, std::vector<float> & data) {
+    Ort::MemoryInfo memory_info =
+        Ort::MemoryInfo::CreateCpu(OrtAllocatorType::OrtArenaAllocator, OrtMemType::OrtMemTypeDefault);
+    return Ort::Value::CreateTensor<float>(memory_info, data.data(), data.size(), shape.data(), shape.size());
+}
+
+} // namespace
+
+struct smt_audio_context::impl {
+    smt_audio_config config;
+    Ort::Env         env{ORT_LOGGING_LEVEL_WARNING, "smt-audio"};
+    Ort::SessionOptions frontend_options;
+    Ort::SessionOptions backend_options;
+    Ort::Session        frontend_session{nullptr};
+    Ort::Session        backend_session{nullptr};
+
+    std::vector<std::string> frontend_input_names;
+    std::vector<std::string> frontend_output_names;
+    std::vector<const char *> frontend_input_names_raw;
+    std::vector<const char *> frontend_output_names_raw;
+
+    std::vector<std::string> backend_input_names;
+    std::vector<std::string> backend_output_names;
+    std::vector<const char *> backend_input_names_raw;
+    std::vector<const char *> backend_output_names_raw;
+
+    std::string arch_name;
+};
+
+smt_audio_context::~smt_audio_context() = default;
+
+std::unique_ptr<smt_audio_context> smt_audio_context::create(const std::string & config_dir) {
+    auto ctx = std::unique_ptr<smt_audio_context>(new smt_audio_context());
+    ctx->pimpl_ = std::make_unique<impl>();
+    auto & d = *ctx->pimpl_;
+
+    if (!load_smt_audio_config(config_dir, d.config)) {
+        throw std::runtime_error("Failed to load SMT audio config from: " + config_dir);
+    }
+
+    if (!d.config.architectures.empty()) {
+        d.arch_name = d.config.architectures[0];
+    } else {
+        d.arch_name = "Qwen3ASRForConditionalGeneration";
+    }
+
+    if (d.config.frontend_model_path.empty() || d.config.backend_model_path.empty()) {
+        throw std::runtime_error("Missing SMT audio frontend/backend model path");
+    }
+    if (d.config.d_model <= 0 || d.config.hidden_size <= 0) {
+        throw std::runtime_error("Invalid SMT audio model dimensions");
+    }
+
+    onnxruntime::g_ort = OrtGetApiBase()->GetApi(ORT_API_VERSION);
+
+    d.frontend_options.SetGraphOptimizationLevel(GraphOptimizationLevel::ORT_ENABLE_ALL);
+    d.backend_options.SetGraphOptimizationLevel(GraphOptimizationLevel::ORT_ENABLE_ALL);
+    d.frontend_options.SetIntraOpNumThreads(1);
+    d.backend_options.SetIntraOpNumThreads(1);
+    d.frontend_options.SetInterOpNumThreads(1);
+    d.backend_options.SetInterOpNumThreads(1);
+
+    append_optional_spacemit_ep(d.frontend_options);
+    append_optional_spacemit_ep(d.backend_options);
+
+    d.frontend_session = Ort::Session(d.env, d.config.frontend_model_path.c_str(), d.frontend_options);
+    d.backend_session  = Ort::Session(d.env, d.config.backend_model_path.c_str(),  d.backend_options);
+
+    d.frontend_input_names = get_io_names(d.frontend_session, true);
+    d.frontend_output_names = get_io_names(d.frontend_session, false);
+    d.frontend_input_names_raw = make_name_ptrs(d.frontend_input_names);
+    d.frontend_output_names_raw = make_name_ptrs(d.frontend_output_names);
+
+    d.backend_input_names = get_io_names(d.backend_session, true);
+    d.backend_output_names = get_io_names(d.backend_session, false);
+    d.backend_input_names_raw = make_name_ptrs(d.backend_input_names);
+    d.backend_output_names_raw = make_name_ptrs(d.backend_output_names);
+
+    if (d.frontend_input_names_raw.size() != 1 || d.frontend_output_names_raw.size() != 1 ||
+        d.backend_input_names_raw.size() != 2 || d.backend_output_names_raw.size() != 1) {
+        throw std::runtime_error("Unexpected SMT audio ONNX IO signature");
+    }
+
+    return ctx;
+}
+
+std::vector<float> smt_audio_context::encode_audio(const std::string & audio_path) {
+    auto & d = *pimpl_;
+
+    std::vector<float> samples;
+    if (!decode_audio_file(audio_path, d.config.sample_rate, samples)) {
+        throw std::runtime_error("failed to decode audio file: " + audio_path);
+    }
+
+    mtmd_audio_mel mel;
+    if (!mtmd_audio_compute_log_mel_spectrogram(samples.data(),
+                                                samples.size(),
+                                                4,
+                                                d.config.num_mel_bins,
+                                                d.config.n_fft,
+                                                d.config.window_len,
+                                                d.config.hop_len,
+                                                d.config.sample_rate,
+                                                true,
+                                                0.0f,
+                                                false,
+                                                false,
+                                                mel)) {
+        throw std::runtime_error("failed to compute Qwen3-ASR mel spectrogram");
+    }
+
+    if (mel.n_len <= 0 || mel.n_mel != d.config.num_mel_bins) {
+        throw std::runtime_error("invalid mel spectrogram shape");
+    }
+
+    const int frames = mel.n_len;
+    const int chunk_frames = 100;
+    const int chunk_tokens = 13;
+    const int padded_frames = ((frames + chunk_frames - 1) / chunk_frames) * chunk_frames;
+    const int n_chunks = padded_frames / chunk_frames;
+
+    std::vector<float> hidden_states((size_t) n_chunks * chunk_tokens * (size_t) d.config.d_model);
+    std::vector<float> chunk_input((size_t) d.config.num_mel_bins * chunk_frames, 0.0f);
+    const std::vector<int64_t> frontend_input_shape = {1, d.config.num_mel_bins, chunk_frames};
+
+    for (int chunk_idx = 0; chunk_idx < n_chunks; ++chunk_idx) {
+        std::fill(chunk_input.begin(), chunk_input.end(), 0.0f);
+        const int frame_offset = chunk_idx * chunk_frames;
+        const int copy_frames = std::min(chunk_frames, frames - frame_offset);
+        if (copy_frames > 0) {
+            for (int mel_idx = 0; mel_idx < mel.n_mel; ++mel_idx) {
+                const float * src = mel.data.data() + (size_t) mel_idx * mel.n_len + frame_offset;
+                float * dst = chunk_input.data() + (size_t) mel_idx * chunk_frames;
+                std::memcpy(dst, src, (size_t) copy_frames * sizeof(float));
+            }
+        }
+
+        auto frontend_input = make_tensor_f32(frontend_input_shape, chunk_input);
+        auto frontend_outputs = d.frontend_session.Run(Ort::RunOptions{nullptr},
+                                                       d.frontend_input_names_raw.data(),
+                                                       &frontend_input,
+                                                       1,
+                                                       d.frontend_output_names_raw.data(),
+                                                       1);
+        float * chunk_out = frontend_outputs[0].GetTensorMutableData<float>();
+        std::memcpy(hidden_states.data() + (size_t) chunk_idx * chunk_tokens * (size_t) d.config.d_model,
+                    chunk_out,
+                    (size_t) chunk_tokens * (size_t) d.config.d_model * sizeof(float));
+    }
+
+    const int t_out = get_feat_extract_output_lengths(frames);
+    if (t_out <= 0 || t_out > n_chunks * chunk_tokens) {
+        throw std::runtime_error("invalid split-encoder output length");
+    }
+
+    hidden_states.resize((size_t) t_out * (size_t) d.config.d_model);
+    std::vector<float> attention_mask((size_t) t_out * (size_t) t_out, 0.0f);
+
+    const std::vector<int64_t> backend_hidden_shape = {1, t_out, d.config.d_model};
+    const std::vector<int64_t> backend_mask_shape = {1, 1, t_out, t_out};
+
+    auto hidden_tensor = make_tensor_f32(backend_hidden_shape, hidden_states);
+    auto mask_tensor = make_tensor_f32(backend_mask_shape, attention_mask);
+    std::array<Ort::Value, 2> backend_inputs = { std::move(hidden_tensor), std::move(mask_tensor) };
+
+    auto backend_outputs = d.backend_session.Run(Ort::RunOptions{nullptr},
+                                                 d.backend_input_names_raw.data(),
+                                                 backend_inputs.data(),
+                                                 backend_inputs.size(),
+                                                 d.backend_output_names_raw.data(),
+                                                 1);
+
+    float * output = backend_outputs[0].GetTensorMutableData<float>();
+    std::vector<float> audio_embd((size_t) t_out * (size_t) d.config.hidden_size);
+    std::memcpy(audio_embd.data(),
+                output,
+                audio_embd.size() * sizeof(float));
+    return audio_embd;
+}
+
+int64_t smt_audio_context::hidden_size() const {
+    return pimpl_->config.hidden_size;
+}
+
+const std::string & smt_audio_context::architecture() const {
+    return pimpl_->arch_name;
+}

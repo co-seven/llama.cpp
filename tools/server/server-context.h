@@ -18,7 +18,7 @@ struct server_context_meta {
     std::set<std::string> model_aliases;
     std::set<std::string> model_tags;
     std::string model_path;
-    std::string vision_backend;
+    std::string media_backend;
     bool has_mtmd;
     bool has_inp_image;
     bool has_inp_audio;
