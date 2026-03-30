@@ -1,5 +1,6 @@
 #include "smt-audio-wrapper.h"
 
+#include "ggml-profile.h"
 #include "mtmd-audio.h"
 
 #include "onnxruntime_cxx_api.h"
@@ -503,12 +504,20 @@ std::unique_ptr<smt_audio_context> smt_audio_context::create(const std::string &
 std::vector<float> smt_audio_context::encode_audio(const std::string & audio_path) {
     auto & d = *pimpl_;
 
+    ggml_trace_log_begin("encode_audio", "Audio", NULL);
+
     std::vector<float> samples;
+    ggml_trace_log_begin("decode_audio_file", "Audio", NULL);
     if (!decode_audio_file(audio_path, d.config.sample_rate, samples)) {
+        ggml_trace_log_end("decode_audio_file", "Audio", NULL);
+        ggml_trace_log_end("encode_audio", "Audio", NULL);
+        ggml_profile_flush_tls();
         throw std::runtime_error("failed to decode audio file: " + audio_path);
     }
+    ggml_trace_log_end("decode_audio_file", "Audio", NULL);
 
     mtmd_audio_mel mel;
+    ggml_trace_log_begin("compute_log_mel_spectrogram", "Audio", NULL);
     if (!mtmd_audio_compute_log_mel_spectrogram(samples.data(),
                                                 samples.size(),
                                                 4,
@@ -522,10 +531,16 @@ std::vector<float> smt_audio_context::encode_audio(const std::string & audio_pat
                                                 false,
                                                 false,
                                                 mel)) {
+        ggml_trace_log_end("compute_log_mel_spectrogram", "Audio", NULL);
+        ggml_trace_log_end("encode_audio", "Audio", NULL);
+        ggml_profile_flush_tls();
         throw std::runtime_error("failed to compute Qwen3-ASR mel spectrogram");
     }
+    ggml_trace_log_end("compute_log_mel_spectrogram", "Audio", NULL);
 
     if (mel.n_len <= 0 || mel.n_mel != d.config.num_mel_bins) {
+        ggml_trace_log_end("encode_audio", "Audio", NULL);
+        ggml_profile_flush_tls();
         throw std::runtime_error("invalid mel spectrogram shape");
     }
 
@@ -539,6 +554,7 @@ std::vector<float> smt_audio_context::encode_audio(const std::string & audio_pat
     std::vector<float> chunk_input((size_t) d.config.num_mel_bins * chunk_frames, 0.0f);
     const std::vector<int64_t> frontend_input_shape = {1, d.config.num_mel_bins, chunk_frames};
 
+    ggml_trace_log_begin("frontend_session_run", "Audio", NULL);
     for (int chunk_idx = 0; chunk_idx < n_chunks; ++chunk_idx) {
         std::fill(chunk_input.begin(), chunk_input.end(), 0.0f);
         const int frame_offset = chunk_idx * chunk_frames;
@@ -563,9 +579,12 @@ std::vector<float> smt_audio_context::encode_audio(const std::string & audio_pat
                     chunk_out,
                     (size_t) chunk_tokens * (size_t) d.config.d_model * sizeof(float));
     }
+    ggml_trace_log_end("frontend_session_run", "Audio", NULL);
 
     const int t_out = get_feat_extract_output_lengths(frames);
     if (t_out <= 0 || t_out > n_chunks * chunk_tokens) {
+        ggml_trace_log_end("encode_audio", "Audio", NULL);
+        ggml_profile_flush_tls();
         throw std::runtime_error("invalid split-encoder output length");
     }
 
@@ -579,18 +598,23 @@ std::vector<float> smt_audio_context::encode_audio(const std::string & audio_pat
     auto mask_tensor = make_tensor_f32(backend_mask_shape, attention_mask);
     std::array<Ort::Value, 2> backend_inputs = { std::move(hidden_tensor), std::move(mask_tensor) };
 
+    ggml_trace_log_begin("backend_session_run", "Audio", NULL);
     auto backend_outputs = d.backend_session.Run(Ort::RunOptions{nullptr},
                                                  d.backend_input_names_raw.data(),
                                                  backend_inputs.data(),
                                                  backend_inputs.size(),
                                                  d.backend_output_names_raw.data(),
                                                  1);
+    ggml_trace_log_end("backend_session_run", "Audio", NULL);
 
     float * output = backend_outputs[0].GetTensorMutableData<float>();
     std::vector<float> audio_embd((size_t) t_out * (size_t) d.config.hidden_size);
     std::memcpy(audio_embd.data(),
                 output,
                 audio_embd.size() * sizeof(float));
+
+    ggml_trace_log_end("encode_audio", "Audio", NULL);
+    ggml_profile_flush_tls();
     return audio_embd;
 }
 

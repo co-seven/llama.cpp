@@ -2,6 +2,7 @@
 
 #include "smt-vision-wrapper.h"
 
+#include "ggml-profile.h"
 #include "spine_vision_engine.h"
 
 #include <cctype>
@@ -249,9 +250,22 @@ std::unique_ptr<smt_vision_context> smt_vision_context::create(const std::string
 
 std::vector<float> smt_vision_context::encode_image(const std::string & binary_path) {
     auto & d = *pimpl_;
-    std::string  path_copy    = binary_path;
+
+    ggml_trace_log_begin("encode_image", "Vision", NULL);
+
+    std::string path_copy = binary_path;
+
+    ggml_trace_log_begin("set_input_tensor", "Vision", NULL);
     Ort::Value & input_tensor = d.vision_engine->SetInputTensor(path_copy);
-    return d.vision_engine->RunSession(input_tensor);
+    ggml_trace_log_end("set_input_tensor", "Vision", NULL);
+
+    ggml_trace_log_begin("vision_session_run", "Vision", NULL);
+    std::vector<float> result = d.vision_engine->RunSession(input_tensor);
+    ggml_trace_log_end("vision_session_run", "Vision", NULL);
+
+    ggml_trace_log_end("encode_image", "Vision", NULL);
+    ggml_profile_flush_tls();
+    return result;
 }
 
 int64_t smt_vision_context::hidden_size() const {
