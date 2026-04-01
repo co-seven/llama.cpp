@@ -32,6 +32,10 @@ struct smt_vision_context {
     // Get the model architecture name
     const std::string & architecture() const;
 
+    // Get the fixed ONNX input size expected by the SMT vision model.
+    int32_t input_width() const;
+    int32_t input_height() const;
+
 private:
     smt_vision_context() = default;
     struct impl;

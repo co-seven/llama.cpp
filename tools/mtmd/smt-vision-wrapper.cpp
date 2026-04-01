@@ -20,6 +20,8 @@ struct smt_vision_config {
     std::vector<std::string> architectures;
     std::string              vision_model_path;
     int64_t                  hidden_size = 0;
+    int32_t                  input_width = 0;
+    int32_t                  input_height = 0;
 };
 
 static std::string read_file_to_string(const std::string & path) {
@@ -205,6 +207,9 @@ static bool load_smt_vision_config(const std::string & config_dir, smt_vision_co
     config.vision_model_path = normalize_path(config_dir, extract_string_value(vision_block, "model_path"));
     config.hidden_size       = extract_int64_value(text_block, "hidden_size", 0);
     config.architectures     = extract_string_array(content, "architectures");
+    const int64_t input_size = extract_int64_value(vision_block, "input_size", 0);
+    config.input_width       = (int32_t) extract_int64_value(vision_block, "input_width", input_size);
+    config.input_height      = (int32_t) extract_int64_value(vision_block, "input_height", input_size);
 
     if (config.vision_model_path.empty()) {
         std::cerr << "Error: Missing required key 'vision_model.model_path'.\n";
@@ -216,6 +221,11 @@ static bool load_smt_vision_config(const std::string & config_dir, smt_vision_co
     }
     if (config.architectures.empty()) {
         std::cerr << "Error: Missing required key 'architectures'.\n";
+        return false;
+    }
+    if ((config.input_width < 0 || config.input_height < 0) ||
+        ((config.input_width == 0) != (config.input_height == 0))) {
+        std::cerr << "Error: vision_model.input_width/input_height must both be set and positive.\n";
         return false;
     }
 
@@ -278,6 +288,14 @@ std::vector<float> smt_vision_context::encode_image(const std::string & binary_p
 
 int64_t smt_vision_context::hidden_size() const {
     return pimpl_->config.hidden_size;
+}
+
+int32_t smt_vision_context::input_width() const {
+    return pimpl_->config.input_width;
+}
+
+int32_t smt_vision_context::input_height() const {
+    return pimpl_->config.input_height;
 }
 
 int64_t smt_vision_context::vocab_size() const {

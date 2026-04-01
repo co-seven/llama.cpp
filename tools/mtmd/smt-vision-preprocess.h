@@ -16,4 +16,6 @@ struct smt_vision_preprocess_result {
 // float32 NCHW bytes for SMT vision ONNX input. Otherwise returns was_image=false.
 smt_vision_preprocess_result smt_vision_preprocess_if_image(
         const std::vector<uint8_t> & input,
-        const std::string & architecture);
+        const std::string & architecture,
+        int32_t input_width = 0,
+        int32_t input_height = 0);

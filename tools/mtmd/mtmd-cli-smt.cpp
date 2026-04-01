@@ -1173,7 +1173,11 @@ static int eval_message_smt(mtmd_cli_smt_context & ctx, common_chat_msg & msg) {
         std::string temp_input_path;
         try {
             const auto image_bytes = read_binary_file(chunk.media_path);
-            auto preproc = smt_vision_preprocess_if_image(image_bytes, ctx.smt_vision_ctx->architecture());
+            auto preproc = smt_vision_preprocess_if_image(
+                image_bytes,
+                ctx.smt_vision_ctx->architecture(),
+                ctx.smt_vision_ctx->input_width(),
+                ctx.smt_vision_ctx->input_height());
             if (preproc.was_image) {
                 temp_input_path = write_temp_bin_file(preproc.tensor_bytes);
                 smt_input_path = temp_input_path;

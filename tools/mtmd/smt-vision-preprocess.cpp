@@ -47,6 +47,18 @@ static ep_preproc_spec resolve_preproc_spec(const std::string & architecture) {
     return {};
 }
 
+static ep_preproc_spec resolve_preproc_spec(
+        const std::string & architecture,
+        int32_t input_width,
+        int32_t input_height) {
+    auto spec = resolve_preproc_spec(architecture);
+    if (input_width > 0 && input_height > 0) {
+        spec.target_w = input_width;
+        spec.target_h = input_height;
+    }
+    return spec;
+}
+
 struct linear_contrib {
     std::vector<int32_t> idx;
     std::vector<float> w;
@@ -191,7 +203,9 @@ static std::vector<uint8_t> pack_f32_bytes(const std::vector<float> & values) {
 
 smt_vision_preprocess_result smt_vision_preprocess_if_image(
         const std::vector<uint8_t> & input,
-        const std::string & architecture) {
+        const std::string & architecture,
+        int32_t input_width,
+        int32_t input_height) {
     smt_vision_preprocess_result out;
     if (input.empty()) {
         return out;
@@ -212,7 +226,7 @@ smt_vision_preprocess_result smt_vision_preprocess_if_image(
     }
 
     try {
-        const ep_preproc_spec spec = resolve_preproc_spec(architecture);
+        const ep_preproc_spec spec = resolve_preproc_spec(architecture, input_width, input_height);
         if (spec.target_w <= 0 || spec.target_h <= 0) {
             stbi_image_free(pixels);
             throw std::runtime_error(
