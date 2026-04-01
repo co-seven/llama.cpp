@@ -182,6 +182,14 @@ struct server_slot {
     double t_prompt_processing = 0.0; // ms
     double t_token_generation = 0.0;  // ms
 
+    // encoder stats (audio / vision)
+    double  t_vision_encode_ms    = 0.0;
+    double  t_vision_prefill_ms   = 0.0;
+    int32_t n_vision_tokens       = 0;
+    double  t_audio_encode_ms     = 0.0;
+    double  t_audio_prefill_ms    = 0.0;
+    int32_t n_audio_tokens        = 0;
+
     std::function<void(int /* id_slot */)> callback_on_release;
 
     // Speculative decoding stats
@@ -213,6 +221,14 @@ struct server_slot {
         // clear speculative decoding stats
         n_draft_total = 0;
         n_draft_accepted = 0;
+
+        // clear encoder stats
+        t_vision_encode_ms  = 0.0;
+        t_vision_prefill_ms = 0.0;
+        n_vision_tokens     = 0;
+        t_audio_encode_ms   = 0.0;
+        t_audio_prefill_ms  = 0.0;
+        n_audio_tokens      = 0;
 
         task_prev = std::move(task);
         task.reset();
@@ -458,20 +474,42 @@ struct server_slot {
     }
 
     void print_timings() const {
-        const double t_prompt        =       t_prompt_processing / n_prompt_tokens_processed;
-        const double n_prompt_second = 1e3 / t_prompt_processing * n_prompt_tokens_processed;
+        // text-only tokens (excluding media tokens counted in image/audio prefill)
+        const int32_t n_text_tokens = n_prompt_tokens_processed - n_vision_tokens - n_audio_tokens;
+        // text prefill time = total prompt time minus media prefill time
+        const double t_text_prefill_ms = t_prompt_processing - t_vision_prefill_ms - t_audio_prefill_ms;
 
-        const double t_gen        =       t_token_generation / n_decoded;
-        const double n_gen_second = 1e3 / t_token_generation * n_decoded;
+        const double t_text_per_tok  = n_text_tokens > 0 ? t_text_prefill_ms / n_text_tokens : 0.0;
+        const double n_text_per_sec  = n_text_tokens > 0 ? 1e3 / t_text_prefill_ms * n_text_tokens : 0.0;
+        const double t_gen_per_tok   = t_token_generation / n_decoded;
+        const double n_gen_per_sec   = 1e3 / t_token_generation * n_decoded;
+        const double t_total_ms      = t_prompt_processing + t_token_generation
+                                       + t_vision_encode_ms + t_audio_encode_ms;
+        const int32_t n_total_tokens = n_prompt_tokens_processed + n_decoded;
 
-        SLT_INF(*this,
-                "\n"
-                "prompt eval time = %10.2f ms / %5d tokens (%8.2f ms per token, %8.2f tokens per second)\n"
-                "       eval time = %10.2f ms / %5d tokens (%8.2f ms per token, %8.2f tokens per second)\n"
-                "      total time = %10.2f ms / %5d tokens\n",
-                t_prompt_processing, n_prompt_tokens_processed, t_prompt, n_prompt_second,
-                t_token_generation, n_decoded, t_gen, n_gen_second,
-                t_prompt_processing + t_token_generation, n_prompt_tokens_processed + n_decoded);
+        if (t_vision_encode_ms > 0.0) {
+            SLT_INF(*this, "vision encode  = %10.2f ms / %5d tokens\n",
+                    t_vision_encode_ms, n_vision_tokens);
+        }
+        if (t_vision_prefill_ms > 0.0) {
+            SLT_INF(*this, "vision prefill = %10.2f ms / %5d tokens\n",
+                    t_vision_prefill_ms, n_vision_tokens);
+        }
+        if (t_audio_encode_ms > 0.0) {
+            SLT_INF(*this, " audio encode  = %10.2f ms / %5d tokens\n",
+                    t_audio_encode_ms, n_audio_tokens);
+        }
+        if (t_audio_prefill_ms > 0.0) {
+            SLT_INF(*this, " audio prefill = %10.2f ms / %5d tokens\n",
+                    t_audio_prefill_ms, n_audio_tokens);
+        }
+
+        SLT_INF(*this, "  text prefill = %10.2f ms / %5d tokens (%8.2f ms per token, %8.2f tokens per second)\n",
+                t_text_prefill_ms, n_text_tokens, t_text_per_tok, n_text_per_sec);
+        SLT_INF(*this, "        decode = %10.2f ms / %5d tokens (%8.2f ms per token, %8.2f tokens per second)\n",
+                t_token_generation, n_decoded, t_gen_per_tok, n_gen_per_sec);
+        SLT_INF(*this, "         total = %10.2f ms / %5d tokens\n",
+                t_total_ms, n_total_tokens);
 
         if (n_draft_total > 0) {
             const float draft_ratio = (float) n_draft_accepted / n_draft_total;
@@ -2773,7 +2811,9 @@ private:
                     if (slot.prompt.n_tokens() < slot.task->n_tokens() && input_tokens[slot.prompt.n_tokens()] == LLAMA_TOKEN_NULL) {
                         // process the image
                         size_t n_tokens_out = 0;
+                        const int64_t t_prefill_start = ggml_time_us();
                         int32_t res = input_tokens.process_chunk(ctx, mctx, smt_ctx, slot.prompt.n_tokens(), slot.prompt.tokens.pos_next(), slot.id, n_tokens_out);
+                        const double t_prefill_ms = (ggml_time_us() - t_prefill_start) / 1e3;
                         if (res != 0) {
                             SLT_ERR(slot, "failed to process image, res = %d\n", res);
                             send_error(slot, "failed to process image", ERROR_TYPE_SERVER);
@@ -2787,6 +2827,16 @@ private:
                         {
                             if (input_tokens.is_smt()) {
                                 const auto & chunk = input_tokens.find_smt_chunk(slot.prompt.n_tokens());
+                                // accumulate encoder and prefill timing
+                                if (chunk.type == server_smt_media_type::audio) {
+                                    slot.t_audio_encode_ms  += chunk.t_encode_ms;
+                                    slot.t_audio_prefill_ms += t_prefill_ms;
+                                    slot.n_audio_tokens     += chunk.n_tokens;
+                                } else {
+                                    slot.t_vision_encode_ms  += chunk.t_encode_ms;
+                                    slot.t_vision_prefill_ms += t_prefill_ms;
+                                    slot.n_vision_tokens     += chunk.n_tokens;
+                                }
                                 slot.prompt.tokens.push_back(chunk); // copy
                             } else {
                                 const auto & chunk = input_tokens.find_chunk(slot.prompt.n_tokens());

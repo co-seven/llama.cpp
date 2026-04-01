@@ -522,7 +522,9 @@ server_smt_image_chunk server_smt_vision_encode_image_bin(
     server_smt_image_chunk out;
     out.type = server_smt_media_type::image;
     try {
+        const int64_t t0 = ggml_time_us();
         out.embd = ctx->smt_vision->encode_image(tmp_file);
+        out.t_encode_ms = (ggml_time_us() - t0) / 1e3;
         std::remove(tmp_file.c_str());
     } catch (...) {
         std::remove(tmp_file.c_str());
@@ -565,7 +567,9 @@ server_smt_image_chunk server_smt_vision_encode_media_bin(
         server_smt_image_chunk out;
         out.type = server_smt_media_type::audio;
         try {
+            const int64_t t0 = ggml_time_us();
             out.embd = ctx->smt_audio->encode_audio(tmp_file);
+            out.t_encode_ms = (ggml_time_us() - t0) / 1e3;
             std::remove(tmp_file.c_str());
         } catch (...) {
             std::remove(tmp_file.c_str());
