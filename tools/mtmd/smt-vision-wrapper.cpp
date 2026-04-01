@@ -57,8 +57,8 @@ static std::string trim_ascii(std::string value) {
 }
 
 static std::string extract_string_value(const std::string & text, const std::string & key) {
-    const std::string marker = "\"" + key + "\"";
-    const size_t key_pos = text.find(marker);
+    const std::string marker  = "\"" + key + "\"";
+    const size_t      key_pos = text.find(marker);
     if (key_pos == std::string::npos) {
         return {};
     }
@@ -82,8 +82,8 @@ static std::string extract_string_value(const std::string & text, const std::str
 }
 
 static int64_t extract_int64_value(const std::string & text, const std::string & key, int64_t default_value) {
-    const std::string marker = "\"" + key + "\"";
-    const size_t key_pos = text.find(marker);
+    const std::string marker  = "\"" + key + "\"";
+    const size_t      key_pos = text.find(marker);
     if (key_pos == std::string::npos) {
         return default_value;
     }
@@ -120,20 +120,20 @@ static int64_t extract_int64_value(const std::string & text, const std::string &
 static std::vector<std::string> extract_string_array(const std::string & text, const std::string & key) {
     std::vector<std::string> values;
 
-    const std::string marker = "\"" + key + "\"";
-    const size_t key_pos = text.find(marker);
+    const std::string marker  = "\"" + key + "\"";
+    const size_t      key_pos = text.find(marker);
     if (key_pos == std::string::npos) {
         return values;
     }
 
     const size_t bracket_start = text.find('[', key_pos + marker.size());
-    const size_t bracket_end = text.find(']', bracket_start == std::string::npos ? key_pos : bracket_start + 1);
+    const size_t bracket_end   = text.find(']', bracket_start == std::string::npos ? key_pos : bracket_start + 1);
     if (bracket_start == std::string::npos || bracket_end == std::string::npos || bracket_end <= bracket_start) {
         return values;
     }
 
     std::string content = text.substr(bracket_start + 1, bracket_end - bracket_start - 1);
-    size_t pos = 0;
+    size_t      pos     = 0;
     while (pos < content.size()) {
         const size_t first_quote = content.find('"', pos);
         if (first_quote == std::string::npos) {
@@ -161,9 +161,17 @@ static std::string normalize_path(const std::string & base_dir, const std::strin
     return base_dir + "/" + trimmed;
 }
 
+static std::string canonicalize_vision_architecture(std::string arch) {
+    const std::string trimmed = trim_ascii(arch);
+    if (trimmed == "Qwen3_5ForConditionalGeneration") {
+        return "Qwen3VL";
+    }
+    return trimmed;
+}
+
 static bool load_smt_vision_config(const std::string & config_dir, smt_vision_config & config) {
     const std::string config_path = config_dir + "/config.json";
-    const std::string content = read_file_to_string(config_path);
+    const std::string content     = read_file_to_string(config_path);
     if (content.empty()) {
         std::cerr << "Error: Failed to read config file: " << config_path << "\n";
         return false;
@@ -174,7 +182,7 @@ static bool load_smt_vision_config(const std::string & config_dir, smt_vision_co
         return false;
     }
     const size_t vision_block_start = content.find('{', vision_start);
-    const size_t vision_block_end = find_closing_brace(content, vision_block_start);
+    const size_t vision_block_end   = find_closing_brace(content, vision_block_start);
     if (vision_block_start == std::string::npos || vision_block_end == std::string::npos) {
         std::cerr << "Error: Invalid 'vision_model' block.\n";
         return false;
@@ -187,7 +195,7 @@ static bool load_smt_vision_config(const std::string & config_dir, smt_vision_co
         return false;
     }
     const size_t text_block_start = content.find('{', text_start);
-    const size_t text_block_end = find_closing_brace(content, text_block_start);
+    const size_t text_block_end   = find_closing_brace(content, text_block_start);
     if (text_block_start == std::string::npos || text_block_end == std::string::npos) {
         std::cerr << "Error: Invalid 'text_model' block.\n";
         return false;
@@ -195,8 +203,8 @@ static bool load_smt_vision_config(const std::string & config_dir, smt_vision_co
     const std::string text_block = content.substr(text_block_start, text_block_end - text_block_start + 1);
 
     config.vision_model_path = normalize_path(config_dir, extract_string_value(vision_block, "model_path"));
-    config.hidden_size = extract_int64_value(text_block, "hidden_size", 0);
-    config.architectures = extract_string_array(content, "architectures");
+    config.hidden_size       = extract_int64_value(text_block, "hidden_size", 0);
+    config.architectures     = extract_string_array(content, "architectures");
 
     if (config.vision_model_path.empty()) {
         std::cerr << "Error: Missing required key 'vision_model.model_path'.\n";
@@ -214,10 +222,10 @@ static bool load_smt_vision_config(const std::string & config_dir, smt_vision_co
     return true;
 }
 
-} // namespace
+}  // namespace
 
 struct smt_vision_context::impl {
-    smt_vision_config                                             config;
+    smt_vision_config                                              config;
     std::unique_ptr<onnxruntime::spacemit::SpineVisionModelEngine> vision_engine;
     std::string                                                    arch_name;
 };

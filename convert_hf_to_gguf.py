@@ -1250,15 +1250,46 @@ class TextModel(ModelBase):
 
         return seems_special
 
+    def load_hf_tokenizer(self, *, trust_remote_code: bool = False):
+        from transformers import AutoTokenizer
+
+        try:
+            return AutoTokenizer.from_pretrained(self.dir_model, trust_remote_code=trust_remote_code)
+        except ValueError as exc:
+            tokenizer_config_path = self.dir_model / "tokenizer_config.json"
+            tokenizer_class = None
+
+            if tokenizer_config_path.is_file():
+                with open(tokenizer_config_path, encoding="utf-8") as f:
+                    tokenizer_class = json.load(f).get("tokenizer_class")
+
+            if tokenizer_class != "TokenizersBackend":
+                raise
+
+            logger.warning(
+                "AutoTokenizer failed for %s with tokenizer_class=%s; "
+                "falling back to AutoProcessor.tokenizer",
+                self.dir_model,
+                tokenizer_class,
+            )
+
+            from transformers import AutoProcessor
+
+            processor = AutoProcessor.from_pretrained(self.dir_model, trust_remote_code=True)
+            tokenizer = getattr(processor, "tokenizer", None)
+            if tokenizer is None:
+                raise ValueError("AutoProcessor fallback did not provide a tokenizer") from exc
+
+            return tokenizer
+
     # used for GPT-2 BPE and WordPiece vocabs
     def get_vocab_base(self) -> tuple[list[str], list[int], str]:
         tokens: list[str] = []
         toktypes: list[int] = []
 
-        from transformers import AutoTokenizer
-        tokenizer = AutoTokenizer.from_pretrained(self.dir_model)
-        vocab_size = self.hparams.get("vocab_size", len(tokenizer.vocab))  # ty: ignore[unresolved-attribute]
-        assert max(tokenizer.vocab.values()) < vocab_size  # ty: ignore[unresolved-attribute]
+        tokenizer = self.load_hf_tokenizer()
+        vocab_size = self.hparams.get("vocab_size", len(tokenizer.vocab))
+        assert max(tokenizer.vocab.values()) < vocab_size
 
         tokpre = self.get_vocab_base_pre(tokenizer)
 
