@@ -243,7 +243,7 @@ std::unique_ptr<smt_vision_context> smt_vision_context::create(const std::string
     }
 
     if (!d.config.architectures.empty()) {
-        d.arch_name = d.config.architectures[0];
+        d.arch_name = canonicalize_vision_architecture(d.config.architectures[0]);
     }
 
     // 2. Initialize ORT API
