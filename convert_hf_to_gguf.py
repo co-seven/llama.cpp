@@ -1251,7 +1251,7 @@ class TextModel(ModelBase):
         return seems_special
 
     def load_hf_tokenizer(self, *, trust_remote_code: bool = False):
-        from transformers import AutoTokenizer
+        from transformers import AutoTokenizer, PreTrainedTokenizerFast
 
         try:
             return AutoTokenizer.from_pretrained(self.dir_model, trust_remote_code=trust_remote_code)
@@ -1265,6 +1265,29 @@ class TextModel(ModelBase):
 
             if tokenizer_class != "TokenizersBackend":
                 raise
+
+            tokenizer_json_path = self.dir_model / "tokenizer.json"
+            tokenizer_config = {}
+            if tokenizer_config_path.is_file():
+                with open(tokenizer_config_path, encoding="utf-8") as f:
+                    tokenizer_config = json.load(f)
+
+            if tokenizer_json_path.is_file():
+                logger.warning(
+                    "AutoTokenizer failed for %s with tokenizer_class=%s; "
+                    "falling back to tokenizer.json",
+                    self.dir_model,
+                    tokenizer_class,
+                )
+                return PreTrainedTokenizerFast(
+                    tokenizer_file=str(tokenizer_json_path),
+                    bos_token=tokenizer_config.get("bos_token"),
+                    eos_token=tokenizer_config.get("eos_token"),
+                    unk_token=tokenizer_config.get("unk_token"),
+                    pad_token=tokenizer_config.get("pad_token"),
+                    clean_up_tokenization_spaces=tokenizer_config.get("clean_up_tokenization_spaces", False),
+                    split_special_tokens=tokenizer_config.get("split_special_tokens", False),
+                )
 
             logger.warning(
                 "AutoTokenizer failed for %s with tokenizer_class=%s; "
