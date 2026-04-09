@@ -14,7 +14,7 @@ struct smt_vision_context {
     ~smt_vision_context();
 
     // Initialize from SMT config directory (containing config.json)
-    static std::unique_ptr<smt_vision_context> create(const std::string & config_dir);
+    static std::unique_ptr<smt_vision_context> create(const std::string & config_dir, bool warmup = true);
 
     // Encode a preprocessed image binary file using ONNX vision engine
     // Returns image embedding vector (n_tokens * hidden_size floats)

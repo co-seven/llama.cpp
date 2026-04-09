@@ -6,9 +6,19 @@
 #include "spine_vision_engine.h"
 
 #include <cctype>
+#include <cstdio>
 #include <fstream>
 #include <iostream>
+#include <limits>
 #include <stdexcept>
+
+#if defined(_WIN32)
+#include <io.h>
+#include <windows.h>
+#else
+#include <fcntl.h>
+#include <unistd.h>
+#endif
 
 namespace onnxruntime {
 const OrtApi * g_ort = NULL;
@@ -240,9 +250,113 @@ struct smt_vision_context::impl {
     std::string                                                    arch_name;
 };
 
+namespace {
+
+static size_t get_static_input_tensor_elements(Ort::Session & session) {
+    auto type_info = session.GetInputTypeInfo(0);
+    auto tensor_info = type_info.GetTensorTypeAndShapeInfo();
+
+    if (tensor_info.GetElementType() != ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT) {
+        throw std::runtime_error("SMT vision warmup expects float32 input tensor");
+    }
+
+    const std::vector<int64_t> input_shape = tensor_info.GetShape();
+    size_t input_size = 1;
+    for (const int64_t dim : input_shape) {
+        if (dim <= 0) {
+            throw std::runtime_error("SMT vision warmup requires a static positive input shape");
+        }
+        if (input_size > std::numeric_limits<size_t>::max() / static_cast<size_t>(dim)) {
+            throw std::runtime_error("SMT vision warmup input tensor is too large");
+        }
+        input_size *= static_cast<size_t>(dim);
+    }
+
+    return input_size;
+}
+
+static std::string write_zero_tensor_file(size_t n_floats) {
+    const std::vector<float> zeros(n_floats, 0.0f);
+
+#if defined(_WIN32)
+    char temp_path[MAX_PATH] = {0};
+    char temp_file[MAX_PATH] = {0};
+
+    if (GetTempPathA(MAX_PATH, temp_path) == 0) {
+        throw std::runtime_error("failed to get temp path for SMT vision warmup");
+    }
+    if (GetTempFileNameA(temp_path, "lsw", 0, temp_file) == 0) {
+        throw std::runtime_error("failed to create temp file for SMT vision warmup");
+    }
+
+    std::ofstream file(temp_file, std::ios::binary);
+    if (!file.is_open()) {
+        std::remove(temp_file);
+        throw std::runtime_error("failed to open temp file for SMT vision warmup");
+    }
+    file.write(reinterpret_cast<const char *>(zeros.data()), static_cast<std::streamsize>(zeros.size() * sizeof(float)));
+    if (!file) {
+        file.close();
+        std::remove(temp_file);
+        throw std::runtime_error("failed to write temp file for SMT vision warmup");
+    }
+    file.close();
+    return std::string(temp_file);
+#else
+    char tmpl[] = "/tmp/llama-smt-vision-warmup-XXXXXX";
+    const int fd = mkstemp(tmpl);
+    if (fd < 0) {
+        throw std::runtime_error("failed to create temp file for SMT vision warmup");
+    }
+
+    const char * ptr = reinterpret_cast<const char *>(zeros.data());
+    size_t bytes_left = zeros.size() * sizeof(float);
+    while (bytes_left > 0) {
+        const ssize_t written = write(fd, ptr, bytes_left);
+        if (written <= 0) {
+            close(fd);
+            std::remove(tmpl);
+            throw std::runtime_error("failed to write temp file for SMT vision warmup");
+        }
+        ptr += written;
+        bytes_left -= static_cast<size_t>(written);
+    }
+
+    close(fd);
+    return std::string(tmpl);
+#endif
+}
+
+static void warmup_vision_engine(
+        onnxruntime::spacemit::SpineVisionModelEngine & vision_engine,
+        Ort::Session & session,
+        const std::string & arch_name) {
+    const size_t input_elements = get_static_input_tensor_elements(session);
+    const std::string temp_path = write_zero_tensor_file(input_elements);
+
+    try {
+        std::cerr << "[SMT][vision] warmup ONNX session";
+        if (!arch_name.empty()) {
+            std::cerr << " for " << arch_name;
+        }
+        std::cerr << "\n";
+
+        std::string path_copy = temp_path;
+        Ort::Value & input_tensor = vision_engine.SetInputTensor(path_copy);
+        (void) vision_engine.RunSession(input_tensor);
+    } catch (...) {
+        std::remove(temp_path.c_str());
+        throw;
+    }
+
+    std::remove(temp_path.c_str());
+}
+
+}  // namespace
+
 smt_vision_context::~smt_vision_context() = default;
 
-std::unique_ptr<smt_vision_context> smt_vision_context::create(const std::string & config_dir) {
+std::unique_ptr<smt_vision_context> smt_vision_context::create(const std::string & config_dir, bool warmup) {
     auto ctx    = std::unique_ptr<smt_vision_context>(new smt_vision_context());
     ctx->pimpl_ = std::make_unique<impl>();
     auto & d    = *ctx->pimpl_;
@@ -261,7 +375,10 @@ std::unique_ptr<smt_vision_context> smt_vision_context::create(const std::string
 
     // 3. Create vision engine and session
     d.vision_engine = std::make_unique<onnxruntime::spacemit::SpineVisionModelEngine>(d.config.vision_model_path);
-    d.vision_engine->CreateVisionModelSession();
+    Ort::Session & vision_session = d.vision_engine->CreateVisionModelSession();
+    if (warmup) {
+        warmup_vision_engine(*d.vision_engine, vision_session, d.arch_name);
+    }
 
     return ctx;
 }

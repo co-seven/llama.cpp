@@ -431,13 +431,14 @@ static int decode_embd(
 
 server_smt_vision_context * server_smt_vision_init(
         llama_context * lctx,
-        const std::string & config_dir) {
+        const std::string & config_dir,
+        bool warmup) {
 #if defined(LLAMA_SERVER_SMT_VISION)
     auto ctx = std::make_unique<server_smt_vision_context>();
     std::string primary_architecture;
 
     try {
-        ctx->smt_vision = smt_vision_context::create(config_dir);
+        ctx->smt_vision = smt_vision_context::create(config_dir, warmup);
         ctx->hidden_size = (int32_t) ctx->smt_vision->hidden_size();
         primary_architecture = ctx->smt_vision->architecture();
         auto boundaries = resolve_image_boundary_tokens(lctx, primary_architecture);
@@ -473,6 +474,7 @@ server_smt_vision_context * server_smt_vision_init(
 #else
     GGML_UNUSED(lctx);
     GGML_UNUSED(config_dir);
+    GGML_UNUSED(warmup);
     throw std::runtime_error("SMT media backend is not compiled. Rebuild with LLAMA_SERVER_SMT_VISION=ON.");
 #endif
 }

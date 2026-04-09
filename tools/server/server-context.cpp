@@ -911,7 +911,7 @@ private:
                 return false;
             }
             try {
-                smt_ctx = server_smt_vision_init(ctx, smt_config_dir);
+                smt_ctx = server_smt_vision_init(ctx, smt_config_dir, params_base.warmup);
             } catch (const std::exception & e) {
                 SRV_ERR("failed to load SMT backend from '%s': %s\n", smt_config_dir.c_str(), e.what());
                 return false;

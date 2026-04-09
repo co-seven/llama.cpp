@@ -30,7 +30,8 @@ struct server_smt_vision_context;
 #if defined(LLAMA_SERVER_SMT_VISION)
 server_smt_vision_context * server_smt_vision_init(
         llama_context * lctx,
-        const std::string & config_dir);
+        const std::string & config_dir,
+        bool warmup = true);
 
 void server_smt_vision_free(server_smt_vision_context * ctx);
 
@@ -56,7 +57,8 @@ int32_t server_smt_vision_decode_chunk(
 #else
 inline server_smt_vision_context * server_smt_vision_init(
         llama_context * /* lctx */,
-        const std::string & /* config_dir */) {
+        const std::string & /* config_dir */,
+        bool /* warmup */ = true) {
     throw std::runtime_error("SMT media backend is not compiled");
 }
 
