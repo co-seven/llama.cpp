@@ -32,6 +32,8 @@ struct smt_vision_config {
     int64_t                  hidden_size = 0;
     int32_t                  input_width = 0;
     int32_t                  input_height = 0;
+    int32_t                  intra_thread_num = 4;
+    int32_t                  inter_thread_num = 1;
 };
 
 static std::string read_file_to_string(const std::string & path) {
@@ -220,6 +222,12 @@ static bool load_smt_vision_config(const std::string & config_dir, smt_vision_co
     const int64_t input_size = extract_int64_value(vision_block, "input_size", 0);
     config.input_width       = (int32_t) extract_int64_value(vision_block, "input_width", input_size);
     config.input_height      = (int32_t) extract_int64_value(vision_block, "input_height", input_size);
+    config.intra_thread_num  = (int32_t) extract_int64_value(vision_block, "spacemit_ep_intra_thread_num", config.intra_thread_num);
+    config.inter_thread_num  = (int32_t) extract_int64_value(vision_block, "spacemit_ep_inter_thread_num", config.inter_thread_num);
+
+    // 从顶层配置读取线程数（如果 vision_model 块中没有设置）
+    config.intra_thread_num  = (int32_t) extract_int64_value(content, "spacemit_ep_intra_thread_num", config.intra_thread_num);
+    config.inter_thread_num  = (int32_t) extract_int64_value(content, "spacemit_ep_inter_thread_num", config.inter_thread_num);
 
     if (config.vision_model_path.empty()) {
         std::cerr << "Error: Missing required key 'vision_model.model_path'.\n";
@@ -374,11 +382,16 @@ std::unique_ptr<smt_vision_context> smt_vision_context::create(const std::string
     onnxruntime::g_ort = OrtGetApiBase()->GetApi(ORT_API_VERSION);
 
     // 3. Create vision engine and session
-    d.vision_engine = std::make_unique<onnxruntime::spacemit::SpineVisionModelEngine>(d.config.vision_model_path);
+    d.vision_engine = std::make_unique<onnxruntime::spacemit::SpineVisionModelEngine>(
+        d.config.vision_model_path, d.config.intra_thread_num, d.config.inter_thread_num);
     Ort::Session & vision_session = d.vision_engine->CreateVisionModelSession();
     if (warmup) {
         warmup_vision_engine(*d.vision_engine, vision_session, d.arch_name);
     }
+
+    std::cerr << "[SMT][vision] Spacemit EP enabled"
+              << " (SPACEMIT_EP_INTRA_THREAD_NUM=" << d.config.intra_thread_num
+              << ", SPACEMIT_EP_INTER_THREAD_NUM=" << d.config.inter_thread_num << ")\n";
 
     return ctx;
 }

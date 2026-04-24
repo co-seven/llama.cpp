@@ -45,6 +45,8 @@ struct smt_audio_config {
     int32_t                  n_fft        = 400;
     int32_t                  window_len   = 400;
     int32_t                  hop_len      = 160;
+    int32_t                  intra_thread_num = 4;
+    int32_t                  inter_thread_num = 1;
 };
 
 static std::string read_file_to_string(const std::string & path) {
@@ -220,6 +222,8 @@ static bool parse_audio_config_block(const std::string & config_dir,
     config.n_fft = (int32_t) extract_int64_value(audio_block, "n_fft", config.n_fft);
     config.window_len = (int32_t) extract_int64_value(audio_block, "window_len", config.window_len);
     config.hop_len = (int32_t) extract_int64_value(audio_block, "hop_len", config.hop_len);
+    config.intra_thread_num = (int32_t) extract_int64_value(audio_block, "spacemit_ep_intra_thread_num", config.intra_thread_num);
+    config.inter_thread_num = (int32_t) extract_int64_value(audio_block, "spacemit_ep_inter_thread_num", config.inter_thread_num);
     config.architectures = extract_string_array(content, "architectures");
 
     return !config.frontend_model_path.empty() && !config.backend_model_path.empty();
@@ -289,6 +293,9 @@ static bool load_smt_audio_config(const std::string & config_dir, smt_audio_conf
                 }
             }
         }
+        // 从顶层配置读取线程数（如果 audio_model 块中没有设置）
+        config.intra_thread_num = (int32_t) extract_int64_value(config_content, "spacemit_ep_intra_thread_num", config.intra_thread_num);
+        config.inter_thread_num = (int32_t) extract_int64_value(config_content, "spacemit_ep_inter_thread_num", config.inter_thread_num);
         if (!config.architectures.empty() && config.hidden_size > 0) {
             return true;
         }
@@ -381,16 +388,18 @@ static bool init_spacemit_execution_provider(
     return true;
 }
 
-static void append_optional_spacemit_ep(Ort::SessionOptions & session_options, const char * session_name) {
+static void append_optional_spacemit_ep(Ort::SessionOptions & session_options, const char * session_name, const smt_audio_config & config) {
     std::unordered_map<std::string, std::string> provider_options;
-    provider_options["SPACEMIT_EP_INTRA_THREAD_NUM"] = "4";
+    provider_options["SPACEMIT_EP_INTRA_THREAD_NUM"] = std::to_string(config.intra_thread_num);
+    provider_options["SPACEMIT_EP_INTER_THREAD_NUM"] = std::to_string(config.inter_thread_num);
     std::string error_message;
     if (!init_spacemit_execution_provider(session_options, provider_options, error_message)) {
         throw std::runtime_error(std::string("[SMT][audio] failed to initialize Spacemit EP for ") +
                                  session_name + ": " + error_message);
     }
     std::cerr << "[SMT][audio] Spacemit EP enabled for " << session_name
-              << " (SPACEMIT_EP_INTRA_THREAD_NUM=4)\n";
+              << " (SPACEMIT_EP_INTRA_THREAD_NUM=" << config.intra_thread_num
+              << ", SPACEMIT_EP_INTER_THREAD_NUM=" << config.inter_thread_num << ")\n";
 }
 
 static std::vector<const char *> make_name_ptrs(const std::vector<std::string> & names) {
@@ -477,8 +486,8 @@ std::unique_ptr<smt_audio_context> smt_audio_context::create(const std::string &
     d.frontend_options.SetInterOpNumThreads(1);
     d.backend_options.SetInterOpNumThreads(1);
 
-    append_optional_spacemit_ep(d.frontend_options, "frontend");
-    append_optional_spacemit_ep(d.backend_options, "backend");
+    append_optional_spacemit_ep(d.frontend_options, "frontend", d.config);
+    append_optional_spacemit_ep(d.backend_options, "backend", d.config);
 
     d.frontend_session = Ort::Session(d.env, d.config.frontend_model_path.c_str(), d.frontend_options);
     d.backend_session  = Ort::Session(d.env, d.config.backend_model_path.c_str(),  d.backend_options);
