@@ -13,11 +13,11 @@
 #include <stdexcept>
 
 #if defined(_WIN32)
-#include <io.h>
-#include <windows.h>
+#    include <io.h>
+#    include <windows.h>
 #else
-#include <fcntl.h>
-#include <unistd.h>
+#    include <fcntl.h>
+#    include <unistd.h>
 #endif
 
 namespace onnxruntime {
@@ -29,9 +29,9 @@ namespace {
 struct smt_vision_config {
     std::vector<std::string> architectures;
     std::string              vision_model_path;
-    int64_t                  hidden_size = 0;
-    int32_t                  input_width = 0;
-    int32_t                  input_height = 0;
+    int64_t                  hidden_size      = 0;
+    int32_t                  input_width      = 0;
+    int32_t                  input_height     = 0;
     int32_t                  intra_thread_num = 4;
     int32_t                  inter_thread_num = 1;
 };
@@ -222,12 +222,16 @@ static bool load_smt_vision_config(const std::string & config_dir, smt_vision_co
     const int64_t input_size = extract_int64_value(vision_block, "input_size", 0);
     config.input_width       = (int32_t) extract_int64_value(vision_block, "input_width", input_size);
     config.input_height      = (int32_t) extract_int64_value(vision_block, "input_height", input_size);
-    config.intra_thread_num  = (int32_t) extract_int64_value(vision_block, "spacemit_ep_intra_thread_num", config.intra_thread_num);
-    config.inter_thread_num  = (int32_t) extract_int64_value(vision_block, "spacemit_ep_inter_thread_num", config.inter_thread_num);
+    config.intra_thread_num =
+        (int32_t) extract_int64_value(vision_block, "spacemit_ep_intra_thread_num", config.intra_thread_num);
+    config.inter_thread_num =
+        (int32_t) extract_int64_value(vision_block, "spacemit_ep_inter_thread_num", config.inter_thread_num);
 
     // 从顶层配置读取线程数（如果 vision_model 块中没有设置）
-    config.intra_thread_num  = (int32_t) extract_int64_value(content, "spacemit_ep_intra_thread_num", config.intra_thread_num);
-    config.inter_thread_num  = (int32_t) extract_int64_value(content, "spacemit_ep_inter_thread_num", config.inter_thread_num);
+    config.intra_thread_num =
+        (int32_t) extract_int64_value(content, "spacemit_ep_intra_thread_num", config.intra_thread_num);
+    config.inter_thread_num =
+        (int32_t) extract_int64_value(content, "spacemit_ep_inter_thread_num", config.inter_thread_num);
 
     if (config.vision_model_path.empty()) {
         std::cerr << "Error: Missing required key 'vision_model.model_path'.\n";
@@ -261,7 +265,7 @@ struct smt_vision_context::impl {
 namespace {
 
 static size_t get_static_input_tensor_elements(Ort::Session & session) {
-    auto type_info = session.GetInputTypeInfo(0);
+    auto type_info   = session.GetInputTypeInfo(0);
     auto tensor_info = type_info.GetTensorTypeAndShapeInfo();
 
     if (tensor_info.GetElementType() != ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT) {
@@ -269,7 +273,7 @@ static size_t get_static_input_tensor_elements(Ort::Session & session) {
     }
 
     const std::vector<int64_t> input_shape = tensor_info.GetShape();
-    size_t input_size = 1;
+    size_t                     input_size  = 1;
     for (const int64_t dim : input_shape) {
         if (dim <= 0) {
             throw std::runtime_error("SMT vision warmup requires a static positive input shape");
@@ -287,8 +291,8 @@ static std::string write_zero_tensor_file(size_t n_floats) {
     const std::vector<float> zeros(n_floats, 0.0f);
 
 #if defined(_WIN32)
-    char temp_path[MAX_PATH] = {0};
-    char temp_file[MAX_PATH] = {0};
+    char temp_path[MAX_PATH] = { 0 };
+    char temp_file[MAX_PATH] = { 0 };
 
     if (GetTempPathA(MAX_PATH, temp_path) == 0) {
         throw std::runtime_error("failed to get temp path for SMT vision warmup");
@@ -302,7 +306,8 @@ static std::string write_zero_tensor_file(size_t n_floats) {
         std::remove(temp_file);
         throw std::runtime_error("failed to open temp file for SMT vision warmup");
     }
-    file.write(reinterpret_cast<const char *>(zeros.data()), static_cast<std::streamsize>(zeros.size() * sizeof(float)));
+    file.write(reinterpret_cast<const char *>(zeros.data()),
+               static_cast<std::streamsize>(zeros.size() * sizeof(float)));
     if (!file) {
         file.close();
         std::remove(temp_file);
@@ -311,14 +316,14 @@ static std::string write_zero_tensor_file(size_t n_floats) {
     file.close();
     return std::string(temp_file);
 #else
-    char tmpl[] = "/tmp/llama-smt-vision-warmup-XXXXXX";
-    const int fd = mkstemp(tmpl);
+    char      tmpl[] = "/tmp/llama-smt-vision-warmup-XXXXXX";
+    const int fd     = mkstemp(tmpl);
     if (fd < 0) {
         throw std::runtime_error("failed to create temp file for SMT vision warmup");
     }
 
-    const char * ptr = reinterpret_cast<const char *>(zeros.data());
-    size_t bytes_left = zeros.size() * sizeof(float);
+    const char * ptr        = reinterpret_cast<const char *>(zeros.data());
+    size_t       bytes_left = zeros.size() * sizeof(float);
     while (bytes_left > 0) {
         const ssize_t written = write(fd, ptr, bytes_left);
         if (written <= 0) {
@@ -335,12 +340,11 @@ static std::string write_zero_tensor_file(size_t n_floats) {
 #endif
 }
 
-static void warmup_vision_engine(
-        onnxruntime::spacemit::SpineVisionModelEngine & vision_engine,
-        Ort::Session & session,
-        const std::string & arch_name) {
-    const size_t input_elements = get_static_input_tensor_elements(session);
-    const std::string temp_path = write_zero_tensor_file(input_elements);
+static void warmup_vision_engine(onnxruntime::spacemit::SpineVisionModelEngine & vision_engine,
+                                 Ort::Session &                                  session,
+                                 const std::string &                             arch_name) {
+    const size_t      input_elements = get_static_input_tensor_elements(session);
+    const std::string temp_path      = write_zero_tensor_file(input_elements);
 
     try {
         std::cerr << "[SMT][vision] warmup ONNX session";
@@ -349,7 +353,7 @@ static void warmup_vision_engine(
         }
         std::cerr << "\n";
 
-        std::string path_copy = temp_path;
+        std::string  path_copy    = temp_path;
         Ort::Value & input_tensor = vision_engine.SetInputTensor(path_copy);
         (void) vision_engine.RunSession(input_tensor);
     } catch (...) {
@@ -383,7 +387,7 @@ std::unique_ptr<smt_vision_context> smt_vision_context::create(const std::string
 
     // 3. Create vision engine and session
     d.vision_engine = std::make_unique<onnxruntime::spacemit::SpineVisionModelEngine>(
-        d.config.vision_model_path, d.config.intra_thread_num, d.config.inter_thread_num);
+        d.config.vision_model_path, d.arch_name, d.config.intra_thread_num, d.config.inter_thread_num);
     Ort::Session & vision_session = d.vision_engine->CreateVisionModelSession();
     if (warmup) {
         warmup_vision_engine(*d.vision_engine, vision_session, d.arch_name);

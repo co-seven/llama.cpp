@@ -2,17 +2,17 @@
 
 #include "ggml-profile.h"
 #include "mtmd-audio.h"
-
 #include "onnxruntime_cxx_api.h"
 #include "onnxruntime_session_options_config_keys.h"
+
+#include <dirent.h>
+#include <dlfcn.h>
 
 #include <algorithm>
 #include <array>
 #include <cctype>
 #include <cstdio>
 #include <cstring>
-#include <dirent.h>
-#include <dlfcn.h>
 #include <fstream>
 #include <iostream>
 #include <stdexcept>
@@ -38,13 +38,13 @@ struct smt_audio_config {
     std::vector<std::string> architectures;
     std::string              frontend_model_path;
     std::string              backend_model_path;
-    int64_t                  d_model      = 0;
-    int64_t                  hidden_size  = 0;
-    int32_t                  num_mel_bins = 128;
-    int32_t                  sample_rate  = 16000;
-    int32_t                  n_fft        = 400;
-    int32_t                  window_len   = 400;
-    int32_t                  hop_len      = 160;
+    int64_t                  d_model          = 0;
+    int64_t                  hidden_size      = 0;
+    int32_t                  num_mel_bins     = 128;
+    int32_t                  sample_rate      = 16000;
+    int32_t                  n_fft            = 400;
+    int32_t                  window_len       = 400;
+    int32_t                  hop_len          = 160;
     int32_t                  intra_thread_num = 4;
     int32_t                  inter_thread_num = 1;
 };
@@ -83,8 +83,8 @@ static std::string trim_ascii(std::string value) {
 }
 
 static std::string extract_string_value(const std::string & text, const std::string & key) {
-    const std::string marker = "\"" + key + "\"";
-    const size_t key_pos = text.find(marker);
+    const std::string marker  = "\"" + key + "\"";
+    const size_t      key_pos = text.find(marker);
     if (key_pos == std::string::npos) {
         return {};
     }
@@ -108,8 +108,8 @@ static std::string extract_string_value(const std::string & text, const std::str
 }
 
 static int64_t extract_int64_value(const std::string & text, const std::string & key, int64_t default_value) {
-    const std::string marker = "\"" + key + "\"";
-    const size_t key_pos = text.find(marker);
+    const std::string marker  = "\"" + key + "\"";
+    const size_t      key_pos = text.find(marker);
     if (key_pos == std::string::npos) {
         return default_value;
     }
@@ -146,20 +146,20 @@ static int64_t extract_int64_value(const std::string & text, const std::string &
 static std::vector<std::string> extract_string_array(const std::string & text, const std::string & key) {
     std::vector<std::string> values;
 
-    const std::string marker = "\"" + key + "\"";
-    const size_t key_pos = text.find(marker);
+    const std::string marker  = "\"" + key + "\"";
+    const size_t      key_pos = text.find(marker);
     if (key_pos == std::string::npos) {
         return values;
     }
 
     const size_t bracket_start = text.find('[', key_pos + marker.size());
-    const size_t bracket_end = text.find(']', bracket_start == std::string::npos ? key_pos : bracket_start + 1);
+    const size_t bracket_end   = text.find(']', bracket_start == std::string::npos ? key_pos : bracket_start + 1);
     if (bracket_start == std::string::npos || bracket_end == std::string::npos || bracket_end <= bracket_start) {
         return values;
     }
 
     std::string content = text.substr(bracket_start + 1, bracket_end - bracket_start - 1);
-    size_t pos = 0;
+    size_t      pos     = 0;
     while (pos < content.size()) {
         const size_t first_quote = content.find('"', pos);
         if (first_quote == std::string::npos) {
@@ -189,14 +189,14 @@ static std::string normalize_path(const std::string & base_dir, const std::strin
 
 static bool parse_audio_config_block(const std::string & config_dir,
                                      const std::string & content,
-                                     smt_audio_config & config) {
+                                     smt_audio_config &  config) {
     const size_t audio_start = content.find("\"audio_model\":");
     if (audio_start == std::string::npos) {
         return false;
     }
 
     const size_t audio_block_start = content.find('{', audio_start);
-    const size_t audio_block_end = find_closing_brace(content, audio_block_start);
+    const size_t audio_block_end   = find_closing_brace(content, audio_block_start);
     if (audio_block_start == std::string::npos || audio_block_end == std::string::npos) {
         std::cerr << "Error: Invalid 'audio_model' block.\n";
         return false;
@@ -212,18 +212,20 @@ static bool parse_audio_config_block(const std::string & config_dir,
         config.backend_model_path = normalize_path(config_dir, extract_string_value(audio_block, "backend_path"));
     }
 
-    config.d_model = extract_int64_value(audio_block, "d_model", config.d_model);
+    config.d_model     = extract_int64_value(audio_block, "d_model", config.d_model);
     config.hidden_size = extract_int64_value(audio_block, "hidden_size", config.hidden_size);
     if (config.hidden_size <= 0) {
         config.hidden_size = extract_int64_value(audio_block, "output_dim", config.hidden_size);
     }
     config.num_mel_bins = (int32_t) extract_int64_value(audio_block, "num_mel_bins", config.num_mel_bins);
-    config.sample_rate = (int32_t) extract_int64_value(audio_block, "sample_rate", config.sample_rate);
-    config.n_fft = (int32_t) extract_int64_value(audio_block, "n_fft", config.n_fft);
-    config.window_len = (int32_t) extract_int64_value(audio_block, "window_len", config.window_len);
-    config.hop_len = (int32_t) extract_int64_value(audio_block, "hop_len", config.hop_len);
-    config.intra_thread_num = (int32_t) extract_int64_value(audio_block, "spacemit_ep_intra_thread_num", config.intra_thread_num);
-    config.inter_thread_num = (int32_t) extract_int64_value(audio_block, "spacemit_ep_inter_thread_num", config.inter_thread_num);
+    config.sample_rate  = (int32_t) extract_int64_value(audio_block, "sample_rate", config.sample_rate);
+    config.n_fft        = (int32_t) extract_int64_value(audio_block, "n_fft", config.n_fft);
+    config.window_len   = (int32_t) extract_int64_value(audio_block, "window_len", config.window_len);
+    config.hop_len      = (int32_t) extract_int64_value(audio_block, "hop_len", config.hop_len);
+    config.intra_thread_num =
+        (int32_t) extract_int64_value(audio_block, "spacemit_ep_intra_thread_num", config.intra_thread_num);
+    config.inter_thread_num =
+        (int32_t) extract_int64_value(audio_block, "spacemit_ep_inter_thread_num", config.inter_thread_num);
     config.architectures = extract_string_array(content, "architectures");
 
     return !config.frontend_model_path.empty() && !config.backend_model_path.empty();
@@ -242,8 +244,7 @@ static std::string find_split_metadata_file(const std::string & config_dir) {
         }
         const std::string name = entry->d_name;
         if (name.size() >= strlen("-encoder-split-metadata.json") &&
-            name.compare(name.size() - strlen("-encoder-split-metadata.json"),
-                         strlen("-encoder-split-metadata.json"),
+            name.compare(name.size() - strlen("-encoder-split-metadata.json"), strlen("-encoder-split-metadata.json"),
                          "-encoder-split-metadata.json") == 0) {
             found = config_dir + "/" + name;
             break;
@@ -256,7 +257,7 @@ static std::string find_split_metadata_file(const std::string & config_dir) {
 
 static bool load_smt_audio_config_from_metadata(const std::string & config_dir,
                                                 const std::string & metadata_path,
-                                                smt_audio_config & config) {
+                                                smt_audio_config &  config) {
     const std::string content = read_file_to_string(metadata_path);
     if (content.empty()) {
         return false;
@@ -271,21 +272,19 @@ static bool load_smt_audio_config_from_metadata(const std::string & config_dir,
         config.architectures = { "Qwen3ASRForConditionalGeneration" };
     }
 
-    return !config.frontend_model_path.empty() &&
-           !config.backend_model_path.empty() &&
-           config.d_model > 0 &&
+    return !config.frontend_model_path.empty() && !config.backend_model_path.empty() && config.d_model > 0 &&
            config.hidden_size > 0;
 }
 
 static bool load_smt_audio_config(const std::string & config_dir, smt_audio_config & config) {
-    const std::string config_path = config_dir + "/config.json";
+    const std::string config_path    = config_dir + "/config.json";
     const std::string config_content = read_file_to_string(config_path);
     if (!config_content.empty() && parse_audio_config_block(config_dir, config_content, config)) {
         if (config.hidden_size <= 0) {
             const size_t text_start = config_content.find("\"text_model\":");
             if (text_start != std::string::npos) {
                 const size_t text_block_start = config_content.find('{', text_start);
-                const size_t text_block_end = find_closing_brace(config_content, text_block_start);
+                const size_t text_block_end   = find_closing_brace(config_content, text_block_start);
                 if (text_block_start != std::string::npos && text_block_end != std::string::npos) {
                     const std::string text_block =
                         config_content.substr(text_block_start, text_block_end - text_block_start + 1);
@@ -294,8 +293,10 @@ static bool load_smt_audio_config(const std::string & config_dir, smt_audio_conf
             }
         }
         // 从顶层配置读取线程数（如果 audio_model 块中没有设置）
-        config.intra_thread_num = (int32_t) extract_int64_value(config_content, "spacemit_ep_intra_thread_num", config.intra_thread_num);
-        config.inter_thread_num = (int32_t) extract_int64_value(config_content, "spacemit_ep_inter_thread_num", config.inter_thread_num);
+        config.intra_thread_num =
+            (int32_t) extract_int64_value(config_content, "spacemit_ep_intra_thread_num", config.intra_thread_num);
+        config.inter_thread_num =
+            (int32_t) extract_int64_value(config_content, "spacemit_ep_inter_thread_num", config.inter_thread_num);
         if (!config.architectures.empty() && config.hidden_size > 0) {
             return true;
         }
@@ -310,7 +311,7 @@ static bool load_smt_audio_config(const std::string & config_dir, smt_audio_conf
 }
 
 static int floor_div(int value, int divisor) {
-    int quotient = value / divisor;
+    int quotient  = value / divisor;
     int remainder = value % divisor;
     if (remainder != 0 && ((remainder > 0) != (divisor > 0))) {
         --quotient;
@@ -320,16 +321,15 @@ static int floor_div(int value, int divisor) {
 
 static int get_feat_extract_output_lengths(int input_lengths) {
     const int input_lengths_leave = input_lengths % 100;
-    const int feat_lengths = floor_div(input_lengths_leave - 1, 2) + 1;
-    const int output_lengths =
-        floor_div(floor_div(feat_lengths - 1, 2) + 1 - 1, 2) + 1 + (input_lengths / 100) * 13;
+    const int feat_lengths        = floor_div(input_lengths_leave - 1, 2) + 1;
+    const int output_lengths = floor_div(floor_div(feat_lengths - 1, 2) + 1 - 1, 2) + 1 + (input_lengths / 100) * 13;
     return output_lengths;
 }
 
 static bool decode_audio_file(const std::string & path, int target_sample_rate, std::vector<float> & pcmf32_mono) {
-    const int channels = 1;
+    const int         channels       = 1;
     ma_decoder_config decoder_config = ma_decoder_config_init(ma_format_f32, channels, target_sample_rate);
-    ma_decoder decoder;
+    ma_decoder        decoder;
 
     if (ma_decoder_init_file(path.c_str(), &decoder_config, &decoder) != MA_SUCCESS) {
         return false;
@@ -353,10 +353,9 @@ static bool decode_audio_file(const std::string & path, int target_sample_rate, 
     return !pcmf32_mono.empty();
 }
 
-static bool init_spacemit_execution_provider(
-        Ort::SessionOptions & options,
-        const std::unordered_map<std::string, std::string> & provider_options,
-        std::string & error_message) {
+static bool init_spacemit_execution_provider(Ort::SessionOptions &                                options,
+                                             const std::unordered_map<std::string, std::string> & provider_options,
+                                             std::string &                                        error_message) {
     std::vector<const char *> keys;
     std::vector<const char *> values;
     keys.reserve(provider_options.size());
@@ -372,7 +371,8 @@ static bool init_spacemit_execution_provider(
         return false;
     }
 
-    auto * ep_init = reinterpret_cast<OrtStatus * (*)(OrtSessionOptions *, const char * const *, const char * const *, size_t)>(
+    auto * ep_init =
+        reinterpret_cast<OrtStatus * (*) (OrtSessionOptions *, const char * const *, const char * const *, size_t)>(
             dlsym(handle, "OrtSessionOptionsSpaceMITEnvInit"));
     if (!ep_init) {
         error_message = std::string("failed to find OrtSessionOptionsSpaceMITEnvInit: ") + dlerror();
@@ -388,14 +388,16 @@ static bool init_spacemit_execution_provider(
     return true;
 }
 
-static void append_optional_spacemit_ep(Ort::SessionOptions & session_options, const char * session_name, const smt_audio_config & config) {
+static void append_optional_spacemit_ep(Ort::SessionOptions &    session_options,
+                                        const char *             session_name,
+                                        const smt_audio_config & config) {
     std::unordered_map<std::string, std::string> provider_options;
     provider_options["SPACEMIT_EP_INTRA_THREAD_NUM"] = std::to_string(config.intra_thread_num);
     provider_options["SPACEMIT_EP_INTER_THREAD_NUM"] = std::to_string(config.inter_thread_num);
     std::string error_message;
     if (!init_spacemit_execution_provider(session_options, provider_options, error_message)) {
-        throw std::runtime_error(std::string("[SMT][audio] failed to initialize Spacemit EP for ") +
-                                 session_name + ": " + error_message);
+        throw std::runtime_error(std::string("[SMT][audio] failed to initialize Spacemit EP for ") + session_name +
+                                 ": " + error_message);
     }
     std::cerr << "[SMT][audio] Spacemit EP enabled for " << session_name
               << " (SPACEMIT_EP_INTRA_THREAD_NUM=" << config.intra_thread_num
@@ -412,13 +414,13 @@ static std::vector<const char *> make_name_ptrs(const std::vector<std::string> &
 }
 
 static std::vector<std::string> get_io_names(Ort::Session & session, bool inputs) {
-    std::vector<std::string> names;
+    std::vector<std::string>         names;
     Ort::AllocatorWithDefaultOptions allocator;
-    const size_t count = inputs ? session.GetInputCount() : session.GetOutputCount();
+    const size_t                     count = inputs ? session.GetInputCount() : session.GetOutputCount();
     names.reserve(count);
     for (size_t i = 0; i < count; ++i) {
-        auto allocated = inputs ? session.GetInputNameAllocated(i, allocator)
-                                : session.GetOutputNameAllocated(i, allocator);
+        auto allocated =
+            inputs ? session.GetInputNameAllocated(i, allocator) : session.GetOutputNameAllocated(i, allocator);
         names.emplace_back(allocated.get());
     }
     return names;
@@ -430,23 +432,23 @@ static Ort::Value make_tensor_f32(const std::vector<int64_t> & shape, std::vecto
     return Ort::Value::CreateTensor<float>(memory_info, data.data(), data.size(), shape.data(), shape.size());
 }
 
-} // namespace
+}  // namespace
 
 struct smt_audio_context::impl {
-    smt_audio_config config;
-    Ort::Env         env{ORT_LOGGING_LEVEL_WARNING, "smt-audio"};
+    smt_audio_config    config;
+    Ort::Env            env{ ORT_LOGGING_LEVEL_WARNING, "smt-audio" };
     Ort::SessionOptions frontend_options;
     Ort::SessionOptions backend_options;
-    Ort::Session        frontend_session{nullptr};
-    Ort::Session        backend_session{nullptr};
+    Ort::Session        frontend_session{ nullptr };
+    Ort::Session        backend_session{ nullptr };
 
-    std::vector<std::string> frontend_input_names;
-    std::vector<std::string> frontend_output_names;
+    std::vector<std::string>  frontend_input_names;
+    std::vector<std::string>  frontend_output_names;
     std::vector<const char *> frontend_input_names_raw;
     std::vector<const char *> frontend_output_names_raw;
 
-    std::vector<std::string> backend_input_names;
-    std::vector<std::string> backend_output_names;
+    std::vector<std::string>  backend_input_names;
+    std::vector<std::string>  backend_output_names;
     std::vector<const char *> backend_input_names_raw;
     std::vector<const char *> backend_output_names_raw;
 
@@ -455,10 +457,10 @@ struct smt_audio_context::impl {
 
 smt_audio_context::~smt_audio_context() = default;
 
-std::unique_ptr<smt_audio_context> smt_audio_context::create(const std::string & config_dir) {
-    auto ctx = std::unique_ptr<smt_audio_context>(new smt_audio_context());
+std::unique_ptr<smt_audio_context> smt_audio_context::create(const std::string & config_dir, bool warmup) {
+    auto ctx    = std::unique_ptr<smt_audio_context>(new smt_audio_context());
     ctx->pimpl_ = std::make_unique<impl>();
-    auto & d = *ctx->pimpl_;
+    auto & d    = *ctx->pimpl_;
 
     if (!load_smt_audio_config(config_dir, d.config)) {
         throw std::runtime_error("Failed to load SMT audio config from: " + config_dir);
@@ -481,30 +483,78 @@ std::unique_ptr<smt_audio_context> smt_audio_context::create(const std::string &
 
     d.frontend_options.SetGraphOptimizationLevel(GraphOptimizationLevel::ORT_ENABLE_ALL);
     d.backend_options.SetGraphOptimizationLevel(GraphOptimizationLevel::ORT_ENABLE_ALL);
-    d.frontend_options.SetIntraOpNumThreads(4);
-    d.backend_options.SetIntraOpNumThreads(4);
-    d.frontend_options.SetInterOpNumThreads(1);
-    d.backend_options.SetInterOpNumThreads(1);
+    d.frontend_options.SetIntraOpNumThreads(d.config.intra_thread_num);
+    d.backend_options.SetIntraOpNumThreads(d.config.intra_thread_num);
+    d.frontend_options.SetInterOpNumThreads(d.config.inter_thread_num);
+    d.backend_options.SetInterOpNumThreads(d.config.inter_thread_num);
 
     append_optional_spacemit_ep(d.frontend_options, "frontend", d.config);
     append_optional_spacemit_ep(d.backend_options, "backend", d.config);
 
     d.frontend_session = Ort::Session(d.env, d.config.frontend_model_path.c_str(), d.frontend_options);
-    d.backend_session  = Ort::Session(d.env, d.config.backend_model_path.c_str(),  d.backend_options);
+    d.backend_session  = Ort::Session(d.env, d.config.backend_model_path.c_str(), d.backend_options);
 
-    d.frontend_input_names = get_io_names(d.frontend_session, true);
-    d.frontend_output_names = get_io_names(d.frontend_session, false);
-    d.frontend_input_names_raw = make_name_ptrs(d.frontend_input_names);
+    d.frontend_input_names      = get_io_names(d.frontend_session, true);
+    d.frontend_output_names     = get_io_names(d.frontend_session, false);
+    d.frontend_input_names_raw  = make_name_ptrs(d.frontend_input_names);
     d.frontend_output_names_raw = make_name_ptrs(d.frontend_output_names);
 
-    d.backend_input_names = get_io_names(d.backend_session, true);
-    d.backend_output_names = get_io_names(d.backend_session, false);
-    d.backend_input_names_raw = make_name_ptrs(d.backend_input_names);
+    d.backend_input_names      = get_io_names(d.backend_session, true);
+    d.backend_output_names     = get_io_names(d.backend_session, false);
+    d.backend_input_names_raw  = make_name_ptrs(d.backend_input_names);
     d.backend_output_names_raw = make_name_ptrs(d.backend_output_names);
 
     if (d.frontend_input_names_raw.size() != 1 || d.frontend_output_names_raw.size() != 1 ||
         d.backend_input_names_raw.size() != 2 || d.backend_output_names_raw.size() != 1) {
         throw std::runtime_error("Unexpected SMT audio ONNX IO signature");
+    }
+
+    if (warmup) {
+        std::cerr << "[SMT][audio] warmup ONNX sessions";
+        if (!d.arch_name.empty()) {
+            std::cerr << " for " << d.arch_name;
+        }
+        std::cerr << "\n";
+
+        const int chunk_frames = 100;
+        const int chunk_tokens = 13;
+        const int t_out        = chunk_tokens;
+
+        std::vector<float>         frontend_input_data((size_t) d.config.num_mel_bins * chunk_frames, 0.0f);
+        const std::vector<int64_t> frontend_input_shape = { 1, d.config.num_mel_bins, chunk_frames };
+        auto                       frontend_input       = make_tensor_f32(frontend_input_shape, frontend_input_data);
+
+        std::cerr << "[SMT][audio] warmup frontend ONNX session: " << d.config.frontend_model_path << "\n";
+        auto frontend_outputs = d.frontend_session.Run(Ort::RunOptions{ nullptr }, d.frontend_input_names_raw.data(),
+                                                       &frontend_input, 1, d.frontend_output_names_raw.data(), 1);
+
+        std::vector<float> hidden_states((size_t) t_out * (size_t) d.config.d_model, 0.0f);
+        if (frontend_outputs.empty()) {
+            throw std::runtime_error("SMT audio warmup frontend returned no outputs");
+        }
+        const auto frontend_output_info = frontend_outputs[0].GetTensorTypeAndShapeInfo();
+        if (frontend_output_info.GetElementType() != ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT) {
+            throw std::runtime_error("SMT audio warmup frontend output must be float32");
+        }
+        const int64_t frontend_output_elems = frontend_output_info.GetElementCount();
+        if (frontend_output_elems < 0 || (size_t) frontend_output_elems < hidden_states.size()) {
+            throw std::runtime_error("SMT audio warmup frontend output is smaller than expected");
+        }
+        const float * frontend_output = frontend_outputs[0].GetTensorData<float>();
+        std::memcpy(hidden_states.data(), frontend_output, hidden_states.size() * sizeof(float));
+
+        std::vector<float>         attention_mask((size_t) t_out * (size_t) t_out, 0.0f);
+        const std::vector<int64_t> backend_hidden_shape = { 1, t_out, d.config.d_model };
+        const std::vector<int64_t> backend_mask_shape   = { 1, 1, t_out, t_out };
+
+        auto                      hidden_tensor  = make_tensor_f32(backend_hidden_shape, hidden_states);
+        auto                      mask_tensor    = make_tensor_f32(backend_mask_shape, attention_mask);
+        std::array<Ort::Value, 2> backend_inputs = { std::move(hidden_tensor), std::move(mask_tensor) };
+
+        std::cerr << "[SMT][audio] warmup backend ONNX session: " << d.config.backend_model_path << "\n";
+        (void) d.backend_session.Run(Ort::RunOptions{ nullptr }, d.backend_input_names_raw.data(),
+                                     backend_inputs.data(), backend_inputs.size(), d.backend_output_names_raw.data(),
+                                     1);
     }
 
     return ctx;
@@ -527,19 +577,9 @@ std::vector<float> smt_audio_context::encode_audio(const std::string & audio_pat
 
     mtmd_audio_mel mel;
     ggml_trace_log_begin("compute_log_mel_spectrogram", "Audio", NULL);
-    if (!mtmd_audio_compute_log_mel_spectrogram(samples.data(),
-                                                samples.size(),
-                                                4,
-                                                d.config.num_mel_bins,
-                                                d.config.n_fft,
-                                                d.config.window_len,
-                                                d.config.hop_len,
-                                                d.config.sample_rate,
-                                                true,
-                                                0.0f,
-                                                false,
-                                                false,
-                                                mel)) {
+    if (!mtmd_audio_compute_log_mel_spectrogram(samples.data(), samples.size(), 4, d.config.num_mel_bins,
+                                                d.config.n_fft, d.config.window_len, d.config.hop_len,
+                                                d.config.sample_rate, true, 0.0f, false, false, mel)) {
         ggml_trace_log_end("compute_log_mel_spectrogram", "Audio", NULL);
         ggml_trace_log_end("encode_audio", "Audio", NULL);
         ggml_profile_flush_tls();
@@ -553,39 +593,34 @@ std::vector<float> smt_audio_context::encode_audio(const std::string & audio_pat
         throw std::runtime_error("invalid mel spectrogram shape");
     }
 
-    const int frames = mel.n_len;
-    const int chunk_frames = 100;
-    const int chunk_tokens = 13;
+    const int frames        = mel.n_len;
+    const int chunk_frames  = 100;
+    const int chunk_tokens  = 13;
     const int padded_frames = ((frames + chunk_frames - 1) / chunk_frames) * chunk_frames;
-    const int n_chunks = padded_frames / chunk_frames;
+    const int n_chunks      = padded_frames / chunk_frames;
 
-    std::vector<float> hidden_states((size_t) n_chunks * chunk_tokens * (size_t) d.config.d_model);
-    std::vector<float> chunk_input((size_t) d.config.num_mel_bins * chunk_frames, 0.0f);
-    const std::vector<int64_t> frontend_input_shape = {1, d.config.num_mel_bins, chunk_frames};
+    std::vector<float>         hidden_states((size_t) n_chunks * chunk_tokens * (size_t) d.config.d_model);
+    std::vector<float>         chunk_input((size_t) d.config.num_mel_bins * chunk_frames, 0.0f);
+    const std::vector<int64_t> frontend_input_shape = { 1, d.config.num_mel_bins, chunk_frames };
 
     ggml_trace_log_begin("frontend_session_run", "Audio", NULL);
     for (int chunk_idx = 0; chunk_idx < n_chunks; ++chunk_idx) {
         std::fill(chunk_input.begin(), chunk_input.end(), 0.0f);
         const int frame_offset = chunk_idx * chunk_frames;
-        const int copy_frames = std::min(chunk_frames, frames - frame_offset);
+        const int copy_frames  = std::min(chunk_frames, frames - frame_offset);
         if (copy_frames > 0) {
             for (int mel_idx = 0; mel_idx < mel.n_mel; ++mel_idx) {
                 const float * src = mel.data.data() + (size_t) mel_idx * mel.n_len + frame_offset;
-                float * dst = chunk_input.data() + (size_t) mel_idx * chunk_frames;
+                float *       dst = chunk_input.data() + (size_t) mel_idx * chunk_frames;
                 std::memcpy(dst, src, (size_t) copy_frames * sizeof(float));
             }
         }
 
-        auto frontend_input = make_tensor_f32(frontend_input_shape, chunk_input);
-        auto frontend_outputs = d.frontend_session.Run(Ort::RunOptions{nullptr},
-                                                       d.frontend_input_names_raw.data(),
-                                                       &frontend_input,
-                                                       1,
-                                                       d.frontend_output_names_raw.data(),
-                                                       1);
-        float * chunk_out = frontend_outputs[0].GetTensorMutableData<float>();
-        std::memcpy(hidden_states.data() + (size_t) chunk_idx * chunk_tokens * (size_t) d.config.d_model,
-                    chunk_out,
+        auto    frontend_input   = make_tensor_f32(frontend_input_shape, chunk_input);
+        auto    frontend_outputs = d.frontend_session.Run(Ort::RunOptions{ nullptr }, d.frontend_input_names_raw.data(),
+                                                          &frontend_input, 1, d.frontend_output_names_raw.data(), 1);
+        float * chunk_out        = frontend_outputs[0].GetTensorMutableData<float>();
+        std::memcpy(hidden_states.data() + (size_t) chunk_idx * chunk_tokens * (size_t) d.config.d_model, chunk_out,
                     (size_t) chunk_tokens * (size_t) d.config.d_model * sizeof(float));
     }
     ggml_trace_log_end("frontend_session_run", "Audio", NULL);
@@ -600,27 +635,22 @@ std::vector<float> smt_audio_context::encode_audio(const std::string & audio_pat
     hidden_states.resize((size_t) t_out * (size_t) d.config.d_model);
     std::vector<float> attention_mask((size_t) t_out * (size_t) t_out, 0.0f);
 
-    const std::vector<int64_t> backend_hidden_shape = {1, t_out, d.config.d_model};
-    const std::vector<int64_t> backend_mask_shape = {1, 1, t_out, t_out};
+    const std::vector<int64_t> backend_hidden_shape = { 1, t_out, d.config.d_model };
+    const std::vector<int64_t> backend_mask_shape   = { 1, 1, t_out, t_out };
 
-    auto hidden_tensor = make_tensor_f32(backend_hidden_shape, hidden_states);
-    auto mask_tensor = make_tensor_f32(backend_mask_shape, attention_mask);
+    auto                      hidden_tensor  = make_tensor_f32(backend_hidden_shape, hidden_states);
+    auto                      mask_tensor    = make_tensor_f32(backend_mask_shape, attention_mask);
     std::array<Ort::Value, 2> backend_inputs = { std::move(hidden_tensor), std::move(mask_tensor) };
 
     ggml_trace_log_begin("backend_session_run", "Audio", NULL);
-    auto backend_outputs = d.backend_session.Run(Ort::RunOptions{nullptr},
-                                                 d.backend_input_names_raw.data(),
-                                                 backend_inputs.data(),
-                                                 backend_inputs.size(),
-                                                 d.backend_output_names_raw.data(),
-                                                 1);
+    auto backend_outputs =
+        d.backend_session.Run(Ort::RunOptions{ nullptr }, d.backend_input_names_raw.data(), backend_inputs.data(),
+                              backend_inputs.size(), d.backend_output_names_raw.data(), 1);
     ggml_trace_log_end("backend_session_run", "Audio", NULL);
 
-    float * output = backend_outputs[0].GetTensorMutableData<float>();
+    float *            output = backend_outputs[0].GetTensorMutableData<float>();
     std::vector<float> audio_embd((size_t) t_out * (size_t) d.config.hidden_size);
-    std::memcpy(audio_embd.data(),
-                output,
-                audio_embd.size() * sizeof(float));
+    std::memcpy(audio_embd.data(), output, audio_embd.size() * sizeof(float));
 
     ggml_trace_log_end("encode_audio", "Audio", NULL);
     ggml_profile_flush_tls();
