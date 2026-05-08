@@ -35,18 +35,19 @@ extern const OrtApi * g_ort;
 namespace {
 
 struct smt_audio_config {
-    std::vector<std::string> architectures;
-    std::string              frontend_model_path;
-    std::string              backend_model_path;
-    int64_t                  d_model          = 0;
-    int64_t                  hidden_size      = 0;
-    int32_t                  num_mel_bins     = 128;
-    int32_t                  sample_rate      = 16000;
-    int32_t                  n_fft            = 400;
-    int32_t                  window_len       = 400;
-    int32_t                  hop_len          = 160;
-    int32_t                  intra_thread_num = 4;
-    int32_t                  inter_thread_num = 1;
+    std::vector<std::string>                     architectures;
+    std::string                                  frontend_model_path;
+    std::string                                  backend_model_path;
+    std::unordered_map<std::string, std::string> ep_config;
+    int64_t                                      d_model          = 0;
+    int64_t                                      hidden_size      = 0;
+    int32_t                                      num_mel_bins     = 128;
+    int32_t                                      sample_rate      = 16000;
+    int32_t                                      n_fft            = 400;
+    int32_t                                      window_len       = 400;
+    int32_t                                      hop_len          = 160;
+    int32_t                                      intra_thread_num = 4;
+    int32_t                                      inter_thread_num = 1;
 };
 
 static std::string read_file_to_string(const std::string & path) {
@@ -143,6 +144,85 @@ static int64_t extract_int64_value(const std::string & text, const std::string &
     }
 }
 
+static std::unordered_map<std::string, std::string> extract_string_map(const std::string & text,
+                                                                       const std::string & key) {
+    std::unordered_map<std::string, std::string> values;
+
+    const std::string marker  = "\"" + key + "\"";
+    const size_t      key_pos = text.find(marker);
+    if (key_pos == std::string::npos) {
+        return values;
+    }
+
+    const size_t brace_start = text.find('{', key_pos + marker.size());
+    const size_t brace_end   = find_closing_brace(text, brace_start);
+    if (brace_start == std::string::npos || brace_end == std::string::npos || brace_end <= brace_start) {
+        return values;
+    }
+
+    std::string content = text.substr(brace_start + 1, brace_end - brace_start - 1);
+    size_t      pos     = 0;
+    while (pos < content.size()) {
+        // Skip whitespace
+        while (pos < content.size() && std::isspace(static_cast<unsigned char>(content[pos]))) {
+            ++pos;
+        }
+        if (pos >= content.size()) {
+            break;
+        }
+
+        // Find key
+        if (content[pos] != '"') {
+            break;
+        }
+        const size_t key_start = pos + 1;
+        const size_t key_end   = content.find('"', key_start);
+        if (key_end == std::string::npos) {
+            break;
+        }
+        std::string map_key = content.substr(key_start, key_end - key_start);
+        pos                 = key_end + 1;
+
+        // Skip :
+        while (pos < content.size() && std::isspace(static_cast<unsigned char>(content[pos]))) {
+            ++pos;
+        }
+        if (pos >= content.size() || content[pos] != ':') {
+            break;
+        }
+        ++pos;
+
+        // Skip whitespace
+        while (pos < content.size() && std::isspace(static_cast<unsigned char>(content[pos]))) {
+            ++pos;
+        }
+
+        // Find value
+        if (content[pos] != '"') {
+            break;
+        }
+        const size_t value_start = pos + 1;
+        const size_t value_end   = content.find('"', value_start);
+        if (value_end == std::string::npos) {
+            break;
+        }
+        std::string map_value = content.substr(value_start, value_end - value_start);
+        pos                   = value_end + 1;
+
+        values[map_key] = map_value;
+
+        // Skip comma or end
+        while (pos < content.size() && std::isspace(static_cast<unsigned char>(content[pos]))) {
+            ++pos;
+        }
+        if (pos < content.size() && content[pos] == ',') {
+            ++pos;
+        }
+    }
+
+    return values;
+}
+
 static std::vector<std::string> extract_string_array(const std::string & text, const std::string & key) {
     std::vector<std::string> values;
 
@@ -217,18 +297,15 @@ static bool parse_audio_config_block(const std::string & config_dir,
     if (config.hidden_size <= 0) {
         config.hidden_size = extract_int64_value(audio_block, "output_dim", config.hidden_size);
     }
-    config.num_mel_bins = (int32_t) extract_int64_value(audio_block, "num_mel_bins", config.num_mel_bins);
-    config.sample_rate  = (int32_t) extract_int64_value(audio_block, "sample_rate", config.sample_rate);
-    config.n_fft        = (int32_t) extract_int64_value(audio_block, "n_fft", config.n_fft);
-    config.window_len   = (int32_t) extract_int64_value(audio_block, "window_len", config.window_len);
-    config.hop_len      = (int32_t) extract_int64_value(audio_block, "hop_len", config.hop_len);
-    config.intra_thread_num =
-        (int32_t) extract_int64_value(audio_block, "spacemit_ep_intra_thread_num", config.intra_thread_num);
-    config.inter_thread_num =
-        (int32_t) extract_int64_value(audio_block, "spacemit_ep_inter_thread_num", config.inter_thread_num);
+    config.num_mel_bins  = (int32_t) extract_int64_value(audio_block, "num_mel_bins", config.num_mel_bins);
+    config.sample_rate   = (int32_t) extract_int64_value(audio_block, "sample_rate", config.sample_rate);
+    config.n_fft         = (int32_t) extract_int64_value(audio_block, "n_fft", config.n_fft);
+    config.window_len    = (int32_t) extract_int64_value(audio_block, "window_len", config.window_len);
+    config.hop_len       = (int32_t) extract_int64_value(audio_block, "hop_len", config.hop_len);
+    config.ep_config     = extract_string_map(audio_block, "ep_config");
     config.architectures = extract_string_array(content, "architectures");
 
-    return !config.frontend_model_path.empty() && !config.backend_model_path.empty();
+    return true;
 }
 
 static std::string find_split_metadata_file(const std::string & config_dir) {
@@ -292,11 +369,20 @@ static bool load_smt_audio_config(const std::string & config_dir, smt_audio_conf
                 }
             }
         }
-        // 从顶层配置读取线程数（如果 audio_model 块中没有设置）
-        config.intra_thread_num =
-            (int32_t) extract_int64_value(config_content, "spacemit_ep_intra_thread_num", config.intra_thread_num);
-        config.inter_thread_num =
-            (int32_t) extract_int64_value(config_content, "spacemit_ep_inter_thread_num", config.inter_thread_num);
+        // 从顶层配置读取 ep_config（如果 audio_model 块中没有设置）
+        auto top_ep_config = extract_string_map(config_content, "ep_config");
+        for (const auto & pair : top_ep_config) {
+            if (config.ep_config.find(pair.first) == config.ep_config.end()) {
+                config.ep_config[pair.first] = pair.second;
+            }
+        }
+        // 从 ep_config 提取线程数设置
+        if (config.ep_config.count("SPACEMIT_EP_INTRA_THREAD_NUM")) {
+            config.intra_thread_num = std::stoi(config.ep_config["SPACEMIT_EP_INTRA_THREAD_NUM"]);
+        }
+        if (config.ep_config.count("SPACEMIT_EP_INTER_THREAD_NUM")) {
+            config.inter_thread_num = std::stoi(config.ep_config["SPACEMIT_EP_INTER_THREAD_NUM"]);
+        }
         if (!config.architectures.empty() && config.hidden_size > 0) {
             return true;
         }
@@ -391,17 +477,29 @@ static bool init_spacemit_execution_provider(Ort::SessionOptions &              
 static void append_optional_spacemit_ep(Ort::SessionOptions &    session_options,
                                         const char *             session_name,
                                         const smt_audio_config & config) {
-    std::unordered_map<std::string, std::string> provider_options;
-    provider_options["SPACEMIT_EP_INTRA_THREAD_NUM"] = std::to_string(config.intra_thread_num);
-    provider_options["SPACEMIT_EP_INTER_THREAD_NUM"] = std::to_string(config.inter_thread_num);
+    std::unordered_map<std::string, std::string> provider_options = config.ep_config;
+    // Add defaults if not specified in ep_config
+    if (provider_options.find("SPACEMIT_EP_INTRA_THREAD_NUM") == provider_options.end()) {
+        provider_options["SPACEMIT_EP_INTRA_THREAD_NUM"] = std::to_string(config.intra_thread_num);
+    }
+    if (provider_options.find("SPACEMIT_EP_INTER_THREAD_NUM") == provider_options.end()) {
+        provider_options["SPACEMIT_EP_INTER_THREAD_NUM"] = std::to_string(config.inter_thread_num);
+    }
     std::string error_message;
     if (!init_spacemit_execution_provider(session_options, provider_options, error_message)) {
         throw std::runtime_error(std::string("[SMT][audio] failed to initialize Spacemit EP for ") + session_name +
                                  ": " + error_message);
     }
-    std::cerr << "[SMT][audio] Spacemit EP enabled for " << session_name
-              << " (SPACEMIT_EP_INTRA_THREAD_NUM=" << config.intra_thread_num
-              << ", SPACEMIT_EP_INTER_THREAD_NUM=" << config.inter_thread_num << ")\n";
+    std::cerr << "[SMT][audio] Spacemit EP enabled for " << session_name << " (";
+    for (const auto & pair : provider_options) {
+        std::cerr << ", " << pair.first << "=" << pair.second;
+    }
+    std::cerr << ")\n";
+}
+
+static bool has_spacemit_ep_affinity(const smt_audio_config & config) {
+    auto it = config.ep_config.find("SPACEMIT_EP_INTRA_THREAD_AFFINITY");
+    return it != config.ep_config.end() && !trim_ascii(it->second).empty();
 }
 
 static std::vector<const char *> make_name_ptrs(const std::vector<std::string> & names) {
@@ -483,10 +581,17 @@ std::unique_ptr<smt_audio_context> smt_audio_context::create(const std::string &
 
     d.frontend_options.SetGraphOptimizationLevel(GraphOptimizationLevel::ORT_ENABLE_ALL);
     d.backend_options.SetGraphOptimizationLevel(GraphOptimizationLevel::ORT_ENABLE_ALL);
-    d.frontend_options.SetIntraOpNumThreads(d.config.intra_thread_num);
-    d.backend_options.SetIntraOpNumThreads(d.config.intra_thread_num);
-    d.frontend_options.SetInterOpNumThreads(d.config.inter_thread_num);
-    d.backend_options.SetInterOpNumThreads(d.config.inter_thread_num);
+
+    const bool ep_affinity_is_configured = has_spacemit_ep_affinity(d.config);
+    if (!ep_affinity_is_configured) {
+        d.frontend_options.SetIntraOpNumThreads(d.config.intra_thread_num);
+        d.backend_options.SetIntraOpNumThreads(d.config.intra_thread_num);
+        d.frontend_options.SetInterOpNumThreads(d.config.inter_thread_num);
+        d.backend_options.SetInterOpNumThreads(d.config.inter_thread_num);
+    } else {
+        std::cerr << "[SMT][audio] detected SPACEMIT_EP_INTRA_THREAD_AFFINITY, skip ORT session thread pinning"
+                  << " to avoid conflicting with EP-managed affinity\n";
+    }
 
     append_optional_spacemit_ep(d.frontend_options, "frontend", d.config);
     append_optional_spacemit_ep(d.backend_options, "backend", d.config);

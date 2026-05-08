@@ -415,7 +415,8 @@ server_smt_vision_context * server_smt_vision_init(llama_context * lctx, const s
         auto boundaries      = resolve_image_boundary_tokens(lctx, primary_architecture);
         ctx->tok_img_beg     = std::move(boundaries.first);
         ctx->tok_img_end     = std::move(boundaries.second);
-    } catch (const std::exception &) {
+    } catch (const std::exception & e) {
+        LOG_WRN("[server-smt] failed to initialize SMT vision backend from '%s': %s\n", config_dir.c_str(), e.what());
     }
 
     try {
@@ -431,7 +432,8 @@ server_smt_vision_context * server_smt_vision_init(llama_context * lctx, const s
         auto audio_boundaries = resolve_audio_boundary_tokens(lctx, ctx->smt_audio->architecture());
         ctx->tok_audio_beg    = std::move(audio_boundaries.first);
         ctx->tok_audio_end    = std::move(audio_boundaries.second);
-    } catch (const std::exception &) {
+    } catch (const std::exception & e) {
+        LOG_WRN("[server-smt] failed to initialize SMT audio backend from '%s': %s\n", config_dir.c_str(), e.what());
     }
 
     if (!ctx->smt_vision && !ctx->smt_audio) {

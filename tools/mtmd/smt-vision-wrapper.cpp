@@ -7,10 +7,12 @@
 
 #include <cctype>
 #include <cstdio>
+#include <cstdlib>
 #include <fstream>
 #include <iostream>
 #include <limits>
 #include <stdexcept>
+#include <type_traits>
 
 #if defined(_WIN32)
 #    include <io.h>
@@ -26,14 +28,48 @@ const OrtApi * g_ort = NULL;
 
 namespace {
 
+template <typename T, typename = void> struct has_affinity_vision_ctor : std::false_type {};
+
+template <typename T>
+struct has_affinity_vision_ctor<
+    T,
+    std::void_t<decltype(T(std::declval<std::string &>(),
+                           std::declval<const std::string &>(),
+                           std::declval<const std::unordered_map<std::string, std::string> &>()))>> : std::true_type {};
+
+static std::unique_ptr<onnxruntime::spacemit::SpineVisionModelEngine> create_spine_vision_model_engine(
+    std::string &                                        model_path,
+    const std::string &                                  architecture,
+    const std::unordered_map<std::string, std::string> & ep_config) {
+    int         intra_thread_num = 4;
+    int         inter_thread_num = 1;
+    std::string intra_thread_affinity;
+
+    if (ep_config.count("SPACEMIT_EP_INTRA_THREAD_NUM")) {
+        intra_thread_num = std::stoi(ep_config.at("SPACEMIT_EP_INTRA_THREAD_NUM"));
+    }
+    if (ep_config.count("SPACEMIT_EP_INTER_THREAD_NUM")) {
+        inter_thread_num = std::stoi(ep_config.at("SPACEMIT_EP_INTER_THREAD_NUM"));
+    }
+    if (ep_config.count("SPACEMIT_EP_INTRA_THREAD_AFFINITY")) {
+        intra_thread_affinity = ep_config.at("SPACEMIT_EP_INTRA_THREAD_AFFINITY");
+    }
+
+    if constexpr (has_affinity_vision_ctor<onnxruntime::spacemit::SpineVisionModelEngine>::value) {
+        return std::make_unique<onnxruntime::spacemit::SpineVisionModelEngine>(model_path, architecture, ep_config);
+    }
+
+    return std::make_unique<onnxruntime::spacemit::SpineVisionModelEngine>(model_path, intra_thread_num,
+                                                                           inter_thread_num);
+}
+
 struct smt_vision_config {
-    std::vector<std::string> architectures;
-    std::string              vision_model_path;
-    int64_t                  hidden_size      = 0;
-    int32_t                  input_width      = 0;
-    int32_t                  input_height     = 0;
-    int32_t                  intra_thread_num = 4;
-    int32_t                  inter_thread_num = 1;
+    std::vector<std::string>                     architectures;
+    std::string                                  vision_model_path;
+    std::unordered_map<std::string, std::string> ep_config;
+    int64_t                                      hidden_size  = 0;
+    int32_t                                      input_width  = 0;
+    int32_t                                      input_height = 0;
 };
 
 static std::string read_file_to_string(const std::string & path) {
@@ -131,6 +167,85 @@ static int64_t extract_int64_value(const std::string & text, const std::string &
     }
 }
 
+static std::unordered_map<std::string, std::string> extract_string_map(const std::string & text,
+                                                                       const std::string & key) {
+    std::unordered_map<std::string, std::string> values;
+
+    const std::string marker  = "\"" + key + "\"";
+    const size_t      key_pos = text.find(marker);
+    if (key_pos == std::string::npos) {
+        return values;
+    }
+
+    const size_t brace_start = text.find('{', key_pos + marker.size());
+    const size_t brace_end   = find_closing_brace(text, brace_start);
+    if (brace_start == std::string::npos || brace_end == std::string::npos || brace_end <= brace_start) {
+        return values;
+    }
+
+    std::string content = text.substr(brace_start + 1, brace_end - brace_start - 1);
+    size_t      pos     = 0;
+    while (pos < content.size()) {
+        // Skip whitespace
+        while (pos < content.size() && std::isspace(static_cast<unsigned char>(content[pos]))) {
+            ++pos;
+        }
+        if (pos >= content.size()) {
+            break;
+        }
+
+        // Find key
+        if (content[pos] != '"') {
+            break;
+        }
+        const size_t key_start = pos + 1;
+        const size_t key_end   = content.find('"', key_start);
+        if (key_end == std::string::npos) {
+            break;
+        }
+        std::string map_key = content.substr(key_start, key_end - key_start);
+        pos                 = key_end + 1;
+
+        // Skip :
+        while (pos < content.size() && std::isspace(static_cast<unsigned char>(content[pos]))) {
+            ++pos;
+        }
+        if (pos >= content.size() || content[pos] != ':') {
+            break;
+        }
+        ++pos;
+
+        // Skip whitespace
+        while (pos < content.size() && std::isspace(static_cast<unsigned char>(content[pos]))) {
+            ++pos;
+        }
+
+        // Find value
+        if (content[pos] != '"') {
+            break;
+        }
+        const size_t value_start = pos + 1;
+        const size_t value_end   = content.find('"', value_start);
+        if (value_end == std::string::npos) {
+            break;
+        }
+        std::string map_value = content.substr(value_start, value_end - value_start);
+        pos                   = value_end + 1;
+
+        values[map_key] = map_value;
+
+        // Skip comma or end
+        while (pos < content.size() && std::isspace(static_cast<unsigned char>(content[pos]))) {
+            ++pos;
+        }
+        if (pos < content.size() && content[pos] == ',') {
+            ++pos;
+        }
+    }
+
+    return values;
+}
+
 static std::vector<std::string> extract_string_array(const std::string & text, const std::string & key) {
     std::vector<std::string> values;
 
@@ -222,16 +337,15 @@ static bool load_smt_vision_config(const std::string & config_dir, smt_vision_co
     const int64_t input_size = extract_int64_value(vision_block, "input_size", 0);
     config.input_width       = (int32_t) extract_int64_value(vision_block, "input_width", input_size);
     config.input_height      = (int32_t) extract_int64_value(vision_block, "input_height", input_size);
-    config.intra_thread_num =
-        (int32_t) extract_int64_value(vision_block, "spacemit_ep_intra_thread_num", config.intra_thread_num);
-    config.inter_thread_num =
-        (int32_t) extract_int64_value(vision_block, "spacemit_ep_inter_thread_num", config.inter_thread_num);
+    config.ep_config         = extract_string_map(vision_block, "ep_config");
 
-    // 从顶层配置读取线程数（如果 vision_model 块中没有设置）
-    config.intra_thread_num =
-        (int32_t) extract_int64_value(content, "spacemit_ep_intra_thread_num", config.intra_thread_num);
-    config.inter_thread_num =
-        (int32_t) extract_int64_value(content, "spacemit_ep_inter_thread_num", config.inter_thread_num);
+    // 从顶层配置读取 ep_config（如果 vision_model 块中没有设置）
+    auto top_ep_config = extract_string_map(content, "ep_config");
+    for (const auto & pair : top_ep_config) {
+        if (config.ep_config.find(pair.first) == config.ep_config.end()) {
+            config.ep_config[pair.first] = pair.second;
+        }
+    }
 
     if (config.vision_model_path.empty()) {
         std::cerr << "Error: Missing required key 'vision_model.model_path'.\n";
@@ -386,16 +500,17 @@ std::unique_ptr<smt_vision_context> smt_vision_context::create(const std::string
     onnxruntime::g_ort = OrtGetApiBase()->GetApi(ORT_API_VERSION);
 
     // 3. Create vision engine and session
-    d.vision_engine = std::make_unique<onnxruntime::spacemit::SpineVisionModelEngine>(
-        d.config.vision_model_path, d.arch_name, d.config.intra_thread_num, d.config.inter_thread_num);
+    d.vision_engine = create_spine_vision_model_engine(d.config.vision_model_path, d.arch_name, d.config.ep_config);
     Ort::Session & vision_session = d.vision_engine->CreateVisionModelSession();
     if (warmup) {
         warmup_vision_engine(*d.vision_engine, vision_session, d.arch_name);
     }
 
-    std::cerr << "[SMT][vision] Spacemit EP enabled"
-              << " (SPACEMIT_EP_INTRA_THREAD_NUM=" << d.config.intra_thread_num
-              << ", SPACEMIT_EP_INTER_THREAD_NUM=" << d.config.inter_thread_num << ")\n";
+    std::cerr << "[SMT][vision] Spacemit EP enabled (";
+    for (const auto & pair : d.config.ep_config) {
+        std::cerr << ", " << pair.first << "=" << pair.second;
+    }
+    std::cerr << ")\n";
 
     return ctx;
 }
