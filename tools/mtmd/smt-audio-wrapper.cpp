@@ -267,6 +267,44 @@ static std::string normalize_path(const std::string & base_dir, const std::strin
     return base_dir + "/" + trimmed;
 }
 
+static bool contains_legacy_spacemit_ep_config(const std::string & text) {
+    return text.find("\"spacemit_ep_intra_thread_num\"") != std::string::npos ||
+           text.find("\"spacemit_ep_inter_thread_num\"") != std::string::npos ||
+           text.find("\"spacemit_ep_intra_thread_affinity\"") != std::string::npos;
+}
+
+static void warn_legacy_spacemit_ep_config_if_needed(const std::string & text, const char * section_name) {
+    if (!contains_legacy_spacemit_ep_config(text)) {
+        return;
+    }
+
+    std::cerr << "[SMT][audio] warning: detected deprecated legacy Spacemit EP config keys";
+    if (section_name != nullptr && section_name[0] != '\0') {
+        std::cerr << " in " << section_name;
+    }
+    std::cerr << "; this style will be removed in a future release. "
+              << "Please migrate to the `ep_config` format.\n";
+}
+
+static void apply_legacy_spacemit_ep_config(const std::string & text, smt_audio_config & config) {
+    config.intra_thread_num =
+        (int32_t) extract_int64_value(text, "spacemit_ep_intra_thread_num", config.intra_thread_num);
+    config.inter_thread_num =
+        (int32_t) extract_int64_value(text, "spacemit_ep_inter_thread_num", config.inter_thread_num);
+
+    const std::string affinity = extract_string_value(text, "spacemit_ep_intra_thread_affinity");
+    if (!affinity.empty() && config.ep_config.find("SPACEMIT_EP_INTRA_THREAD_AFFINITY") == config.ep_config.end()) {
+        config.ep_config["SPACEMIT_EP_INTRA_THREAD_AFFINITY"] = affinity;
+    }
+
+    if (config.ep_config.find("SPACEMIT_EP_INTRA_THREAD_NUM") == config.ep_config.end()) {
+        config.ep_config["SPACEMIT_EP_INTRA_THREAD_NUM"] = std::to_string(config.intra_thread_num);
+    }
+    if (config.ep_config.find("SPACEMIT_EP_INTER_THREAD_NUM") == config.ep_config.end()) {
+        config.ep_config["SPACEMIT_EP_INTER_THREAD_NUM"] = std::to_string(config.inter_thread_num);
+    }
+}
+
 static bool parse_audio_config_block(const std::string & config_dir,
                                      const std::string & content,
                                      smt_audio_config &  config) {
@@ -283,6 +321,7 @@ static bool parse_audio_config_block(const std::string & config_dir,
     }
 
     const std::string audio_block = content.substr(audio_block_start, audio_block_end - audio_block_start + 1);
+    warn_legacy_spacemit_ep_config_if_needed(audio_block, "audio_model");
     config.frontend_model_path = normalize_path(config_dir, extract_string_value(audio_block, "frontend_model_path"));
     if (config.frontend_model_path.empty()) {
         config.frontend_model_path = normalize_path(config_dir, extract_string_value(audio_block, "frontend_path"));
@@ -297,12 +336,13 @@ static bool parse_audio_config_block(const std::string & config_dir,
     if (config.hidden_size <= 0) {
         config.hidden_size = extract_int64_value(audio_block, "output_dim", config.hidden_size);
     }
-    config.num_mel_bins  = (int32_t) extract_int64_value(audio_block, "num_mel_bins", config.num_mel_bins);
-    config.sample_rate   = (int32_t) extract_int64_value(audio_block, "sample_rate", config.sample_rate);
-    config.n_fft         = (int32_t) extract_int64_value(audio_block, "n_fft", config.n_fft);
-    config.window_len    = (int32_t) extract_int64_value(audio_block, "window_len", config.window_len);
-    config.hop_len       = (int32_t) extract_int64_value(audio_block, "hop_len", config.hop_len);
-    config.ep_config     = extract_string_map(audio_block, "ep_config");
+    config.num_mel_bins = (int32_t) extract_int64_value(audio_block, "num_mel_bins", config.num_mel_bins);
+    config.sample_rate  = (int32_t) extract_int64_value(audio_block, "sample_rate", config.sample_rate);
+    config.n_fft        = (int32_t) extract_int64_value(audio_block, "n_fft", config.n_fft);
+    config.window_len   = (int32_t) extract_int64_value(audio_block, "window_len", config.window_len);
+    config.hop_len      = (int32_t) extract_int64_value(audio_block, "hop_len", config.hop_len);
+    config.ep_config    = extract_string_map(audio_block, "ep_config");
+    apply_legacy_spacemit_ep_config(audio_block, config);
     config.architectures = extract_string_array(content, "architectures");
 
     return true;
@@ -357,6 +397,7 @@ static bool load_smt_audio_config(const std::string & config_dir, smt_audio_conf
     const std::string config_path    = config_dir + "/config.json";
     const std::string config_content = read_file_to_string(config_path);
     if (!config_content.empty() && parse_audio_config_block(config_dir, config_content, config)) {
+        warn_legacy_spacemit_ep_config_if_needed(config_content, "top-level config");
         if (config.hidden_size <= 0) {
             const size_t text_start = config_content.find("\"text_model\":");
             if (text_start != std::string::npos) {
@@ -376,6 +417,7 @@ static bool load_smt_audio_config(const std::string & config_dir, smt_audio_conf
                 config.ep_config[pair.first] = pair.second;
             }
         }
+        apply_legacy_spacemit_ep_config(config_content, config);
         // 从 ep_config 提取线程数设置
         if (config.ep_config.count("SPACEMIT_EP_INTRA_THREAD_NUM")) {
             config.intra_thread_num = std::stoi(config.ep_config["SPACEMIT_EP_INTRA_THREAD_NUM"]);

@@ -28,14 +28,26 @@ const OrtApi * g_ort = NULL;
 
 namespace {
 
-template <typename T, typename = void> struct has_affinity_vision_ctor : std::false_type {};
+template <typename...> using void_t = void;
+
+template <typename T, typename = void> struct has_ep_config_vision_ctor : std::false_type {};
 
 template <typename T>
-struct has_affinity_vision_ctor<
+struct has_ep_config_vision_ctor<
     T,
-    std::void_t<decltype(T(std::declval<std::string &>(),
-                           std::declval<const std::string &>(),
-                           std::declval<const std::unordered_map<std::string, std::string> &>()))>> : std::true_type {};
+    void_t<decltype(T(std::declval<std::string &>(),
+                      std::declval<const std::string &>(),
+                      std::declval<const std::unordered_map<std::string, std::string> &>()))>> : std::true_type {};
+
+template <typename T, typename = void> struct has_legacy_affinity_vision_ctor : std::false_type {};
+
+template <typename T>
+struct has_legacy_affinity_vision_ctor<
+    T,
+    void_t<decltype(T(std::declval<std::string &>(),
+                      std::declval<int>(),
+                      std::declval<int>(),
+                      std::declval<const std::string &>()))>> : std::true_type {};
 
 static std::unique_ptr<onnxruntime::spacemit::SpineVisionModelEngine> create_spine_vision_model_engine(
     std::string &                                        model_path,
@@ -55,12 +67,20 @@ static std::unique_ptr<onnxruntime::spacemit::SpineVisionModelEngine> create_spi
         intra_thread_affinity = ep_config.at("SPACEMIT_EP_INTRA_THREAD_AFFINITY");
     }
 
-    if constexpr (has_affinity_vision_ctor<onnxruntime::spacemit::SpineVisionModelEngine>::value) {
+    if constexpr (has_ep_config_vision_ctor<onnxruntime::spacemit::SpineVisionModelEngine>::value) {
         return std::make_unique<onnxruntime::spacemit::SpineVisionModelEngine>(model_path, architecture, ep_config);
+    } else if constexpr (has_legacy_affinity_vision_ctor<onnxruntime::spacemit::SpineVisionModelEngine>::value) {
+        return std::make_unique<onnxruntime::spacemit::SpineVisionModelEngine>(model_path, intra_thread_num,
+                                                                               inter_thread_num,
+                                                                               intra_thread_affinity);
+    } else {
+        if (!intra_thread_affinity.empty()) {
+            std::cerr << "[SMT][vision] warning: SPACEMIT_EP_INTRA_THREAD_AFFINITY is ignored by this "
+                         "SpineVisionModelEngine version\n";
+        }
+        return std::make_unique<onnxruntime::spacemit::SpineVisionModelEngine>(model_path, intra_thread_num,
+                                                                               inter_thread_num);
     }
-
-    return std::make_unique<onnxruntime::spacemit::SpineVisionModelEngine>(model_path, intra_thread_num,
-                                                                           inter_thread_num);
 }
 
 struct smt_vision_config {
@@ -298,6 +318,50 @@ static std::string canonicalize_vision_architecture(std::string arch) {
     return trimmed;
 }
 
+static bool contains_legacy_spacemit_ep_config(const std::string & text) {
+    return text.find("\"spacemit_ep_intra_thread_num\"") != std::string::npos ||
+           text.find("\"spacemit_ep_inter_thread_num\"") != std::string::npos ||
+           text.find("\"spacemit_ep_intra_thread_affinity\"") != std::string::npos;
+}
+
+static void warn_legacy_spacemit_ep_config_if_needed(const std::string & text, const char * section_name) {
+    if (!contains_legacy_spacemit_ep_config(text)) {
+        return;
+    }
+
+    std::cerr << "[SMT][vision] warning: detected deprecated legacy Spacemit EP config keys";
+    if (section_name != nullptr && section_name[0] != '\0') {
+        std::cerr << " in " << section_name;
+    }
+    std::cerr << "; this style will be removed in a future release. "
+              << "Please migrate to the `ep_config` format.\n";
+}
+
+static void apply_legacy_spacemit_ep_config(const std::string & text, smt_vision_config & config) {
+    const int32_t intra_thread_num =
+        (int32_t) extract_int64_value(text, "spacemit_ep_intra_thread_num",
+                                      config.ep_config.count("SPACEMIT_EP_INTRA_THREAD_NUM") ?
+                                          std::stoll(config.ep_config.at("SPACEMIT_EP_INTRA_THREAD_NUM")) :
+                                          4);
+    const int32_t inter_thread_num =
+        (int32_t) extract_int64_value(text, "spacemit_ep_inter_thread_num",
+                                      config.ep_config.count("SPACEMIT_EP_INTER_THREAD_NUM") ?
+                                          std::stoll(config.ep_config.at("SPACEMIT_EP_INTER_THREAD_NUM")) :
+                                          1);
+
+    if (config.ep_config.find("SPACEMIT_EP_INTRA_THREAD_NUM") == config.ep_config.end()) {
+        config.ep_config["SPACEMIT_EP_INTRA_THREAD_NUM"] = std::to_string(intra_thread_num);
+    }
+    if (config.ep_config.find("SPACEMIT_EP_INTER_THREAD_NUM") == config.ep_config.end()) {
+        config.ep_config["SPACEMIT_EP_INTER_THREAD_NUM"] = std::to_string(inter_thread_num);
+    }
+
+    const std::string affinity = extract_string_value(text, "spacemit_ep_intra_thread_affinity");
+    if (!affinity.empty() && config.ep_config.find("SPACEMIT_EP_INTRA_THREAD_AFFINITY") == config.ep_config.end()) {
+        config.ep_config["SPACEMIT_EP_INTRA_THREAD_AFFINITY"] = affinity;
+    }
+}
+
 static bool load_smt_vision_config(const std::string & config_dir, smt_vision_config & config) {
     const std::string config_path = config_dir + "/config.json";
     const std::string content     = read_file_to_string(config_path);
@@ -331,6 +395,9 @@ static bool load_smt_vision_config(const std::string & config_dir, smt_vision_co
     }
     const std::string text_block = content.substr(text_block_start, text_block_end - text_block_start + 1);
 
+    warn_legacy_spacemit_ep_config_if_needed(vision_block, "vision_model");
+    warn_legacy_spacemit_ep_config_if_needed(content, "top-level config");
+
     config.vision_model_path = normalize_path(config_dir, extract_string_value(vision_block, "model_path"));
     config.hidden_size       = extract_int64_value(text_block, "hidden_size", 0);
     config.architectures     = extract_string_array(content, "architectures");
@@ -338,6 +405,7 @@ static bool load_smt_vision_config(const std::string & config_dir, smt_vision_co
     config.input_width       = (int32_t) extract_int64_value(vision_block, "input_width", input_size);
     config.input_height      = (int32_t) extract_int64_value(vision_block, "input_height", input_size);
     config.ep_config         = extract_string_map(vision_block, "ep_config");
+    apply_legacy_spacemit_ep_config(vision_block, config);
 
     // 从顶层配置读取 ep_config（如果 vision_model 块中没有设置）
     auto top_ep_config = extract_string_map(content, "ep_config");
@@ -346,6 +414,7 @@ static bool load_smt_vision_config(const std::string & config_dir, smt_vision_co
             config.ep_config[pair.first] = pair.second;
         }
     }
+    apply_legacy_spacemit_ep_config(content, config);
 
     if (config.vision_model_path.empty()) {
         std::cerr << "Error: Missing required key 'vision_model.model_path'.\n";
