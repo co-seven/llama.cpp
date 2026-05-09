@@ -344,58 +344,6 @@ size_t server_tokens::size_up_to_pos(llama_pos max_pos) const {
         if (pos >= max_pos) {
             break;
         }
-
-        return res;
-    }
-
-    int64_t idx = 0;
-    llama_pos pos = 0;
-
-    GGML_ASSERT(n_tokens <= (int64_t)tokens.size());
-
-    while (idx < n_tokens) {
-        const auto media_it = map_idx_to_media.find(idx);
-        if (media_it != map_idx_to_media.end()) {
-            const auto & chunk = media_it->second;
-            const llama_pos n_pos = mtmd_input_chunk_get_n_pos(chunk.get());
-            const size_t n_tok = mtmd_input_chunk_get_n_tokens(chunk.get());
-
-            pos += n_pos;
-            idx += n_tok;
-        } else {
-            pos++;
-            idx++;
-        }
-    }
-
-    return pos;
-}
-
-size_t server_tokens::size_up_to_pos(llama_pos max_pos) const {
-    if (!has_mtmd) {
-        return std::min((size_t)max_pos, tokens.size());
-    }
-
-    size_t idx = 0;
-    llama_pos pos = 0;
-
-    while (idx < tokens.size()) {
-        const auto media_it = map_idx_to_media.find(idx);
-        if (media_it != map_idx_to_media.end()) {
-            const auto & chunk = media_it->second;
-            const llama_pos n_pos = mtmd_input_chunk_get_n_pos(chunk.get());
-            const size_t n_tok = mtmd_input_chunk_get_n_tokens(chunk.get());
-
-            pos += n_pos;
-            idx += n_tok;
-        } else {
-            pos++;
-            idx++;
-        }
-
-        if (pos >= max_pos) {
-            break;
-        }
     }
 
     return idx;
