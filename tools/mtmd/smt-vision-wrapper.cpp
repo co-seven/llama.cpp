@@ -42,12 +42,11 @@ struct has_ep_config_vision_ctor<
 template <typename T, typename = void> struct has_legacy_affinity_vision_ctor : std::false_type {};
 
 template <typename T>
-struct has_legacy_affinity_vision_ctor<
-    T,
-    void_t<decltype(T(std::declval<std::string &>(),
-                      std::declval<int>(),
-                      std::declval<int>(),
-                      std::declval<const std::string &>()))>> : std::true_type {};
+struct has_legacy_affinity_vision_ctor<T,
+                                       void_t<decltype(T(std::declval<std::string &>(),
+                                                         std::declval<int>(),
+                                                         std::declval<int>(),
+                                                         std::declval<const std::string &>()))>> : std::true_type {};
 
 static std::unique_ptr<onnxruntime::spacemit::SpineVisionModelEngine> create_spine_vision_model_engine(
     std::string &                                        model_path,
@@ -71,8 +70,7 @@ static std::unique_ptr<onnxruntime::spacemit::SpineVisionModelEngine> create_spi
         return std::make_unique<onnxruntime::spacemit::SpineVisionModelEngine>(model_path, architecture, ep_config);
     } else if constexpr (has_legacy_affinity_vision_ctor<onnxruntime::spacemit::SpineVisionModelEngine>::value) {
         return std::make_unique<onnxruntime::spacemit::SpineVisionModelEngine>(model_path, intra_thread_num,
-                                                                               inter_thread_num,
-                                                                               intra_thread_affinity);
+                                                                               inter_thread_num, intra_thread_affinity);
     } else {
         if (!intra_thread_affinity.empty()) {
             std::cerr << "[SMT][vision] warning: SPACEMIT_EP_INTRA_THREAD_AFFINITY is ignored by this "
@@ -90,6 +88,7 @@ struct smt_vision_config {
     int64_t                                      hidden_size  = 0;
     int32_t                                      input_width  = 0;
     int32_t                                      input_height = 0;
+    smt_vision_preprocess_config                 preprocess_config;
 };
 
 static std::string read_file_to_string(const std::string & path) {
@@ -182,6 +181,53 @@ static int64_t extract_int64_value(const std::string & text, const std::string &
 
     try {
         return std::stoll(text.substr(value_start, value_end - value_start));
+    } catch (...) {
+        return default_value;
+    }
+}
+
+static double extract_double_value(const std::string & text, const std::string & key, double default_value) {
+    const std::string marker  = "\"" + key + "\"";
+    const size_t      key_pos = text.find(marker);
+    if (key_pos == std::string::npos) {
+        return default_value;
+    }
+
+    const size_t colon_pos = text.find(':', key_pos + marker.size());
+    if (colon_pos == std::string::npos) {
+        return default_value;
+    }
+
+    size_t value_start = colon_pos + 1;
+    while (value_start < text.size() && std::isspace(static_cast<unsigned char>(text[value_start]))) {
+        ++value_start;
+    }
+
+    size_t value_end = value_start;
+    if (value_end < text.size() && (text[value_end] == '-' || text[value_end] == '+')) {
+        ++value_end;
+    }
+    bool seen_dot = false;
+    while (value_end < text.size()) {
+        const unsigned char ch = static_cast<unsigned char>(text[value_end]);
+        if (std::isdigit(ch)) {
+            ++value_end;
+            continue;
+        }
+        if (ch == '.' && !seen_dot) {
+            seen_dot = true;
+            ++value_end;
+            continue;
+        }
+        break;
+    }
+
+    if (value_end == value_start) {
+        return default_value;
+    }
+
+    try {
+        return std::stod(text.substr(value_start, value_end - value_start));
     } catch (...) {
         return default_value;
     }
@@ -299,6 +345,63 @@ static std::vector<std::string> extract_string_array(const std::string & text, c
     return values;
 }
 
+static std::vector<double> extract_number_array(const std::string & text, const std::string & key) {
+    std::vector<double> values;
+
+    const std::string marker  = "\"" + key + "\"";
+    const size_t      key_pos = text.find(marker);
+    if (key_pos == std::string::npos) {
+        return values;
+    }
+
+    const size_t bracket_start = text.find('[', key_pos + marker.size());
+    const size_t bracket_end   = text.find(']', bracket_start == std::string::npos ? key_pos : bracket_start + 1);
+    if (bracket_start == std::string::npos || bracket_end == std::string::npos || bracket_end <= bracket_start) {
+        return values;
+    }
+
+    std::string content = text.substr(bracket_start + 1, bracket_end - bracket_start - 1);
+    size_t      pos     = 0;
+    while (pos < content.size()) {
+        while (pos < content.size() &&
+               (std::isspace(static_cast<unsigned char>(content[pos])) || content[pos] == ',')) {
+            ++pos;
+        }
+        if (pos >= content.size()) {
+            break;
+        }
+        size_t end      = pos;
+        bool   seen_dot = false;
+        if (content[end] == '-' || content[end] == '+') {
+            ++end;
+        }
+        while (end < content.size()) {
+            const unsigned char ch = static_cast<unsigned char>(content[end]);
+            if (std::isdigit(ch)) {
+                ++end;
+                continue;
+            }
+            if (ch == '.' && !seen_dot) {
+                seen_dot = true;
+                ++end;
+                continue;
+            }
+            break;
+        }
+        if (end > pos) {
+            try {
+                values.push_back(std::stod(content.substr(pos, end - pos)));
+            } catch (...) {
+                values.clear();
+                return values;
+            }
+        }
+        pos = end + 1;
+    }
+
+    return values;
+}
+
 static std::string normalize_path(const std::string & base_dir, const std::string & path) {
     const std::string trimmed = trim_ascii(path);
     if (trimmed.empty()) {
@@ -395,6 +498,18 @@ static bool load_smt_vision_config(const std::string & config_dir, smt_vision_co
     }
     const std::string text_block = content.substr(text_block_start, text_block_end - text_block_start + 1);
 
+    std::string  preprocess_block;
+    const size_t preprocess_start = content.find("\"vision_preprocess\":");
+    if (preprocess_start != std::string::npos) {
+        const size_t preprocess_block_start = content.find('{', preprocess_start);
+        const size_t preprocess_block_end   = find_closing_brace(content, preprocess_block_start);
+        if (preprocess_block_start == std::string::npos || preprocess_block_end == std::string::npos) {
+            std::cerr << "Error: Invalid 'vision_preprocess' block.\n";
+            return false;
+        }
+        preprocess_block = content.substr(preprocess_block_start, preprocess_block_end - preprocess_block_start + 1);
+    }
+
     warn_legacy_spacemit_ep_config_if_needed(vision_block, "vision_model");
     warn_legacy_spacemit_ep_config_if_needed(content, "top-level config");
 
@@ -405,6 +520,18 @@ static bool load_smt_vision_config(const std::string & config_dir, smt_vision_co
     config.input_width       = (int32_t) extract_int64_value(vision_block, "input_width", input_size);
     config.input_height      = (int32_t) extract_int64_value(vision_block, "input_height", input_size);
     config.ep_config         = extract_string_map(vision_block, "ep_config");
+    if (!preprocess_block.empty()) {
+        config.preprocess_config.rescale_factor = (float) extract_double_value(preprocess_block, "rescale_factor", 1.0);
+        const auto image_mean                   = extract_number_array(preprocess_block, "image_mean");
+        const auto image_std                    = extract_number_array(preprocess_block, "image_std");
+        if (image_mean.size() == 3 && image_std.size() == 3) {
+            for (size_t i = 0; i < 3; ++i) {
+                config.preprocess_config.image_mean[i] = (float) image_mean[i];
+                config.preprocess_config.image_std[i]  = (float) image_std[i];
+            }
+            config.preprocess_config.has_normalize_config = true;
+        }
+    }
     apply_legacy_spacemit_ep_config(vision_block, config);
 
     // 从顶层配置读取 ep_config（如果 vision_model 块中没有设置）
@@ -627,4 +754,8 @@ const std::string & smt_vision_context::token_embedding_path() const {
 
 const std::string & smt_vision_context::architecture() const {
     return pimpl_->arch_name;
+}
+
+const smt_vision_preprocess_config & smt_vision_context::preprocess_config() const {
+    return pimpl_->config.preprocess_config;
 }

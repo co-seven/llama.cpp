@@ -3,13 +3,15 @@
 
 #pragma once
 
+#include "smt-vision-preprocess.h"
+
+#include <cstdint>
 #include <memory>
 #include <string>
 #include <vector>
-#include <cstdint>
 
 struct smt_vision_context {
-    smt_vision_context(const smt_vision_context &) = delete;
+    smt_vision_context(const smt_vision_context &)             = delete;
     smt_vision_context & operator=(const smt_vision_context &) = delete;
     ~smt_vision_context();
 
@@ -36,7 +38,10 @@ struct smt_vision_context {
     int32_t input_width() const;
     int32_t input_height() const;
 
-private:
+    // Get image preprocess config for external SMT preprocessing.
+    const smt_vision_preprocess_config & preprocess_config() const;
+
+  private:
     smt_vision_context() = default;
     struct impl;
     std::unique_ptr<impl> pimpl_;

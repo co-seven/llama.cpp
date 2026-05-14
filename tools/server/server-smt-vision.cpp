@@ -488,7 +488,8 @@ server_smt_image_chunk server_smt_vision_encode_image_bin(server_smt_vision_cont
     std::vector<uint8_t> smt_input = data;
     auto                 preproc =
         smt_vision_preprocess_if_image(data, ctx->architecture, ctx->smt_vision ? ctx->smt_vision->input_width() : 0,
-                                       ctx->smt_vision ? ctx->smt_vision->input_height() : 0);
+                                       ctx->smt_vision ? ctx->smt_vision->input_height() : 0,
+                                       ctx->smt_vision ? &ctx->smt_vision->preprocess_config() : nullptr);
     if (preproc.was_image) {
         smt_input = std::move(preproc.tensor_bytes);
     }
