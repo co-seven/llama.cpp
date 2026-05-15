@@ -1,14 +1,51 @@
 #include "ggml-profile.h"
 
-#include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/syscall.h>
-#include <time.h>
-#include <unistd.h>
 
 #ifdef GGML_BUILD_PROFILE
+#    if defined(_WIN32)
+int g_current_token_idx = -1;
+
+void ggml_set_current_token_idx(int idx) {
+    g_current_token_idx = idx;
+}
+
+void ggml_profile_init_trace_file(void) {
+}
+
+void ggml_trace_log_begin(const char * name, const char * cat, const char * args) {
+    GGML_UNUSED(name);
+    GGML_UNUSED(cat);
+    GGML_UNUSED(args);
+}
+
+void ggml_trace_log_end(const char * name, const char * cat, const char * args) {
+    GGML_UNUSED(name);
+    GGML_UNUSED(cat);
+    GGML_UNUSED(args);
+}
+
+void ggml_profile_log_op_begin(struct ggml_tensor * t) {
+    GGML_UNUSED(t);
+}
+
+void ggml_profile_log_op_end(struct ggml_tensor * t) {
+    GGML_UNUSED(t);
+}
+
+void ggml_profile_flush_tls(void) {
+}
+
+void ggml_profile_flush_trace(void) {
+}
+#    else
+#        include <pthread.h>
+#        include <sys/syscall.h>
+#        include <time.h>
+#        include <unistd.h>
+
 static int            g_trace_enabled = 0;
 static pthread_once_t g_trace_once    = PTHREAD_ONCE_INIT;
 
@@ -242,4 +279,5 @@ void ggml_profile_flush_trace(void) {
 
     pthread_mutex_unlock(&g_trace_mutex);
 }
+#    endif
 #endif
