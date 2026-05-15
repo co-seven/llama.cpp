@@ -1,34 +1,35 @@
 #include "arg.h"
-#include "debug.h"
-#include "log.h"
-#include "common.h"
-#include "sampling.h"
-#include "llama.h"
-#include "ggml.h"
-#include "console.h"
 #include "chat.h"
-#include "mtmd.h"
+#include "common.h"
+#include "console.h"
+#include "debug.h"
+#include "ggml.h"
+#include "llama.h"
+#include "log.h"
 #include "mtmd-helper.h"
+#include "mtmd.h"
+#include "sampling.h"
 
-#include <vector>
 #include <limits.h>
+
 #include <cinttypes>
 #include <clocale>
+#include <vector>
 
-#if defined (__unix__) || (defined (__APPLE__) && defined (__MACH__))
-#include <signal.h>
-#include <unistd.h>
-#elif defined (_WIN32)
-#define WIN32_LEAN_AND_MEAN
-#ifndef NOMINMAX
-#define NOMINMAX
-#endif
-#include <windows.h>
-#include <signal.h>
+#if defined(__unix__) || (defined(__APPLE__) && defined(__MACH__))
+#    include <signal.h>
+#    include <unistd.h>
+#elif defined(_WIN32)
+#    define WIN32_LEAN_AND_MEAN
+#    ifndef NOMINMAX
+#        define NOMINMAX
+#    endif
+#    include <signal.h>
+#    include <windows.h>
 #endif
 
 // volatile, because of signal being an interrupt
-static volatile bool g_is_generating = false;
+static volatile bool g_is_generating  = false;
 static volatile bool g_is_interrupted = false;
 
 /**
@@ -39,27 +40,24 @@ static volatile bool g_is_interrupted = false;
 
 static void show_additional_info(int /*argc*/, char ** argv) {
 #if defined(LLAMA_SERVER_SMT_VISION)
-    LOG(
-        "Experimental CLI for multimodal\n\n"
-        "Usage: %s [options] -m <model> [--mmproj <mmproj> | --smt-config-dir <dir>] --image <image> --audio <audio> -p <prompt>\n\n"
+    LOG("Experimental CLI for multimodal\n\n"
+        "Usage: %s [options] -m <model> [--mmproj <mmproj> | --smt-config-dir <dir>] --image <image> --audio <audio> "
+        "-p <prompt>\n\n"
         "  -m is required\n"
         "  --mmproj is required for the mtmd backend\n"
         "  --smt-config-dir is required for the smt backend\n"
         "  -hf user/repo can replace both -m and --mmproj in most cases\n"
         "  --image, --audio and -p are optional, if NOT provided, the CLI will run in chat mode\n"
         "  to disable using GPU for mmproj model, add --no-mmproj-offload\n",
-        argv[0]
-    );
+        argv[0]);
 #else
-    LOG(
-        "Experimental CLI for multimodal\n\n"
+    LOG("Experimental CLI for multimodal\n\n"
         "Usage: %s [options] -m <model> --mmproj <mmproj> --image <image> --audio <audio> -p <prompt>\n\n"
         "  -m and --mmproj are required\n"
         "  -hf user/repo can replace both -m and --mmproj in most cases\n"
         "  --image, --audio and -p are optional, if NOT provided, the CLI will run in chat mode\n"
         "  to disable using GPU for mmproj model, add --no-mmproj-offload\n",
-        argv[0]
-    );
+        argv[0]);
 #endif
 }
 
@@ -67,7 +65,7 @@ static void show_additional_info(int /*argc*/, char ** argv) {
 int mtmd_cli_smt_run(int argc, char ** argv, common_params params);
 #endif
 
-#if defined (__unix__) || (defined (__APPLE__) && defined (__MACH__)) || defined (_WIN32)
+#if defined(__unix__) || (defined(__APPLE__) && defined(__MACH__)) || defined(_WIN32)
 static void sigint_handler(int signo) {
     if (signo == SIGINT) {
         if (g_is_generating) {
@@ -84,40 +82,40 @@ static void sigint_handler(int signo) {
 #endif
 
 struct mtmd_cli_context {
-    mtmd::context_ptr ctx_vision;
+    mtmd::context_ptr      ctx_vision;
     common_init_result_ptr llama_init;
 
-    llama_model       * model;
-    llama_context     * lctx;
+    llama_model *       model;
+    llama_context *     lctx;
     const llama_vocab * vocab;
-    common_sampler    * smpl;
+    common_sampler *    smpl;
     llama_batch         batch;
     int                 n_batch;
 
     mtmd::bitmaps bitmaps;
 
     // chat template
-    common_chat_templates_ptr tmpls;
+    common_chat_templates_ptr    tmpls;
     std::vector<common_chat_msg> chat_history;
-    bool use_jinja = false;
+    bool                         use_jinja = false;
     // TODO: support for --system-prompt with /clear command
 
     // support for legacy templates (models not having EOT token)
     llama_tokens antiprompt_tokens;
 
-    int n_threads    = 1;
-    llama_pos n_past = 0;
+    int       n_threads = 1;
+    llama_pos n_past    = 0;
 
     common_debug_cb_user_data cb_data;
 
     mtmd_cli_context(common_params & params) : llama_init(common_init_from_params(params)) {
-        model = llama_init->model();
-        lctx = llama_init->context();
-        vocab = llama_model_get_vocab(model);
-        smpl = common_sampler_init(model, params.sampling);
+        model     = llama_init->model();
+        lctx      = llama_init->context();
+        vocab     = llama_model_get_vocab(model);
+        smpl      = common_sampler_init(model, params.sampling);
         n_threads = params.cpuparams.n_threads;
-        batch = llama_batch_init(1, 0, 1); // batch for next token generation
-        n_batch = params.n_batch;
+        batch     = llama_batch_init(1, 0, 1);  // batch for next token generation
+        n_batch   = params.n_batch;
 
         if (!model || !lctx) {
             exit(1);
@@ -131,10 +129,11 @@ struct mtmd_cli_context {
             exit(1);
         }
 
-        tmpls = common_chat_templates_init(model, params.chat_template);
+        tmpls     = common_chat_templates_init(model, params.chat_template);
         use_jinja = params.use_jinja;
         chat_history.clear();
-        LOG_INF("%s: chat template example:\n%s\n", __func__, common_chat_format_example(tmpls.get(), params.use_jinja, params.default_template_kwargs).c_str());
+        LOG_INF("%s: chat template example:\n%s\n", __func__,
+                common_chat_format_example(tmpls.get(), params.use_jinja, params.default_template_kwargs).c_str());
 
         init_vision_context(params);
 
@@ -152,18 +151,18 @@ struct mtmd_cli_context {
     }
 
     void init_vision_context(common_params & params) {
-        const char * clip_path = params.mmproj.path.c_str();
-        mtmd_context_params mparams = mtmd_context_params_default();
-        mparams.use_gpu          = params.mmproj_use_gpu;
-        mparams.print_timings    = true;
-        mparams.n_threads        = params.cpuparams.n_threads;
-        mparams.flash_attn_type  = params.flash_attn_type;
-        mparams.warmup           = params.warmup;
-        mparams.image_min_tokens = params.image_min_tokens;
-        mparams.image_max_tokens = params.image_max_tokens;
+        const char *        clip_path = params.mmproj.path.c_str();
+        mtmd_context_params mparams   = mtmd_context_params_default();
+        mparams.use_gpu               = params.mmproj_use_gpu;
+        mparams.print_timings         = true;
+        mparams.n_threads             = params.cpuparams.n_threads;
+        mparams.flash_attn_type       = params.flash_attn_type;
+        mparams.warmup                = params.warmup;
+        mparams.image_min_tokens      = params.image_min_tokens;
+        mparams.image_max_tokens      = params.image_max_tokens;
         if (std::getenv("MTMD_DEBUG_GRAPH") != nullptr) {
             mparams.cb_eval_user_data = &cb_data;
-            mparams.cb_eval = common_debug_cb_eval;
+            mparams.cb_eval           = common_debug_cb_eval;
         }
         ctx_vision.reset(mtmd_init_from_file(clip_path, model, mparams));
         if (!ctx_vision.get()) {
@@ -176,11 +175,8 @@ struct mtmd_cli_context {
         if (antiprompt_tokens.empty() || generated_tokens.size() < antiprompt_tokens.size()) {
             return false;
         }
-        return std::equal(
-            generated_tokens.end() - antiprompt_tokens.size(),
-            generated_tokens.end(),
-            antiprompt_tokens.begin()
-        );
+        return std::equal(generated_tokens.end() - antiprompt_tokens.size(), generated_tokens.end(),
+                          antiprompt_tokens.begin());
     }
 
     bool load_media(const std::string & fname) {
@@ -207,7 +203,7 @@ static int generate_response(mtmd_cli_context & ctx, int n_predict) {
 
         if (llama_vocab_is_eog(ctx.vocab, token_id) || ctx.check_antiprompt(generated_tokens)) {
             LOG("\n");
-            break; // end of generation
+            break;  // end of generation
         }
 
         LOG("%s", common_token_to_piece(ctx.lctx, token_id).c_str());
@@ -220,14 +216,14 @@ static int generate_response(mtmd_cli_context & ctx, int n_predict) {
 
         // eval the token
         common_batch_clear(ctx.batch);
-        common_batch_add(ctx.batch, token_id, ctx.n_past++, {0}, true);
+        common_batch_add(ctx.batch, token_id, ctx.n_past++, { 0 }, true);
         if (llama_decode(ctx.lctx, ctx.batch)) {
             LOG_ERR("failed to decode token\n");
             return 1;
         }
     }
 
-    std::string generated_text = common_detokenize(ctx.lctx, generated_tokens);
+    std::string     generated_text = common_detokenize(ctx.lctx, generated_tokens);
     common_chat_msg msg;
     msg.role    = "assistant";
     msg.content = generated_text;
@@ -237,17 +233,16 @@ static int generate_response(mtmd_cli_context & ctx, int n_predict) {
 }
 
 static std::string chat_add_and_format(mtmd_cli_context & ctx, common_chat_msg & new_msg) {
-    LOG_DBG("chat_add_and_format: new_msg.role='%s', new_msg.content='%s'\n",
-        new_msg.role.c_str(), new_msg.content.c_str());
-    auto formatted = common_chat_format_single(ctx.tmpls.get(), ctx.chat_history,
-        new_msg, new_msg.role == "user",
-        ctx.use_jinja);
+    LOG_DBG("chat_add_and_format: new_msg.role='%s', new_msg.content='%s'\n", new_msg.role.c_str(),
+            new_msg.content.c_str());
+    auto formatted =
+        common_chat_format_single(ctx.tmpls.get(), ctx.chat_history, new_msg, new_msg.role == "user", ctx.use_jinja);
     ctx.chat_history.push_back(new_msg);
     return formatted;
 }
 
 static int eval_message(mtmd_cli_context & ctx, common_chat_msg & msg) {
-    bool add_bos = ctx.chat_history.empty();
+    bool add_bos        = ctx.chat_history.empty();
     auto formatted_chat = chat_add_and_format(ctx, msg);
     LOG_DBG("formatted_chat.prompt: %s\n", formatted_chat.c_str());
 
@@ -256,15 +251,16 @@ static int eval_message(mtmd_cli_context & ctx, common_chat_msg & msg) {
     text.add_special   = add_bos;
     text.parse_special = true;
 
-    if (g_is_interrupted) return 0;
+    if (g_is_interrupted) {
+        return 0;
+    }
 
     mtmd::input_chunks chunks(mtmd_input_chunks_init());
-    auto bitmaps_c_ptr = ctx.bitmaps.c_ptr();
-    int32_t res = mtmd_tokenize(ctx.ctx_vision.get(),
-                        chunks.ptr.get(), // output
-                        &text, // text
-                        bitmaps_c_ptr.data(),
-                        bitmaps_c_ptr.size());
+    auto               bitmaps_c_ptr = ctx.bitmaps.c_ptr();
+    int32_t            res           = mtmd_tokenize(ctx.ctx_vision.get(),
+                                                     chunks.ptr.get(),  // output
+                                                     &text,             // text
+                                                     bitmaps_c_ptr.data(), bitmaps_c_ptr.size());
     if (res != 0) {
         LOG_ERR("Unable to tokenize prompt, res = %d\n", res);
         return 1;
@@ -274,13 +270,13 @@ static int eval_message(mtmd_cli_context & ctx, common_chat_msg & msg) {
 
     llama_pos new_n_past;
     if (mtmd_helper_eval_chunks(ctx.ctx_vision.get(),
-                ctx.lctx, // lctx
-                chunks.ptr.get(), // chunks
-                ctx.n_past, // n_past
-                0, // seq_id
-                ctx.n_batch, // n_batch
-                true, // logits_last
-                &new_n_past)) {
+                                ctx.lctx,          // lctx
+                                chunks.ptr.get(),  // chunks
+                                ctx.n_past,        // n_past
+                                0,                 // seq_id
+                                ctx.n_batch,       // n_batch
+                                true,              // logits_last
+                                &new_n_past)) {
         LOG_ERR("Unable to eval prompt\n");
         return 1;
     }
@@ -306,7 +302,12 @@ int main(int argc, char ** argv) {
     }
 
 #if defined(LLAMA_SERVER_SMT_VISION)
-    if (params.media_backend == "smt" || !params.smt_config_dir.empty()) {
+    if (params.media_backend == "smt" || params.media_backend == "auto") {
+        if (params.smt_config_dir.empty()) {
+            show_additional_info(argc, argv);
+            LOG_ERR("ERR: Missing --smt-config-dir argument\n");
+            return 1;
+        }
         return mtmd_cli_smt_run(argc, argv, std::move(params));
     }
 #endif
@@ -331,13 +332,13 @@ int main(int argc, char ** argv) {
 
     // Ctrl+C handling
     {
-#if defined (__unix__) || (defined (__APPLE__) && defined (__MACH__))
+#if defined(__unix__) || (defined(__APPLE__) && defined(__MACH__))
         struct sigaction sigint_action;
         sigint_action.sa_handler = sigint_handler;
-        sigemptyset (&sigint_action.sa_mask);
+        sigemptyset(&sigint_action.sa_mask);
         sigint_action.sa_flags = 0;
         sigaction(SIGINT, &sigint_action, NULL);
-#elif defined (_WIN32)
+#elif defined(_WIN32)
         auto console_ctrl_handler = +[](DWORD ctrl_type) -> BOOL {
             return (ctrl_type == CTRL_C_EVENT) ? (sigint_handler(SIGINT), true) : false;
         };
@@ -345,7 +346,9 @@ int main(int argc, char ** argv) {
 #endif
     }
 
-    if (g_is_interrupted) return 130;
+    if (g_is_interrupted) {
+        return 130;
+    }
 
     auto eval_system_prompt_if_present = [&] {
         if (params.system_prompt.empty()) {
@@ -353,7 +356,7 @@ int main(int argc, char ** argv) {
         }
 
         common_chat_msg msg;
-        msg.role = "system";
+        msg.role    = "system";
         msg.content = params.system_prompt;
         return eval_message(ctx, msg);
     };
@@ -376,11 +379,11 @@ int main(int argc, char ** argv) {
         }
 
         common_chat_msg msg;
-        msg.role = "user";
+        msg.role    = "user";
         msg.content = params.prompt;
         for (const auto & image : params.image) {
             if (!ctx.load_media(image)) {
-                return 1; // error is already printed by libmtmd
+                return 1;  // error is already printed by libmtmd
             }
         }
         if (eval_message(ctx, msg)) {
@@ -410,7 +413,9 @@ int main(int argc, char ** argv) {
             console::set_display(DISPLAY_TYPE_USER_INPUT);
             std::string line;
             console::readline(line, false);
-            if (g_is_interrupted) break;
+            if (g_is_interrupted) {
+                break;
+            }
             console::set_display(DISPLAY_TYPE_RESET);
             line = string_strip(line);
             if (line.empty()) {
@@ -430,8 +435,8 @@ int main(int argc, char ** argv) {
                 continue;
             }
             g_is_generating = true;
-            bool is_image = line == "/image" || line.find("/image ") == 0;
-            bool is_audio = line == "/audio" || line.find("/audio ") == 0;
+            bool is_image   = line == "/image" || line.find("/image ") == 0;
+            bool is_audio   = line == "/audio" || line.find("/audio ") == 0;
             if (is_image || is_audio) {
                 if (line.size() < 8) {
                     LOG_ERR("ERR: Missing media filename\n");
@@ -448,20 +453,24 @@ int main(int argc, char ** argv) {
                 content += line;
             }
             common_chat_msg msg;
-            msg.role = "user";
+            msg.role    = "user";
             msg.content = content;
-            int ret = eval_message(ctx, msg);
+            int ret     = eval_message(ctx, msg);
             if (ret) {
                 return 1;
             }
-            if (g_is_interrupted) break;
+            if (g_is_interrupted) {
+                break;
+            }
             if (generate_response(ctx, n_predict)) {
                 return 1;
             }
             content.clear();
         }
     }
-    if (g_is_interrupted) LOG("\nInterrupted by user\n");
+    if (g_is_interrupted) {
+        LOG("\nInterrupted by user\n");
+    }
     LOG("\n\n");
     llama_perf_context_print(ctx.lctx);
     return g_is_interrupted ? 130 : 0;

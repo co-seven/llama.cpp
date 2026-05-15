@@ -124,6 +124,10 @@ target_link_libraries(llama-mtmd-debug PRIVATE llama-common mtmd Threads::Thread
 target_compile_features(llama-mtmd-debug PRIVATE cxx_std_17)
 
 if(LLAMA_SERVER_SMT_VISION)
+    if(WIN32)
+        message(FATAL_ERROR "LLAMA_SERVER_SMT_VISION is not supported on Windows because the SMT audio backend depends on POSIX dlopen APIs")
+    endif()
+
     if(NOT DEFINED SPACEMIT_ORT_DIR)
         message(FATAL_ERROR "SPACEMIT_ORT_DIR must be set when LLAMA_SERVER_SMT_VISION=ON")
     endif()
@@ -166,8 +170,10 @@ if(LLAMA_SERVER_SMT_VISION)
 
     target_link_libraries(${TARGET} PRIVATE
         ${ONNXRUNTIME_LIB}
-        dl
     )
+    if(CMAKE_DL_LIBS)
+        target_link_libraries(${TARGET} PRIVATE ${CMAKE_DL_LIBS})
+    endif()
 
     target_compile_definitions(${TARGET} PRIVATE LLAMA_SERVER_SMT_VISION=1)
 endif()

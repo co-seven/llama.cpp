@@ -28,6 +28,10 @@ target_include_directories(${TARGET} PRIVATE ${CMAKE_SOURCE_DIR})
 target_link_libraries(${TARGET} PUBLIC llama-common mtmd ${CMAKE_THREAD_LIBS_INIT})
 
 if(LLAMA_SERVER_SMT_VISION)
+    if(WIN32)
+        message(FATAL_ERROR "LLAMA_SERVER_SMT_VISION is not supported on Windows because the SMT audio backend depends on POSIX dlopen APIs")
+    endif()
+
     if(NOT DEFINED SPACEMIT_ORT_DIR)
         message(FATAL_ERROR "SPACEMIT_ORT_DIR must be set when LLAMA_SERVER_SMT_VISION=ON")
     endif()
@@ -67,7 +71,10 @@ if(LLAMA_SERVER_SMT_VISION)
         ${SPACEMIT_ORT_SAMPLE_DIR}
         ${SPACEMIT_ORT_INC_DIR}
     )
-    target_link_libraries(${TARGET} PRIVATE ${ONNXRUNTIME_LIB} dl)
+    target_link_libraries(${TARGET} PRIVATE ${ONNXRUNTIME_LIB})
+    if(CMAKE_DL_LIBS)
+        target_link_libraries(${TARGET} PRIVATE ${CMAKE_DL_LIBS})
+    endif()
 endif()
 
 

@@ -5,8 +5,10 @@
 #include "onnxruntime_cxx_api.h"
 #include "onnxruntime_session_options_config_keys.h"
 
-#include <dirent.h>
-#include <dlfcn.h>
+#ifndef _WIN32
+#    include <dirent.h>
+#    include <dlfcn.h>
+#endif
 
 #include <algorithm>
 #include <array>
