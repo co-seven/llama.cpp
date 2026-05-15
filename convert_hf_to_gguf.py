@@ -4911,6 +4911,24 @@ class Qwen3ASRTextModel(Qwen3Model):
 
         super().__init__(dir_model, *args, hparams=hparams, **kwargs)
 
+    def set_gguf_parameters(self):
+        super().set_gguf_parameters()
+        self.gguf_writer.add_num_deepstack_layers(0)
+
+    def set_vocab(self):
+        super().set_vocab()
+        # fix chat template, use correct chatml format
+        self.gguf_writer.add_chat_template("{% for message in messages %}{{'<|im_start|>' + message['role'] + '\\n' + message['content'] + '<|im_end|>' + '\\n'}}{% endfor %}{% if add_generation_prompt %}{{ '<|im_start|>assistant\\n' }}{% endif %}")
+        # correct BOS/EOS tokens
+        with open(self.dir_model / "tokenizer_config.json", "r", encoding="utf-8") as f:
+            tokenizer_config = json.load(f)
+            added_tokens = tokenizer_config.get("added_tokens_decoder", {})
+            for token_id, data in added_tokens.items():
+                if data.get("content") == "<|im_end|>":
+                    self.gguf_writer.add_bos_token_id(int(token_id))
+                    self.gguf_writer.add_eos_token_id(int(token_id))
+                    break
+
     def modify_tensors(self, data_torch: Tensor, name: str, bid: int | None) -> Iterable[tuple[str, Tensor]]:
         if name.startswith("thinker.audio_tower."):
             return
@@ -5424,29 +5442,6 @@ class Qwen3OmniMoeTextModel(Qwen3VLMoeTextModel):
     def set_gguf_parameters(self):
         super().set_gguf_parameters()
         self.gguf_writer.add_num_deepstack_layers(0)
-
-
-@ModelBase.register("Qwen3ASRForConditionalGeneration")
-class Qwen3ASRTextModel(Qwen3VLTextModel):
-    model_arch = gguf.MODEL_ARCH.QWEN3VL
-
-    def set_gguf_parameters(self):
-        super().set_gguf_parameters()
-        self.gguf_writer.add_num_deepstack_layers(0)
-
-    def set_vocab(self):
-        super().set_vocab()
-        # fix chat template, use correct chatml format
-        self.gguf_writer.add_chat_template("{% for message in messages %}{{'<|im_start|>' + message['role'] + '\\n' + message['content'] + '<|im_end|>' + '\\n'}}{% endfor %}{% if add_generation_prompt %}{{ '<|im_start|>assistant\\n' }}{% endif %}")
-        # correct BOS/EOS tokens
-        with open(self.dir_model / "tokenizer_config.json", "r", encoding="utf-8") as f:
-            tokenizer_config = json.load(f)
-            added_tokens = tokenizer_config.get("added_tokens_decoder", {})
-            for token_id, data in added_tokens.items():
-                if data.get("content") == "<|im_end|>":
-                    self.gguf_writer.add_bos_token_id(int(token_id))
-                    self.gguf_writer.add_eos_token_id(int(token_id))
-                    break
 
 
 class _LinearAttentionVReorderBase(Qwen3NextModel):
