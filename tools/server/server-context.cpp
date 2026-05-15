@@ -911,7 +911,7 @@ private:
                 return false;
             }
             try {
-                smt_ctx = server_smt_vision_init(ctx, smt_config_dir, params_base.warmup);
+                smt_ctx = server_smt_vision_init(ctx_tgt, smt_config_dir, params_base.warmup);
             } catch (const std::exception & e) {
                 SRV_ERR("failed to load SMT backend from '%s': %s\n", smt_config_dir.c_str(), e.what());
                 return false;
@@ -2812,7 +2812,7 @@ private:
                         // process the image
                         size_t n_tokens_out = 0;
                         const int64_t t_prefill_start = ggml_time_us();
-                        int32_t res = input_tokens.process_chunk(ctx, mctx, smt_ctx, slot.prompt.n_tokens(), slot.prompt.tokens.pos_next(), slot.id, n_tokens_out);
+                        int32_t res = input_tokens.process_chunk(ctx_tgt, mctx, smt_ctx, slot.prompt.n_tokens(), slot.prompt.tokens.pos_next(), slot.id, n_tokens_out);
                         const double t_prefill_ms = (ggml_time_us() - t_prefill_start) / 1e3;
                         if (res != 0) {
                             SLT_ERR(slot, "failed to process image, res = %d\n", res);
@@ -2878,7 +2878,7 @@ private:
                     while (slot.prompt.n_tokens() < slot.task->n_tokens() && input_tokens[slot.prompt.n_tokens()] == LLAMA_TOKEN_NULL) {
                         // process the image
                         size_t n_tokens_out = 0;
-                        int32_t res = input_tokens.process_chunk(ctx, mctx, smt_ctx, slot.prompt.n_tokens(), slot.prompt.tokens.pos_next(), slot.id, n_tokens_out);
+                        int32_t res = input_tokens.process_chunk(ctx_tgt, mctx, smt_ctx, slot.prompt.n_tokens(), slot.prompt.tokens.pos_next(), slot.id, n_tokens_out);
                         if (res != 0) {
                             SLT_ERR(slot, "failed to process image, res = %d\n", res);
                             send_error(slot, "failed to process image", ERROR_TYPE_SERVER);
@@ -2890,7 +2890,7 @@ private:
                             // TODO: in the future, figure out how to infuse target embeddings to the images
                             //       for now, we skip this for simplicity
                             //       maybe we simply need to call `common_speculative_process()` on the mtmd batches in the `process_chunk` above?
-                            res = input_tokens.process_chunk(ctx_dft.get(), mctx, slot.prompt.n_tokens(), slot.prompt.tokens.pos_next(), slot.id, n_tokens_out);
+                            res = input_tokens.process_chunk(ctx_dft.get(), mctx, smt_ctx, slot.prompt.n_tokens(), slot.prompt.tokens.pos_next(), slot.id, n_tokens_out);
                             if (res != 0) {
                                 GGML_ABORT("failed to process multi-modal data on draft context\n");
                             }
@@ -4499,7 +4499,7 @@ json server_routes::get_model_info() const {
             {"n_embd",      meta->model_n_embd_inp},
             {"n_params",    meta->model_n_params},
             {"size",        meta->model_size},
-            {"vision_backend", meta->vision_backend},
+            {"vision_backend", meta->media_backend},
         }},
     };
 }
