@@ -1298,7 +1298,10 @@ class TextModel(ModelBase):
 
             from transformers import AutoProcessor
 
-            processor = AutoProcessor.from_pretrained(self.dir_model, trust_remote_code=True)
+            processor = AutoProcessor.from_pretrained(
+                self.dir_model,
+                trust_remote_code=trust_remote_code,
+            )
             tokenizer = getattr(processor, "tokenizer", None)
             if tokenizer is None:
                 raise ValueError("AutoProcessor fallback did not provide a tokenizer") from exc
