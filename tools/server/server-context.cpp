@@ -1251,9 +1251,6 @@ struct server_context_impl {
             // cache prompts only for completion tasks
             update_cache = update_cache && task.type == SERVER_TASK_TYPE_COMPLETION;
 
-            // don't update the cache if the slot's context is empty
-            update_cache = update_cache && tokens.size() > 0;
-
             // TODO: mtmd does not support prompt cache
             update_cache = update_cache && !ret->prompt.tokens.has_mtmd;
 
@@ -1262,7 +1259,8 @@ struct server_context_impl {
 
                 const int64_t t_start = ggml_time_us();
 
-                // don't save the slot's state if its context is empty
+                // An empty slot may still restore a better prompt from cache after
+                // cache-idle-slots cleared its local prompt tokens.
                 if (tokens.size() > 0) {
                     ret->prompt_save(*prompt_cache);
                 }
