@@ -96,6 +96,22 @@ struct mtmd_audio_preprocessor_gemma4a : mtmd_audio_preprocessor {
     mtmd_audio_cache cache;
 };
 
+// Generic helper to compute a log-mel spectrogram with the same implementation used by mtmd.
+// The output layout is [n_mel, n_len] flattened in row-major order per mel bin.
+bool mtmd_audio_compute_log_mel_spectrogram(const float * samples,
+                                            size_t        n_samples,
+                                            int           n_threads,
+                                            int           n_mel,
+                                            int           n_fft,
+                                            int           window_len,
+                                            int           hop_len,
+                                            int           sample_rate,
+                                            bool          center_padding,
+                                            float         preemph,
+                                            bool          use_natural_log,
+                                            bool          norm_per_feature,
+                                            mtmd_audio_mel & out);
+
 //
 // streaming ISTFT - converts spectrogram frames back to audio one frame at a time
 //

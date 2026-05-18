@@ -5,6 +5,7 @@
 #include "llama.h"
 #include "chat.h"
 #include "mtmd.h"
+#include "server-smt-vision.h"
 
 #define JSON_ASSERT GGML_ASSERT
 #include <nlohmann/json.hpp>
@@ -124,7 +125,7 @@ std::vector<size_t> lora_get_enabled_ids(const std::vector<common_adapter_lora_i
 //
 
 /**
- * server_tokens is a helper to manage the input tokens and image for the server.
+ * server_tokens is a helper to manage the input tokens and media for the server.
  * it is made this way to simplify the logic of KV cache management.
  */
 struct server_tokens {
@@ -132,9 +133,12 @@ struct server_tokens {
 
 private: // disallow accessing these members directly, risking out-of-sync
 
-    // map a **start** index in tokens to the image chunk
+    // map a **start** index in tokens to the media chunk
     // note: the order need to be in-sync with tokens
     std::map<size_t, mtmd::input_chunk_ptr> map_idx_to_media;
+    std::map<size_t, server_smt_image_chunk> map_idx_to_smt_media;
+
+    bool has_smt = false;
 
     // list of tokens
     //   if the token is LLAMA_TOKEN_NULL, it indicates that this position is occupied by media chunk
@@ -172,18 +176,16 @@ public:
     // for debugging
     std::string str() const;
 
-    // the next position after n_tokens. if n_tokens < 0, return the next position after all tokens.
     llama_pos pos_next(int64_t n_tokens = -1) const;
-
-    // number of tokens with position < max_pos
     size_t size_up_to_pos(llama_pos max_pos) const;
-
     const mtmd::input_chunk_ptr & find_chunk(size_t idx) const;
+    const server_smt_image_chunk & find_smt_chunk(size_t idx) const;
 
     void push_back(llama_token tok);
 
     // will create a copy of the chunk if it contains non-text data
     void push_back(const mtmd_input_chunk * chunk);
+    void push_back(const server_smt_image_chunk & chunk);
 
     // appends server tokens, updates the media map. copies media chunks.
     void push_back(server_tokens & tokens);
@@ -202,10 +204,13 @@ public:
     size_t size() const { return tokens.size(); }
 
     bool empty() const { return tokens.empty(); }
+    bool is_smt() const { return has_mtmd && has_smt; }
 
     void clear() {
         map_idx_to_media.clear();
+        map_idx_to_smt_media.clear();
         tokens.clear();
+        has_smt = false;
     }
 
     void keep_first(size_t n);
@@ -221,6 +226,7 @@ public:
     int32_t process_chunk(
                 llama_context * ctx,
                 mtmd_context * mctx,
+                const server_smt_vision_context * smt_ctx,
                 size_t idx,
                 llama_pos pos,
                 int32_t seq_id,
@@ -259,6 +265,13 @@ size_t validate_utf8(const std::string& text);
 
 // process mtmd prompt, return the server_tokens containing both text tokens and media chunks
 server_tokens process_mtmd_prompt(mtmd_context * mctx, std::string prompt, std::vector<raw_buffer> files);
+server_tokens process_smt_prompt(
+                    server_smt_vision_context * smt_ctx,
+                    const llama_vocab * vocab,
+                    std::string prompt,
+                    std::vector<raw_buffer> files,
+                    bool add_special = true,
+                    bool parse_special = true);
 
 /**
  * break the input "prompt" object into multiple prompt if needed, then tokenize them
@@ -276,6 +289,7 @@ server_tokens process_mtmd_prompt(mtmd_context * mctx, std::string prompt, std::
 std::vector<server_tokens> tokenize_input_prompts(
                                         const llama_vocab * vocab,
                                         mtmd_context * mctx,
+                                        server_smt_vision_context * smt_ctx,
                                         const json & json_prompt,
                                         bool add_special,
                                         bool parse_special);
@@ -293,6 +307,10 @@ struct server_chat_params {
     common_chat_templates_ptr tmpls;
     bool allow_image;
     bool allow_audio;
+    // Legacy flag name: when true, parsing follows SMT vision media rules
+    // (.bin tensors and raw image payloads handled by SMT preprocessing path).
+    bool image_bin_only = false;
+    std::string media_backend = "none";
     bool enable_thinking = true;
     int  reasoning_budget = -1;
     std::string reasoning_budget_message;

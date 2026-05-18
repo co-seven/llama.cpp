@@ -1250,19 +1250,77 @@ class TextModel(ModelBase):
 
         return seems_special
 
+    def load_hf_tokenizer(self, *, trust_remote_code: bool = False):
+        from transformers import AutoTokenizer, PreTrainedTokenizerFast
+
+        try:
+            return AutoTokenizer.from_pretrained(self.dir_model, trust_remote_code=trust_remote_code)
+        except ValueError as exc:
+            tokenizer_config_path = self.dir_model / "tokenizer_config.json"
+            tokenizer_class = None
+
+            if tokenizer_config_path.is_file():
+                with open(tokenizer_config_path, encoding="utf-8") as f:
+                    tokenizer_class = json.load(f).get("tokenizer_class")
+
+            if tokenizer_class != "TokenizersBackend":
+                raise
+
+            tokenizer_json_path = self.dir_model / "tokenizer.json"
+            tokenizer_config = {}
+            if tokenizer_config_path.is_file():
+                with open(tokenizer_config_path, encoding="utf-8") as f:
+                    tokenizer_config = json.load(f)
+
+            if tokenizer_json_path.is_file():
+                logger.warning(
+                    "AutoTokenizer failed for %s with tokenizer_class=%s; "
+                    "falling back to tokenizer.json",
+                    self.dir_model,
+                    tokenizer_class,
+                )
+                return PreTrainedTokenizerFast(
+                    tokenizer_file=str(tokenizer_json_path),
+                    bos_token=tokenizer_config.get("bos_token"),
+                    eos_token=tokenizer_config.get("eos_token"),
+                    unk_token=tokenizer_config.get("unk_token"),
+                    pad_token=tokenizer_config.get("pad_token"),
+                    clean_up_tokenization_spaces=tokenizer_config.get("clean_up_tokenization_spaces", False),
+                    split_special_tokens=tokenizer_config.get("split_special_tokens", False),
+                )
+
+            logger.warning(
+                "AutoTokenizer failed for %s with tokenizer_class=%s; "
+                "falling back to AutoProcessor.tokenizer",
+                self.dir_model,
+                tokenizer_class,
+            )
+
+            from transformers import AutoProcessor
+
+            processor = AutoProcessor.from_pretrained(
+                self.dir_model,
+                trust_remote_code=trust_remote_code,
+            )
+            tokenizer = getattr(processor, "tokenizer", None)
+            if tokenizer is None:
+                raise ValueError("AutoProcessor fallback did not provide a tokenizer") from exc
+
+            return tokenizer
+
     # used for GPT-2 BPE and WordPiece vocabs
     def get_vocab_base(self) -> tuple[list[str], list[int], str]:
         tokens: list[str] = []
         toktypes: list[int] = []
 
-        from transformers import AutoTokenizer
-        tokenizer = AutoTokenizer.from_pretrained(self.dir_model)
-        vocab_size = self.hparams.get("vocab_size", len(tokenizer.vocab))  # ty: ignore[unresolved-attribute]
-        assert max(tokenizer.vocab.values()) < vocab_size  # ty: ignore[unresolved-attribute]
+        tokenizer = self.load_hf_tokenizer()
+        vocab = tokenizer.get_vocab()
+        vocab_size = self.hparams.get("vocab_size", len(vocab))
+        assert max(vocab.values()) < vocab_size
 
         tokpre = self.get_vocab_base_pre(tokenizer)
 
-        reverse_vocab = {id_: encoded_tok for encoded_tok, id_ in tokenizer.vocab.items()}  # ty: ignore[unresolved-attribute]
+        reverse_vocab = {id_: encoded_tok for encoded_tok, id_ in vocab.items()}
         added_vocab = tokenizer.get_added_vocab()  # ty: ignore[unresolved-attribute]
 
         added_tokens_decoder = tokenizer.added_tokens_decoder  # ty: ignore[unresolved-attribute]
@@ -3882,7 +3940,7 @@ class Qwen2Model(TextModel):
     def set_vocab(self):
         try:
             self._set_vocab_sentencepiece()
-        except FileNotFoundError:
+        except (FileNotFoundError, ModuleNotFoundError, ImportError):
             self._set_vocab_gpt2()
 
     def set_gguf_parameters(self):
@@ -4839,6 +4897,54 @@ class Qwen3Model(Qwen2Model):
         yield from super().modify_tensors(data_torch, name, bid)
 
 
+@ModelBase.register("Qwen3ASRForConditionalGeneration")
+class Qwen3ASRTextModel(Qwen3Model):
+    model_arch = gguf.MODEL_ARCH.QWEN3
+
+    def __init__(self, dir_model: Path, *args, **kwargs):
+        hparams = kwargs.pop("hparams", None)
+        if hparams is None:
+            hparams = ModelBase.load_hparams(dir_model, self.is_mistral_format)
+
+        thinker_config = hparams.get("thinker_config", {})
+        text_config = dict(thinker_config.get("text_config", {}))
+        if text_config and text_config.get("architectures") is None and text_config.get("model_type") == "qwen3":
+            text_config["architectures"] = ["Qwen3ForCausalLM"]
+        if text_config:
+            hparams = {**hparams, "text_config": text_config}
+
+        super().__init__(dir_model, *args, hparams=hparams, **kwargs)
+
+    def set_gguf_parameters(self):
+        super().set_gguf_parameters()
+        self.gguf_writer.add_num_deepstack_layers(0)
+
+    def set_vocab(self):
+        super().set_vocab()
+        # fix chat template, use correct chatml format
+        self.gguf_writer.add_chat_template("{% for message in messages %}{{'<|im_start|>' + message['role'] + '\\n' + message['content'] + '<|im_end|>' + '\\n'}}{% endfor %}{% if add_generation_prompt %}{{ '<|im_start|>assistant\\n' }}{% endif %}")
+        # correct BOS/EOS tokens
+        with open(self.dir_model / "tokenizer_config.json", "r", encoding="utf-8") as f:
+            tokenizer_config = json.load(f)
+            added_tokens = tokenizer_config.get("added_tokens_decoder", {})
+            for token_id, data in added_tokens.items():
+                if data.get("content") == "<|im_end|>":
+                    self.gguf_writer.add_bos_token_id(int(token_id))
+                    self.gguf_writer.add_eos_token_id(int(token_id))
+                    break
+
+    def modify_tensors(self, data_torch: Tensor, name: str, bid: int | None) -> Iterable[tuple[str, Tensor]]:
+        if name.startswith("thinker.audio_tower."):
+            return
+
+        if name.startswith("thinker.model.") or name.startswith("thinker.lm_head."):
+            name = name.removeprefix("thinker.")
+        elif name.startswith("thinker."):
+            return
+
+        yield from super().modify_tensors(data_torch, name, bid)
+
+
 @ModelBase.register("Qwen3MoeForCausalLM")
 class Qwen3MoeModel(Qwen2MoeModel):
     model_arch = gguf.MODEL_ARCH.QWEN3MOE
@@ -5340,29 +5446,6 @@ class Qwen3OmniMoeTextModel(Qwen3VLMoeTextModel):
     def set_gguf_parameters(self):
         super().set_gguf_parameters()
         self.gguf_writer.add_num_deepstack_layers(0)
-
-
-@ModelBase.register("Qwen3ASRForConditionalGeneration")
-class Qwen3ASRTextModel(Qwen3VLTextModel):
-    model_arch = gguf.MODEL_ARCH.QWEN3VL
-
-    def set_gguf_parameters(self):
-        super().set_gguf_parameters()
-        self.gguf_writer.add_num_deepstack_layers(0)
-
-    def set_vocab(self):
-        super().set_vocab()
-        # fix chat template, use correct chatml format
-        self.gguf_writer.add_chat_template("{% for message in messages %}{{'<|im_start|>' + message['role'] + '\\n' + message['content'] + '<|im_end|>' + '\\n'}}{% endfor %}{% if add_generation_prompt %}{{ '<|im_start|>assistant\\n' }}{% endif %}")
-        # correct BOS/EOS tokens
-        with open(self.dir_model / "tokenizer_config.json", "r", encoding="utf-8") as f:
-            tokenizer_config = json.load(f)
-            added_tokens = tokenizer_config.get("added_tokens_decoder", {})
-            for token_id, data in added_tokens.items():
-                if data.get("content") == "<|im_end|>":
-                    self.gguf_writer.add_bos_token_id(int(token_id))
-                    self.gguf_writer.add_eos_token_id(int(token_id))
-                    break
 
 
 class _LinearAttentionVReorderBase(Qwen3NextModel):
@@ -14104,6 +14187,8 @@ def get_model_architecture(hparams: dict[str, Any], model_type: ModelType) -> st
     # TODO @ngxson : this won't work correctly if the model has both audio & vision encoders
     # maybe we should fallback to text model's arch in that case, since not many models have both
     text_config = hparams.get("text_config", {})
+    if model_type == ModelType.TEXT and hparams.get("thinker_config", {}).get("text_config") is not None:
+        text_config = hparams["thinker_config"]["text_config"]
     vision_config = hparams.get("vision_config", {})
     arch = None
     if (arches := hparams.get("architectures")) is not None and len(arches) > 0:
@@ -14121,6 +14206,8 @@ def get_model_architecture(hparams: dict[str, Any], model_type: ModelType) -> st
     # if "architectures" is found in the sub-config, use that instead
     if model_type == ModelType.TEXT and text_config.get("architectures") is not None:
         arch = text_config["architectures"][0]
+    elif model_type == ModelType.TEXT and arch == "Qwen3ASRForConditionalGeneration" and text_config.get("model_type") == "qwen3":
+        arch = "Qwen3ASRForConditionalGeneration"
     elif model_type == ModelType.MMPROJ and vision_config.get("architectures") is not None:
         arch = vision_config["architectures"][0]
     if arch is None:

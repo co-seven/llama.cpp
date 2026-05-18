@@ -116,6 +116,11 @@ option(LLAMA_TESTS_INSTALL          "llama: install tests"                      
 # 3rd party libs
 option(LLAMA_OPENSSL    "llama: use openssl to support HTTPS" ON)
 option(LLAMA_LLGUIDANCE "llama-common: include LLGuidance library for structured output in common utils" OFF)
+option(LLAMA_SERVER_SMT_VISION "llama: enable SpacemiT multimodal SMT extensions" OFF)
+
+if (LLAMA_SERVER_SMT_VISION)
+    add_compile_definitions(LLAMA_SERVER_SMT_VISION=1)
+endif()
 
 
 # Required for relocatable CMake package

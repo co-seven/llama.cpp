@@ -11,6 +11,10 @@ on:
       'ggml/src/spacemit/*',
       'ggml/src/arch/loongarch/*'
     ]
+  pull_request:
+    branches:
+      - master
+      - spacemit-mtmd
   # run once every week
   schedule:
     - cron: '0 0 * * 0'

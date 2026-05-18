@@ -525,6 +525,49 @@ static bool log_mel_spectrogram(
     return true;
 }
 
+bool mtmd_audio_compute_log_mel_spectrogram(const float * samples,
+                                            size_t        n_samples,
+                                            int           n_threads,
+                                            int           n_mel,
+                                            int           n_fft,
+                                            int           window_len,
+                                            int           hop_len,
+                                            int           sample_rate,
+                                            bool          center_padding,
+                                            float         preemph,
+                                            bool          use_natural_log,
+                                            bool          norm_per_feature,
+                                            mtmd_audio_mel & out) {
+    if (samples == nullptr || n_samples == 0 || n_mel <= 0 || n_fft <= 0 || window_len <= 0 || hop_len <= 0 ||
+        sample_rate <= 0) {
+        return false;
+    }
+
+    mtmd_audio_cache cache;
+    cache.fill_sin_cos_table(n_fft);
+    cache.fill_hann_window(window_len, true);
+    cache.fill_mel_filterbank_matrix(n_mel, n_fft, sample_rate);
+
+    filter_params params;
+    params.n_mel            = n_mel;
+    params.n_fft_bins       = 1 + (n_fft / 2);
+    params.hann_window_size = window_len;
+    params.hop_length       = hop_len;
+    params.sample_rate      = sample_rate;
+    params.center_padding   = center_padding;
+    params.preemph          = preemph;
+    params.use_natural_log  = use_natural_log;
+    params.norm_per_feature = norm_per_feature;
+
+    return log_mel_spectrogram(
+            samples,
+            (int) n_samples,
+            std::max(1, n_threads),
+            params,
+            cache,
+            out);
+}
+
 //
 // mtmd_audio_preprocessor_whisper
 //
