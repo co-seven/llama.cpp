@@ -42,9 +42,11 @@ void ggml_profile_flush_trace(void) {
 }
 #    else
 #        include <pthread.h>
-#        include <sys/syscall.h>
 #        include <time.h>
-#        include <unistd.h>
+#        if defined(__linux__)
+#            include <sys/syscall.h>
+#            include <unistd.h>
+#        endif
 
 static int            g_trace_enabled = 0;
 static pthread_once_t g_trace_once    = PTHREAD_ONCE_INIT;
@@ -67,7 +69,11 @@ static inline int64_t ggml_trace_now_us(void) {
 }
 
 static inline unsigned long ggml_trace_tid(void) {
+#        if defined(__linux__)
     return (unsigned long) syscall(SYS_gettid);
+#        else
+    return (unsigned long) (uintptr_t) pthread_self();
+#        endif
 }
 
 static pthread_mutex_t g_trace_mutex = PTHREAD_MUTEX_INITIALIZER;

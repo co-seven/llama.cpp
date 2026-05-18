@@ -93,6 +93,6 @@ inline int32_t server_smt_vision_decode_chunk(
         int32_t /* seq_id */,
         int32_t /* n_batch */,
         bool /* logits_last */) {
-    return 1;
+    return -1;
 }
 #endif

@@ -1073,6 +1073,14 @@ static std::string format_qwen3asr_audio_prompt(const mtmd_cli_smt_context & ctx
 // ============================================================
 
 static int eval_message_smt(mtmd_cli_smt_context & ctx, common_chat_msg & msg) {
+    struct pending_media_guard {
+        mtmd_cli_smt_context & ctx;
+
+        ~pending_media_guard() {
+            ctx.pending_media.clear();
+        }
+    } guard{ctx};
+
     bool add_bos = ctx.chat_history.empty();
 
     if (msg.role == "user" && ctx.pending_image_count() > 0) {
@@ -1238,8 +1246,6 @@ static int eval_message_smt(mtmd_cli_smt_context & ctx, common_chat_msg & msg) {
             }
         }
     }
-
-    ctx.pending_media.clear();
 
     LOG("\n");
     return 0;

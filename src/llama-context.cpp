@@ -3762,6 +3762,7 @@ int32_t llama_encode(
 int32_t llama_decode(
         llama_context * ctx,
           llama_batch   batch) {
+#ifdef GGML_BUILD_PROFILE
     // Distinguish between prefill and decode phases
     const char * phase_name = (batch.n_tokens > 1) ? "llama_decode_prefill" : "llama_decode_generate";
 
@@ -3769,13 +3770,16 @@ int32_t llama_decode(
     snprintf(args, sizeof(args), "\"n_tokens\":%d", batch.n_tokens);
 
     ggml_trace_log_begin(phase_name, "Decode", args);
+#endif
 
     const int ret = ctx->decode(batch);
     if (ret != 0 && ret != 1) {
         LLAMA_LOG_ERROR("%s: failed to decode, ret = %d\n", __func__, ret);
     }
 
+#ifdef GGML_BUILD_PROFILE
     ggml_trace_log_end(phase_name, "Decode", NULL);
+#endif
 
     return ret;
 }
