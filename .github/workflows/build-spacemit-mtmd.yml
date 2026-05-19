@@ -1,0 +1,166 @@
+name: CI (SpacemiT MTMD)
+
+on:
+  push:
+    branches:
+      - spacemit-mtmd
+  pull_request:
+    branches:
+      - spacemit-mtmd
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref && github.ref || github.run_id }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  SPACEMIT_IME_TOOLCHAIN_VERSION: "1.1.2"
+  SPACEMIT_ORT_URL: https://github.com/spacemit-com/onnxruntime/releases/download/2.0.2/spacemit-ort.riscv64.2.0.2.tar.gz
+  SPACEMIT_MTMD_RELEASE_TAG: spacemit-llama.cpp.riscv64.0.1.0
+jobs:
+  build:
+    name: Build SpacemiT MTMD
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Clone
+        uses: actions/checkout@v6
+
+      - name: Setup SpacemiT Toolchain
+        uses: ./.github/actions/linux-setup-spacemit
+        with:
+          path: ./spacemit_toolchain
+          version: ${{ env.SPACEMIT_IME_TOOLCHAIN_VERSION }}
+
+      - name: Download SpacemiT ORT
+        run: |
+          set -euo pipefail
+
+          mkdir -p third_party/spacemit-ort
+          curl -L --fail --retry 5 --retry-all-errors \
+            -o spacemit-ort.riscv64.2.0.2.tar.gz \
+            "${SPACEMIT_ORT_URL}"
+          tar -xzf spacemit-ort.riscv64.2.0.2.tar.gz -C third_party/spacemit-ort
+
+          ORT_DIR=$(find third_party/spacemit-ort -mindepth 1 -maxdepth 1 -type d | head -n 1)
+          if [[ -z "${ORT_DIR}" ]]; then
+            ORT_DIR="${PWD}/third_party/spacemit-ort"
+          else
+            ORT_DIR="${PWD}/${ORT_DIR}"
+          fi
+
+          if [[ ! -d "${ORT_DIR}/include" || ! -d "${ORT_DIR}/lib" || ! -d "${ORT_DIR}/samples" ]]; then
+            echo "error: invalid SPACEMIT_ORT_DIR layout at ${ORT_DIR}" >&2
+            find third_party/spacemit-ort -maxdepth 2 -type d | sort
+            exit 1
+          fi
+
+          echo "SPACEMIT_ORT_DIR=${ORT_DIR}" >> "$GITHUB_ENV"
+
+      - name: Build
+        run: |
+          export RISCV_ROOT_PATH=${PWD}/spacemit_toolchain
+          if [[ ! -d "${SPACEMIT_ORT_DIR}/include" ]]; then
+            echo "error: include directory not found under SPACEMIT_ORT_DIR: ${SPACEMIT_ORT_DIR}/include" >&2
+            exit 1
+          fi
+
+          if [[ ! -d "${SPACEMIT_ORT_DIR}/lib" ]]; then
+            echo "error: lib directory not found under SPACEMIT_ORT_DIR: ${SPACEMIT_ORT_DIR}/lib" >&2
+            exit 1
+          fi
+
+          if [[ ! -d "${SPACEMIT_ORT_DIR}/samples" ]]; then
+            echo "error: samples directory not found under SPACEMIT_ORT_DIR: ${SPACEMIT_ORT_DIR}/samples" >&2
+            exit 1
+          fi
+
+          echo "Using SPACEMIT_ORT_DIR=${SPACEMIT_ORT_DIR}"
+          rm -rf build/CMakeCache.txt
+          cmake -B build \
+              -DCMAKE_BUILD_TYPE=Release \
+              -DGGML_CPU_RISCV64_SPACEMIT=ON \
+              -DGGML_CPU_REPACK=OFF \
+              -DLLAMA_CURL=OFF \
+              -DGGML_RVV=ON \
+              -DGGML_RV_ZVFH=ON \
+              -DGGML_RV_ZFH=ON \
+              -DGGML_RV_ZICBOP=ON \
+              -DGGML_RV_ZIHINTPAUSE=ON \
+              -DGGML_RV_ZBA=ON \
+              -DCMAKE_INSTALL_PREFIX=build/installed \
+              -DCMAKE_TOOLCHAIN_FILE=${PWD}/cmake/riscv64-spacemit-linux-gnu-gcc.cmake \
+              -DLLAMA_SERVER_SMT_VISION=ON \
+              -DSPACEMIT_ORT_DIR=${SPACEMIT_ORT_DIR}
+
+          cmake --build build --parallel "$(nproc)" --config Release
+
+          pushd build >/dev/null
+          make install
+          popd >/dev/null
+
+      - name: Pack artifacts
+        run: |
+          set -euo pipefail
+          mkdir -p release
+
+          ASSET_NAME="llama-${SPACEMIT_MTMD_RELEASE_TAG}-bin-spacemit-mtmd.tar.gz"
+          tar -czf "release/${ASSET_NAME}" -C build/installed .
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v6
+        with:
+          name: llama-bin-spacemit-mtmd
+          path: release/*.tar.gz
+          if-no-files-found: error
+          retention-days: 14
+
+  release:
+    name: Publish GitHub Release
+    if: ${{ github.event_name == 'push' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository) }}
+    needs:
+      - build
+    runs-on: ubuntu-24.04
+
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download build artifact
+        uses: actions/download-artifact@v7
+        with:
+          name: llama-bin-spacemit-mtmd
+          path: release
+
+      - name: Determine release info
+        id: release_info
+        run: |
+          set -euo pipefail
+
+          if [[ "${GITHUB_EVENT_NAME}" == "pull_request" ]]; then
+            echo "tag_name=${SPACEMIT_MTMD_RELEASE_TAG}-pr${{ github.event.number }}" >> "$GITHUB_OUTPUT"
+            echo "release_name=${SPACEMIT_MTMD_RELEASE_TAG} PR #${{ github.event.number }}" >> "$GITHUB_OUTPUT"
+            echo "prerelease=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "tag_name=${SPACEMIT_MTMD_RELEASE_TAG}" >> "$GITHUB_OUTPUT"
+            echo "release_name=${SPACEMIT_MTMD_RELEASE_TAG}" >> "$GITHUB_OUTPUT"
+            echo "prerelease=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Publish GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          tag_name: ${{ steps.release_info.outputs.tag_name }}
+          name: ${{ steps.release_info.outputs.release_name }}
+          target_commitish: ${{ github.sha }}
+          files: release/*.tar.gz
+          body: |
+            SpacemiT MTMD build for `spacemit-mtmd`.
+            Commit: `${{ github.sha }}`
+          prerelease: ${{ steps.release_info.outputs.prerelease }}
+          make_latest: false
+          overwrite_files: true
+          fail_on_unmatched_files: true
