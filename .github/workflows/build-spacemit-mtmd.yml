@@ -15,10 +15,6 @@ concurrency:
 permissions:
   contents: read
 
-env:
-  SPACEMIT_IME_TOOLCHAIN_VERSION: "1.1.2"
-  SPACEMIT_ORT_URL: https://github.com/spacemit-com/onnxruntime/releases/download/2.0.2/spacemit-ort.riscv64.2.0.2.tar.gz
-  SPACEMIT_MTMD_RELEASE_TAG: spacemit-llama.cpp.riscv64.0.1.0
 jobs:
   build:
     name: Build SpacemiT MTMD
@@ -28,40 +24,105 @@ jobs:
       - name: Clone
         uses: actions/checkout@v6
 
-      - name: Setup SpacemiT Toolchain
-        uses: ./.github/actions/linux-setup-spacemit
-        with:
-          path: ./spacemit_toolchain
-          version: ${{ env.SPACEMIT_IME_TOOLCHAIN_VERSION }}
+      - name: Load shared variables
+        id: vars
+        shell: bash
+        run: |
+          set -euo pipefail
+          set -a
+          source .github/variables.env
+          set +a
 
-      - name: Download SpacemiT ORT
+          {
+            echo "SPACEMIT_IME_TOOLCHAIN_VERSION=${SPACEMIT_IME_TOOLCHAIN_VERSION}"
+            echo "SPACEMIT_TOOLCHAIN_URL=${SPACEMIT_TOOLCHAIN_URL}"
+            echo "SPACEMIT_ORT_VERSION=${SPACEMIT_ORT_VERSION}"
+            echo "SPACEMIT_ORT_URL=${SPACEMIT_ORT_URL}"
+            echo "SPACEMIT_MTMD_RELEASE_TAG=${SPACEMIT_MTMD_RELEASE_TAG}"
+            echo "SPACEMIT_TOOLCHAIN_ARCHIVE=${SPACEMIT_TOOLCHAIN_ARCHIVE}"
+            echo "SPACEMIT_ORT_ARCHIVE=${SPACEMIT_ORT_ARCHIVE}"
+            echo "SPACEMIT_TOOLCHAIN_DIR=${SPACEMIT_TOOLCHAIN_DIR}"
+            echo "SPACEMIT_ORT_ROOT=${SPACEMIT_ORT_ROOT}"
+          } >> "$GITHUB_ENV"
+
+          {
+            echo "toolchain_version=${SPACEMIT_IME_TOOLCHAIN_VERSION}"
+            echo "toolchain_url=${SPACEMIT_TOOLCHAIN_URL}"
+            echo "ort_version=${SPACEMIT_ORT_VERSION}"
+            echo "ort_url=${SPACEMIT_ORT_URL}"
+            echo "release_tag=${SPACEMIT_MTMD_RELEASE_TAG}"
+            echo "toolchain_archive=${SPACEMIT_TOOLCHAIN_ARCHIVE}"
+            echo "ort_archive=${SPACEMIT_ORT_ARCHIVE}"
+            echo "toolchain_dir=${SPACEMIT_TOOLCHAIN_DIR}"
+            echo "ort_root=${SPACEMIT_ORT_ROOT}"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Cache SpacemiT Toolchain archive
+        id: cache-toolchain
+        uses: actions/cache@v5
+        with:
+          path: ${{ steps.vars.outputs.toolchain_archive }}
+          key: spacemit-toolchain-archive-${{ steps.vars.outputs.toolchain_version }}-${{ runner.os }}
+
+      - name: Cache SpacemiT ORT archive
+        id: cache-ort
+        uses: actions/cache@v5
+        with:
+          path: ${{ steps.vars.outputs.ort_archive }}
+          key: spacemit-ort-archive-${{ steps.vars.outputs.ort_version }}-${{ runner.os }}
+
+      - name: Prepare SpacemiT Toolchain
+        shell: bash
         run: |
           set -euo pipefail
 
-          mkdir -p third_party/spacemit-ort
-          curl -L --fail --retry 5 --retry-all-errors \
-            -o spacemit-ort.riscv64.2.0.2.tar.gz \
-            "${SPACEMIT_ORT_URL}"
-          tar -xzf spacemit-ort.riscv64.2.0.2.tar.gz -C third_party/spacemit-ort
+          mkdir -p "$(dirname "$SPACEMIT_TOOLCHAIN_ARCHIVE")"
+          if [[ ! -f "$SPACEMIT_TOOLCHAIN_ARCHIVE" ]]; then
+            curl -L --fail --retry 5 --retry-all-errors \
+              -o "$SPACEMIT_TOOLCHAIN_ARCHIVE" \
+              "$SPACEMIT_TOOLCHAIN_URL"
+          fi
 
-          ORT_DIR=$(find third_party/spacemit-ort -mindepth 1 -maxdepth 1 -type d | head -n 1)
+          rm -rf "$SPACEMIT_TOOLCHAIN_DIR"
+          mkdir -p "$SPACEMIT_TOOLCHAIN_DIR"
+          tar -xJf "$SPACEMIT_TOOLCHAIN_ARCHIVE" -C "$SPACEMIT_TOOLCHAIN_DIR" --strip-components=1
+
+      - name: Prepare SpacemiT ORT
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          mkdir -p "$(dirname "$SPACEMIT_ORT_ARCHIVE")"
+          if [[ ! -f "$SPACEMIT_ORT_ARCHIVE" ]]; then
+            curl -L --fail --retry 5 --retry-all-errors \
+              -o "$SPACEMIT_ORT_ARCHIVE" \
+              "$SPACEMIT_ORT_URL"
+          fi
+
+          rm -rf "$SPACEMIT_ORT_ROOT"
+          mkdir -p "$SPACEMIT_ORT_ROOT"
+          tar -xzf "$SPACEMIT_ORT_ARCHIVE" -C "$SPACEMIT_ORT_ROOT"
+
+          ORT_DIR=$(find "$SPACEMIT_ORT_ROOT" -mindepth 1 -maxdepth 1 -type d | head -n 1)
           if [[ -z "${ORT_DIR}" ]]; then
-            ORT_DIR="${PWD}/third_party/spacemit-ort"
+            ORT_DIR="${PWD}/${SPACEMIT_ORT_ROOT}"
           else
             ORT_DIR="${PWD}/${ORT_DIR}"
           fi
 
           if [[ ! -d "${ORT_DIR}/include" || ! -d "${ORT_DIR}/lib" || ! -d "${ORT_DIR}/samples" ]]; then
             echo "error: invalid SPACEMIT_ORT_DIR layout at ${ORT_DIR}" >&2
-            find third_party/spacemit-ort -maxdepth 2 -type d | sort
+            find "$SPACEMIT_ORT_ROOT" -maxdepth 2 -type d | sort
             exit 1
           fi
 
           echo "SPACEMIT_ORT_DIR=${ORT_DIR}" >> "$GITHUB_ENV"
 
       - name: Build
+        shell: bash
         run: |
-          export RISCV_ROOT_PATH=${PWD}/spacemit_toolchain
+          set -euo pipefail
+          export RISCV_ROOT_PATH=${PWD}/${SPACEMIT_TOOLCHAIN_DIR}
           if [[ ! -d "${SPACEMIT_ORT_DIR}/include" ]]; then
             echo "error: include directory not found under SPACEMIT_ORT_DIR: ${SPACEMIT_ORT_DIR}/include" >&2
             exit 1
@@ -102,6 +163,7 @@ jobs:
           popd >/dev/null
 
       - name: Pack artifacts
+        shell: bash
         run: |
           set -euo pipefail
           mkdir -p release
@@ -128,6 +190,26 @@ jobs:
       contents: write
 
     steps:
+      - name: Clone
+        uses: actions/checkout@v6
+
+      - name: Load shared variables
+        id: vars
+        shell: bash
+        run: |
+          set -euo pipefail
+          set -a
+          source .github/variables.env
+          set +a
+
+          {
+            echo "SPACEMIT_MTMD_RELEASE_TAG=${SPACEMIT_MTMD_RELEASE_TAG}"
+          } >> "$GITHUB_ENV"
+
+          {
+            echo "release_tag=${SPACEMIT_MTMD_RELEASE_TAG}"
+          } >> "$GITHUB_OUTPUT"
+
       - name: Download build artifact
         uses: actions/download-artifact@v7
         with:
@@ -140,12 +222,12 @@ jobs:
           set -euo pipefail
 
           if [[ "${GITHUB_EVENT_NAME}" == "pull_request" ]]; then
-            echo "tag_name=${SPACEMIT_MTMD_RELEASE_TAG}-pr${{ github.event.number }}" >> "$GITHUB_OUTPUT"
-            echo "release_name=${SPACEMIT_MTMD_RELEASE_TAG} PR #${{ github.event.number }}" >> "$GITHUB_OUTPUT"
+            echo "tag_name=${{ steps.vars.outputs.release_tag }}-pr${{ github.event.number }}" >> "$GITHUB_OUTPUT"
+            echo "release_name=${{ steps.vars.outputs.release_tag }} PR #${{ github.event.number }}" >> "$GITHUB_OUTPUT"
             echo "prerelease=true" >> "$GITHUB_OUTPUT"
           else
-            echo "tag_name=${SPACEMIT_MTMD_RELEASE_TAG}" >> "$GITHUB_OUTPUT"
-            echo "release_name=${SPACEMIT_MTMD_RELEASE_TAG}" >> "$GITHUB_OUTPUT"
+            echo "tag_name=${{ steps.vars.outputs.release_tag }}" >> "$GITHUB_OUTPUT"
+            echo "release_name=${{ steps.vars.outputs.release_tag }}" >> "$GITHUB_OUTPUT"
             echo "prerelease=false" >> "$GITHUB_OUTPUT"
           fi
 
