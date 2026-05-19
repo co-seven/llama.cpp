@@ -41,9 +41,7 @@ cmake -B build \
 
 cmake --build build --parallel "$(nproc)" --config Release
 
-pushd build >/dev/null
-make install
-popd >/dev/null
+cmake --install build --config Release
 ```
 
 ## Run
