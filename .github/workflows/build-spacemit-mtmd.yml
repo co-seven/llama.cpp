@@ -203,7 +203,7 @@ jobs:
         if: ${{ github.event_name == 'pull_request' }}
         uses: actions/upload-artifact@v6
         with:
-          name: spacemit-mtmd-package-${{ github.event.number }}
+          name: spacemit-mtmd-package
           path: release/${{ steps.vars.outputs.release_tag }}.tar.gz
           if-no-files-found: error
           retention-days: 7
