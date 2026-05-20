@@ -188,6 +188,26 @@ jobs:
 
           tar -czf "release/${ASSET_NAME}" -C release "${SPACEMIT_MTMD_RELEASE_TAG}"
 
+      - name: Inspect package
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          ASSET_NAME="${SPACEMIT_MTMD_RELEASE_TAG}.tar.gz"
+          echo "Package tree:"
+          find "release/${SPACEMIT_MTMD_RELEASE_TAG}" -maxdepth 2 -print | sort
+          echo "Package archive:"
+          tar -tzf "release/${ASSET_NAME}"
+
+      - name: Upload package for PR inspection
+        if: ${{ github.event_name == 'pull_request' }}
+        uses: actions/upload-artifact@v6
+        with:
+          name: spacemit-mtmd-package-${{ github.event.number }}
+          path: release/${{ steps.vars.outputs.release_tag }}.tar.gz
+          if-no-files-found: error
+          retention-days: 7
+
       - name: Publish GitHub release
         if: ${{ github.event_name == 'push' }}
         uses: softprops/action-gh-release@v2
