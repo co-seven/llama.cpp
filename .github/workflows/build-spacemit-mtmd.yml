@@ -13,11 +13,11 @@ concurrency:
   cancel-in-progress: true
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
   build:
-    name: Build SpacemiT MTMD
+    name: Build and Publish SpacemiT MTMD
     runs-on: ubuntu-24.04
 
     steps:
@@ -174,91 +174,32 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          mkdir -p release
+          PACKAGE_DIR="release/${SPACEMIT_MTMD_RELEASE_TAG}"
+          ASSET_NAME="${SPACEMIT_MTMD_RELEASE_TAG}.tar.gz"
 
-          ASSET_NAME="llama-${SPACEMIT_MTMD_RELEASE_TAG}-bin-spacemit-mtmd.tar.gz"
-          tar -czf "release/${ASSET_NAME}" -C build/installed .
+          rm -rf "$PACKAGE_DIR"
+          mkdir -p "$PACKAGE_DIR"
+          cp -a build/installed/. "$PACKAGE_DIR/"
+          cp LICENSE README.md VERSION_NUMBER "$PACKAGE_DIR/"
 
-      - name: Upload build artifact
-        uses: actions/upload-artifact@v6
-        with:
-          name: llama-bin-spacemit-mtmd
-          path: release/*.tar.gz
-          if-no-files-found: error
-          retention-days: 14
-
-  release:
-    name: Publish GitHub Release
-    if: ${{ github.event_name == 'push' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository) }}
-    needs:
-      - build
-    runs-on: ubuntu-24.04
-
-    permissions:
-      contents: write
-
-    steps:
-      - name: Clone
-        uses: actions/checkout@v6
-
-      - name: Load shared variables
-        id: vars
-        shell: bash
-        run: |
-          set -euo pipefail
-          set -a
-          source .github/variables.env
-          set +a
-
-          VERSION_NUMBER=$(tr -d '[:space:]' < VERSION_NUMBER)
-          if [[ -z "${VERSION_NUMBER}" ]]; then
-            echo "error: VERSION_NUMBER is empty" >&2
-            exit 1
+          if [[ -d "$PACKAGE_DIR/bin" ]]; then
+            find "$PACKAGE_DIR/bin" -maxdepth 1 \( -type f -o -type l \) \( -name 'test*' -o -name 'export-graph-ops*' \) -exec rm -f {} +
           fi
 
-          SPACEMIT_MTMD_RELEASE_TAG="${SPACEMIT_MTMD_RELEASE_TAG}.${VERSION_NUMBER}"
-
-          {
-            echo "SPACEMIT_MTMD_RELEASE_TAG=${SPACEMIT_MTMD_RELEASE_TAG}"
-          } >> "$GITHUB_ENV"
-
-          {
-            echo "release_tag=${SPACEMIT_MTMD_RELEASE_TAG}"
-          } >> "$GITHUB_OUTPUT"
-
-      - name: Download build artifact
-        uses: actions/download-artifact@v7
-        with:
-          name: llama-bin-spacemit-mtmd
-          path: release
-
-      - name: Determine release info
-        id: release_info
-        run: |
-          set -euo pipefail
-
-          if [[ "${GITHUB_EVENT_NAME}" == "pull_request" ]]; then
-            echo "tag_name=${{ steps.vars.outputs.release_tag }}-pr${{ github.event.number }}" >> "$GITHUB_OUTPUT"
-            echo "release_name=${{ steps.vars.outputs.release_tag }} PR #${{ github.event.number }}" >> "$GITHUB_OUTPUT"
-            echo "prerelease=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "tag_name=${{ steps.vars.outputs.release_tag }}" >> "$GITHUB_OUTPUT"
-            echo "release_name=${{ steps.vars.outputs.release_tag }}" >> "$GITHUB_OUTPUT"
-            echo "prerelease=false" >> "$GITHUB_OUTPUT"
-          fi
+          tar -czf "release/${ASSET_NAME}" -C release "${SPACEMIT_MTMD_RELEASE_TAG}"
 
       - name: Publish GitHub release
+        if: ${{ github.event_name == 'push' }}
         uses: softprops/action-gh-release@v2
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
-          tag_name: ${{ steps.release_info.outputs.tag_name }}
-          name: ${{ steps.release_info.outputs.release_name }}
+          tag_name: ${{ steps.vars.outputs.release_tag }}
+          name: ${{ steps.vars.outputs.release_tag }}
           target_commitish: ${{ github.sha }}
-          files: release/*.tar.gz
+          files: release/${{ steps.vars.outputs.release_tag }}.tar.gz
           body: |
             SpacemiT MTMD build for `spacemit-mtmd`.
             Commit: `${{ github.sha }}`
-          prerelease: ${{ steps.release_info.outputs.prerelease }}
           make_latest: false
           overwrite_files: true
           fail_on_unmatched_files: true

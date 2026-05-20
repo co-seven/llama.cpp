@@ -13,7 +13,7 @@ To build with SMT support, you need:
 Download and unpack the required packages:
 
 ```bash
-wget https://archive.spacemit.com/toolchain/spacemit-toolchain-linux-glibc-x86_64-v1.1.2.tar.xz
+wget https://github.com/spacemit-com/toolchain/releases/download/v1.1.2/spacemit-toolchain-linux-glibc-x86_64-v1.1.2.tar.xz
 wget https://github.com/spacemit-com/onnxruntime/releases/download/2.0.2/spacemit-ort.riscv64.2.0.2.tar.gz
 ```
 
