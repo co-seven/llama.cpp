@@ -1729,6 +1729,9 @@ json oaicompat_chat_params_parse(json &                     body, /* openai api 
     return llama_params;
 }
 
+json convert_responses_to_chatcmpl(const json & response_body);
+json convert_anthropic_to_oai(const json & body);
+
 json convert_responses_to_chatcmpl(const json & response_body) {
     if (!response_body.contains("input")) {
         throw std::invalid_argument("'input' is required");
