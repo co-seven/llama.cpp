@@ -145,6 +145,11 @@ if(LLAMA_SERVER_SMT_VISION)
         message(FATAL_ERROR "Could not find spine_llm_argparser.cc in SPACEMIT_ORT_DIR='${SPACEMIT_ORT_DIR}'")
     endif()
 
+    target_sources(mtmd PRIVATE
+        lingbot-map-wrapper.cpp
+        lingbot-map-wrapper.h
+    )
+
     if(EXISTS "${SPACEMIT_ORT_LIB_DIR}/libonnxruntime.so")
         set(ONNXRUNTIME_LIB "${SPACEMIT_ORT_LIB_DIR}/libonnxruntime.so")
     elseif(EXISTS "${SPACEMIT_ORT_LIB_DIR}/libonnxruntime.a")

@@ -382,8 +382,8 @@ static bool moe_implemented(const llm_arch arch) {
 }
 
 static bool arch_supported(const llm_arch arch) {
-    if (arch == LLM_ARCH_CLIP || arch == LLM_ARCH_GPTJ || arch == LLM_ARCH_UNKNOWN) {
-        return false; // These models don't have usable implementations.
+    if (arch == LLM_ARCH_CLIP || arch == LLM_ARCH_LINGBOT_MAP || arch == LLM_ARCH_GPTJ || arch == LLM_ARCH_UNKNOWN) {
+        return false; // These models don't have usable llama_model text implementations.
     }
     if (arch == LLM_ARCH_CHAMELEON) {
         return false; // Only half-implemented and to be removed in the future.

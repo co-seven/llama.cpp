@@ -715,6 +715,7 @@ struct server_context_impl {
 
     common_context_seq_rm_type ctx_tgt_seq_rm_type = COMMON_CONTEXT_SEQ_RM_TYPE_NO;
     common_context_seq_rm_type ctx_dft_seq_rm_type = COMMON_CONTEXT_SEQ_RM_TYPE_NO;
+    bool model_less_reconstruction = false;
 
     common_speculative_ptr spec;
 
@@ -749,7 +750,7 @@ struct server_context_impl {
 
     bool sleeping = false;
 
-    bool has_multimodal() const { return mctx != nullptr || smt_ctx != nullptr; }
+    bool has_multimodal() const { return mctx != nullptr || server_smt_vision_supports_prompt_embeddings(smt_ctx); }
 
     const char * vision_backend_name() const {
         switch (vision_backend) {
@@ -818,6 +819,57 @@ struct server_context_impl {
 
         params_base = params;
         params_base.n_outputs_max = server_n_outputs_max(params_base);
+
+#if defined(LLAMA_SERVER_SMT_VISION)
+        const std::string & lingbot_backend_config_dir = params_base.smt_config_dir;
+        const bool is_lingbot_map_reconstruct =
+            (params_base.media_backend == "smt" || params_base.media_backend == "auto") &&
+            server_smt_vision_config_is_lingbot_map(lingbot_backend_config_dir);
+
+        if (is_lingbot_map_reconstruct) {
+            try {
+                smt_ctx = server_smt_vision_init(nullptr, lingbot_backend_config_dir, params_base.warmup);
+            } catch (const std::exception & e) {
+                SRV_ERR("failed to load LingBot-MAP SMT backend from '%s': %s\n", lingbot_backend_config_dir.c_str(), e.what());
+                return false;
+            }
+
+            vision_backend = SERVER_VISION_BACKEND_SMT;
+            model_less_reconstruction = true;
+            chat_params = {
+                /* use_jinja             */ params_base.use_jinja,
+                /* prefill_assistant     */ params_base.prefill_assistant,
+                /* reasoning_format      */ params_base.reasoning_format,
+                /* chat_template_kwargs  */ params_base.default_template_kwargs,
+                /* tmpls                 */ nullptr,
+                /* allow_image           */ false,
+                /* allow_audio           */ false,
+                /* image_bin_only        */ false,
+                /* media_backend         */ vision_backend_name(),
+                /* enable_thinking       */ false,
+                /* reasoning_budget      */ params_base.sampling.reasoning_budget_tokens,
+                /* reasoning_budget_msg  */ params_base.sampling.reasoning_budget_message,
+                /* media_path            */ params_base.media_path,
+                /* force_pure_content    */ params_base.force_pure_content_parser
+            };
+
+            if (!params_base.model_alias.empty()) {
+                model_name = *params_base.model_alias.begin();
+            } else if (!params_base.model.name.empty()) {
+                model_name = params_base.model.name;
+            } else {
+                model_name = "lingbot-map";
+            }
+            model_aliases = params_base.model_alias;
+            model_tags    = params_base.model_tags;
+
+            params = params_base;
+            if (!is_resume) {
+                return init();
+            }
+            return true;
+        }
+#endif
 
         std::string & mmproj_path = params_base.mmproj.path;
         bool has_mmproj = !mmproj_path.empty();
@@ -1029,9 +1081,9 @@ struct server_context_impl {
         server_vision_backend_mode selected_backend = SERVER_VISION_BACKEND_NONE;
 #if defined(LLAMA_SERVER_SMT_VISION)
         const std::string & backend_pref = params_base.media_backend;
+        const std::string & backend_config_dir = params_base.smt_config_dir;
         if (backend_pref == "auto") {
-            const std::string & smt_config_dir = params_base.smt_config_dir;
-            if (!smt_config_dir.empty()) {
+            if (!backend_config_dir.empty()) {
                 selected_backend = SERVER_VISION_BACKEND_SMT;
             } else if (!mmproj_path.empty()) {
                 selected_backend = SERVER_VISION_BACKEND_MTMD;
@@ -1070,9 +1122,9 @@ struct server_context_impl {
 
 #if defined(LLAMA_SERVER_SMT_VISION)
         } else if (selected_backend == SERVER_VISION_BACKEND_SMT) {
-            const std::string & smt_config_dir = params_base.smt_config_dir;
+            const std::string & smt_config_dir = backend_config_dir;
             if (smt_config_dir.empty()) {
-                SRV_ERR("%s", "media backend 'smt' selected but --smt-config-dir is empty\n");
+                SRV_ERR("%s", "media backend 'smt' selected but --smt-config-dir is not set\n");
                 return false;
             }
             try {
@@ -1259,8 +1311,10 @@ struct server_context_impl {
 
     // unlike load_model(), this is only called once during initialization
     bool init() {
-        GGML_ASSERT(ctx_tgt != nullptr);
-        GGML_ASSERT(model_tgt != nullptr);
+        if (!model_less_reconstruction) {
+            GGML_ASSERT(ctx_tgt != nullptr);
+            GGML_ASSERT(model_tgt != nullptr);
+        }
 
         GGML_ASSERT(!sleeping);
 
@@ -1299,6 +1353,10 @@ struct server_context_impl {
                     return false;
                 }
             }
+        }
+
+        if (model_less_reconstruction) {
+            return true;
         }
 
         // populate chat template params
@@ -2076,12 +2134,12 @@ struct server_context_impl {
     bool tokenize_cli_input(server_task & task) {
         try {
             auto & prompt = task.cli_prompt;
-            if (smt_ctx != nullptr) {
+            if (server_smt_vision_supports_prompt_embeddings(smt_ctx)) {
                 task.tokens = process_smt_prompt(smt_ctx, vocab, prompt, task.cli_files);
             } else if (mctx != nullptr) {
                 task.tokens = process_mtmd_prompt(mctx, prompt, task.cli_files);
             } else {
-                task.tokens = std::move(tokenize_input_prompts(vocab, mctx, smt_ctx, prompt, true, true)[0]);
+                task.tokens = std::move(tokenize_input_prompts(vocab, mctx, server_smt_vision_supports_prompt_embeddings(smt_ctx) ? smt_ctx : nullptr, prompt, true, true)[0]);
             }
             task.cli_prompt.clear();
             task.cli_files.clear();
@@ -3734,7 +3792,7 @@ struct server_context_impl {
         SRV_DBG("%s", "run slots completed\n");
     }
 
-    int get_slot_n_ctx() { return slots.back().n_ctx; }
+    int get_slot_n_ctx() { return slots.empty() ? 0 : slots.back().n_ctx; }
 
     server_response_reader get_response_reader() {
         return server_response_reader(queue_tasks, queue_results, HTTP_POLLING_SECONDS);
@@ -3771,8 +3829,9 @@ server_response_reader server_context::get_response_reader() {
 }
 
 server_context_meta server_context::get_meta() const {
-    auto bos_id        = llama_vocab_bos(impl->vocab);
-    auto eos_id        = llama_vocab_eos(impl->vocab);
+    const bool has_vocab = impl->vocab != nullptr && impl->ctx_tgt != nullptr;
+    auto bos_id = has_vocab ? llama_vocab_bos(impl->vocab) : LLAMA_TOKEN_NULL;
+    auto eos_id = has_vocab ? llama_vocab_eos(impl->vocab) : LLAMA_TOKEN_NULL;
     auto bos_token_str = bos_id != LLAMA_TOKEN_NULL ? common_token_to_piece(impl->ctx_tgt, bos_id, true) : "";
     auto eos_token_str = eos_id != LLAMA_TOKEN_NULL ? common_token_to_piece(impl->ctx_tgt, eos_id, true) : "";
 
@@ -3786,31 +3845,32 @@ server_context_meta server_context::get_meta() const {
         /* has_mtmd               */ impl->has_multimodal(),
         /* has_inp_image          */ impl->chat_params.allow_image,
         /* has_inp_audio          */ impl->chat_params.allow_audio,
+        /* has_reconstruction     */ server_smt_vision_is_lingbot_map(impl->smt_ctx),
         /* json_ui_settings       */ impl->json_ui_settings,
         /* json_webui_settings    */ impl->json_webui_settings,  // Deprecated
         /* slot_n_ctx             */ impl->get_slot_n_ctx(),
-        /* pooling_type           */ llama_pooling_type(impl->ctx_tgt),
+        /* pooling_type           */ impl->ctx_tgt ? llama_pooling_type(impl->ctx_tgt) : LLAMA_POOLING_TYPE_NONE,
 
         /* chat_params            */ impl->chat_params,
-        /* chat_template_caps     */ common_chat_templates_get_caps(impl->chat_params.tmpls.get()),
+        /* chat_template_caps     */ impl->chat_params.tmpls ? common_chat_templates_get_caps(impl->chat_params.tmpls.get()) : std::map<std::string, bool>{},
 
         /* bos_token_str          */ bos_token_str,
         /* eos_token_str          */ eos_token_str,
-        /* fim_pre_token          */ llama_vocab_fim_pre(impl->vocab),
-        /* fim_sub_token          */ llama_vocab_fim_suf(impl->vocab),
-        /* fim_mid_token          */ llama_vocab_fim_mid(impl->vocab),
-        /* fim_pad_token          */ llama_vocab_fim_pad(impl->vocab),
-        /* fim_rep_token          */ llama_vocab_fim_rep(impl->vocab),
-        /* fim_sep_token          */ llama_vocab_fim_sep(impl->vocab),
+        /* fim_pre_token          */ has_vocab ? llama_vocab_fim_pre(impl->vocab) : LLAMA_TOKEN_NULL,
+        /* fim_sub_token          */ has_vocab ? llama_vocab_fim_suf(impl->vocab) : LLAMA_TOKEN_NULL,
+        /* fim_mid_token          */ has_vocab ? llama_vocab_fim_mid(impl->vocab) : LLAMA_TOKEN_NULL,
+        /* fim_pad_token          */ has_vocab ? llama_vocab_fim_pad(impl->vocab) : LLAMA_TOKEN_NULL,
+        /* fim_rep_token          */ has_vocab ? llama_vocab_fim_rep(impl->vocab) : LLAMA_TOKEN_NULL,
+        /* fim_sep_token          */ has_vocab ? llama_vocab_fim_sep(impl->vocab) : LLAMA_TOKEN_NULL,
 
         /* logit_bias_eog         */ impl->params_base.sampling.logit_bias_eog,
 
-        /* model_vocab_type       */ llama_vocab_type(impl->vocab),
-        /* model_vocab_n_tokens   */ llama_vocab_n_tokens(impl->vocab),
-        /* model_n_ctx_train      */ llama_model_n_ctx_train(impl->model_tgt),
-        /* model_n_embd_inp       */ llama_model_n_embd(impl->model_tgt),
-        /* model_n_params         */ llama_model_n_params(impl->model_tgt),
-        /* model_size             */ llama_model_size(impl->model_tgt),
+        /* model_vocab_type       */ has_vocab ? llama_vocab_type(impl->vocab) : LLAMA_VOCAB_TYPE_NONE,
+        /* model_vocab_n_tokens   */ has_vocab ? llama_vocab_n_tokens(impl->vocab) : 0,
+        /* model_n_ctx_train      */ impl->model_tgt ? llama_model_n_ctx_train(impl->model_tgt) : 0,
+        /* model_n_embd_inp       */ impl->model_tgt ? llama_model_n_embd(impl->model_tgt) : 0,
+        /* model_n_params         */ impl->model_tgt ? llama_model_n_params(impl->model_tgt) : 0,
+        /* model_size             */ impl->model_tgt ? llama_model_size(impl->model_tgt) : 0,
     };
 }
 
@@ -3886,7 +3946,7 @@ static int32_t prompt_get_n_before_user(
 
             if (mctx != nullptr) {
                 result = (int32_t) process_mtmd_prompt(mctx, prefix, prefix_files).size();
-            } else if (smt_ctx != nullptr) {
+            } else if (server_smt_vision_supports_prompt_embeddings(smt_ctx)) {
                 result = (int32_t) process_smt_prompt(smt_ctx, vocab, prefix, prefix_files).size();
             } else {
                 result = (int32_t) tokenize_input_prompts(vocab, nullptr, nullptr, prefix, true, true)[0].size();
@@ -3928,9 +3988,10 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(con
         // process prompt
         std::vector<server_tokens> inputs;
 
-        if (res_type != TASK_RESPONSE_TYPE_NONE && (ctx_server.mctx != nullptr || ctx_server.smt_ctx != nullptr)) {
+        if (res_type != TASK_RESPONSE_TYPE_NONE &&
+            (ctx_server.mctx != nullptr || server_smt_vision_supports_prompt_embeddings(ctx_server.smt_ctx))) {
             // OAI-compatible chat path with multimodal backend.
-            if (ctx_server.smt_ctx != nullptr) {
+            if (server_smt_vision_supports_prompt_embeddings(ctx_server.smt_ctx)) {
                 inputs.push_back(
                     process_smt_prompt(ctx_server.smt_ctx, ctx_server.vocab, prompt.get<std::string>(), files));
             } else {
@@ -3938,7 +3999,7 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(con
             }
         } else {
             // Everything else, including multimodal completions.
-            inputs = tokenize_input_prompts(ctx_server.vocab, ctx_server.mctx, ctx_server.smt_ctx, prompt, true, true);
+            inputs = tokenize_input_prompts(ctx_server.vocab, ctx_server.mctx, server_smt_vision_supports_prompt_embeddings(ctx_server.smt_ctx) ? ctx_server.smt_ctx : nullptr, prompt, true, true);
         }
 
         // tasks.reserve(inputs.size()); // TODO: this is inaccurate due to child tasks
@@ -4383,6 +4444,7 @@ void server_routes::init_routes() {
             { "modalities",                  json {
                 {"vision", meta->has_inp_image},
                 {"audio",  meta->has_inp_audio},
+                {"reconstruction", meta->has_reconstruction},
             } },
             { "media_marker",                get_media_marker() },
             { "endpoint_slots",              params.endpoint_slots },
@@ -4489,7 +4551,7 @@ void server_routes::init_routes() {
 
         std::string                prompt = json_value(data, "prompt", std::string());
         std::vector<server_tokens> tokenized_prompts =
-            tokenize_input_prompts(ctx_server.vocab, ctx_server.mctx, ctx_server.smt_ctx, prompt, false, true);
+            tokenize_input_prompts(ctx_server.vocab, ctx_server.mctx, server_smt_vision_supports_prompt_embeddings(ctx_server.smt_ctx) ? ctx_server.smt_ctx : nullptr, prompt, false, true);
         SRV_DBG("creating infill tasks, n_prompts = %d\n", (int) tokenized_prompts.size());
         data["prompt"] = format_prompt_infill(
             ctx_server.vocab, data.at("input_prefix"), data.at("input_suffix"), data.at("input_extra"), params.n_batch,
@@ -4628,6 +4690,167 @@ void server_routes::init_routes() {
         res->ok({
             {"prompt", std::move(data.at("prompt"))}
         });
+        return res;
+    };
+
+    this->post_reconstruct = [this](const server_http_req & req) {
+        auto res = create_response();
+#if defined(LLAMA_SERVER_SMT_VISION)
+        if (!server_smt_vision_is_lingbot_map(ctx_server.smt_ctx)) {
+            res->error(format_error_response("The current SMT model is not LingBot-MAP.", ERROR_TYPE_NOT_SUPPORTED));
+            return res;
+        }
+
+        server_smt_lingbot_map_reconstruct_options options;
+        if (!req.body.empty() && req.files.empty()) {
+            const json body = json::parse(req.body);
+            options.output_pose = json_value(body, "output_pose", options.output_pose);
+            options.output_depth = json_value(body, "output_depth", options.output_depth);
+            options.output_point_cloud = json_value(body, "output_point_cloud", options.output_point_cloud);
+            options.max_frames = json_value(body, "max_frames", options.max_frames);
+        }
+
+        std::vector<std::vector<uint8_t>> images;
+        images.reserve(req.files.size());
+        for (const auto & item : req.files) {
+            images.push_back(item.second.data);
+        }
+        if (images.empty()) {
+            res->error(format_error_response("LingBot-MAP reconstruction requires multipart image uploads.",
+                                             ERROR_TYPE_INVALID_REQUEST));
+            return res;
+        }
+
+        try {
+            const auto result = server_smt_vision_lingbot_map_reconstruct(ctx_server.smt_ctx, images, options);
+            res->ok({
+                {"object", "lingbot_map.reconstruction"},
+                {"status", result.inference_ready ? "ok" : "not_implemented"},
+                {"message", result.message},
+                {"architecture", result.architecture},
+                {"n_images", result.n_images},
+                {"tensor_count", result.tensor_count},
+                {"image_size", result.image_size},
+                {"patch_size", result.patch_size},
+                {"hidden_size", result.hidden_size},
+                {"camera_hidden_size", result.camera_hidden_size},
+                {"preprocess", {
+                    {"width", result.preprocess_width},
+                    {"height", result.preprocess_height},
+                    {"resized_heights", result.resized_heights},
+                }},
+                {"vision_input_shape", result.vision_input_shape},
+                {"vision_output_shape", result.vision_output_shape},
+                {"vision_input_float_count", result.vision_input_float_count},
+                {"vision_output_float_count", result.vision_output_float_count},
+                {"vision_output_frames", result.vision_output_frames},
+                {"vision_output_tokens", result.vision_output_tokens},
+                {"vision_output_hidden", result.vision_output_hidden},
+                {"aggregator_input", {
+                    {"tokens_per_frame", result.aggregator_tokens_per_frame},
+                    {"patch_start_idx", result.aggregator_patch_start_idx},
+                    {"patch_tokens", result.aggregator_patch_tokens},
+                    {"vit_prefix_tokens", result.aggregator_vit_prefix_tokens},
+                }},
+                {"ggml_runtime", {
+                    {"backend", result.ggml_runtime_backend},
+                    {"buffer_type", result.ggml_runtime_buffer_type},
+                    {"graph_nodes", result.ggml_runtime_graph_nodes},
+                }},
+                {"aggregator_probe", {
+                    {"graph_nodes", result.aggregator_probe_graph_nodes},
+                    {"qkv_shape", result.aggregator_probe_qkv_shape},
+                    {"output_shape", result.aggregator_probe_output_shape},
+                    {"global_graph_nodes", result.aggregator_global_probe_graph_nodes},
+                    {"global_input_tokens", result.aggregator_global_probe_input_tokens},
+                    {"global_qkv_shape", result.aggregator_global_probe_qkv_shape},
+                    {"global_output_shape", result.aggregator_global_probe_output_shape},
+                    {"full_graph_nodes", result.aggregator_full_probe_graph_nodes},
+                    {"full_selected_outputs", result.aggregator_full_probe_selected_outputs},
+                    {"full_frame_blocks", result.aggregator_full_probe_frame_blocks},
+                    {"full_global_blocks", result.aggregator_full_probe_global_blocks},
+                    {"full_final_frame_shape", result.aggregator_full_probe_final_frame_shape},
+                    {"full_final_global_shape", result.aggregator_full_probe_final_global_shape},
+                    {"aggregator_graph_nodes", result.aggregator_graph_nodes},
+                    {"aggregator_graph_selected_outputs", result.aggregator_graph_selected_outputs},
+                    {"aggregator_graph_frame_blocks", result.aggregator_graph_frame_blocks},
+                    {"aggregator_graph_global_blocks", result.aggregator_graph_global_blocks},
+                    {"aggregator_graph_tokens_per_frame", result.aggregator_graph_tokens_per_frame},
+                    {"aggregator_graph_patch_start_idx", result.aggregator_graph_patch_start_idx},
+                    {"aggregator_graph_final_frame_shape", result.aggregator_graph_final_frame_shape},
+                    {"aggregator_graph_final_global_shape", result.aggregator_graph_final_global_shape},
+                    {"aggregator_graph_selected_output_shapes", result.aggregator_graph_selected_output_shapes},
+                    {"selected_layers", result.aggregator_selected_layers},
+                }},
+                {"camera_head", {
+                    {"graph_nodes", result.camera_head_graph_nodes},
+                    {"trunk_blocks", result.camera_head_trunk_blocks},
+                    {"iterations", result.camera_head_iterations},
+                    {"pose_dim", result.camera_head_pose_dim},
+                    {"input_shape", result.camera_head_input_shape},
+                    {"final_pose_shape", result.camera_head_final_pose_shape},
+                    {"iteration_pose_shapes", result.camera_head_iteration_pose_shapes},
+                }},
+                {"depth_onnx", {
+                    {"input_count", result.depth_onnx_input_count},
+                    {"output_count", result.depth_onnx_output_count},
+                    {"input_float_count", result.depth_onnx_input_float_count},
+                    {"input_source", result.depth_input_source},
+                    {"input_names", result.depth_input_names},
+                    {"output_names", result.depth_output_names},
+                    {"input_shapes", result.depth_input_shapes},
+                    {"output_shapes", result.depth_output_shapes},
+                    {"output_float_counts", result.depth_output_float_counts},
+                }},
+                {"postprocess", {
+                    {"pose_source", result.pose_output_source},
+                    {"pose_encoding_shape", result.pose_encoding_shape},
+                    {"extrinsic_shape", result.extrinsic_shape},
+                    {"intrinsic_shape", result.intrinsic_shape},
+                    {"world_points_shape", result.world_points_shape},
+                    {"world_points_conf_shape", result.world_points_conf_shape},
+                    {"world_points_bin", {
+                        {"path", result.world_points_path},
+                        {"dtype", "float32"},
+                        {"layout", "xyz"},
+                        {"shape", result.world_points_shape},
+                        {"bytes", result.world_points_bytes},
+                    }},
+                    {"point_count", result.postprocess_point_count},
+                    {"sample_count", result.postprocess_sample_count},
+                    {"pose_encoding_sample", result.pose_encoding_sample},
+                    {"extrinsic_first", result.extrinsic_first},
+                    {"intrinsic_first", result.intrinsic_first},
+                    {"world_points_sample", result.world_points_sample},
+                    {"depth_stats", {
+                        {"min", result.depth_min},
+                        {"max", result.depth_max},
+                        {"mean", result.depth_mean},
+                    }},
+                    {"depth_conf_stats", {
+                        {"min", result.depth_conf_min},
+                        {"max", result.depth_conf_max},
+                        {"mean", result.depth_conf_mean},
+                    }},
+                }},
+                {"onnx_sessions_loaded", result.onnx_sessions_loaded},
+                {"outputs", {
+                    {"pose", result.output_pose},
+                    {"depth", result.output_depth},
+                    {"point_cloud", result.output_point_cloud},
+                }},
+                {"stages", result.stages},
+            });
+        } catch (const std::invalid_argument & e) {
+            res->error(format_error_response(e.what(), ERROR_TYPE_INVALID_REQUEST));
+        } catch (const std::exception & e) {
+            res->error(format_error_response(e.what(), ERROR_TYPE_SERVER));
+        }
+#else
+        GGML_UNUSED(req);
+        res->error(format_error_response("LingBot-MAP reconstruction requires llama-server built with SMT vision support.",
+                                         ERROR_TYPE_NOT_SUPPORTED));
+#endif
         return res;
     };
 
@@ -5043,7 +5266,7 @@ std::unique_ptr<server_res_generator> server_routes::handle_embeddings_impl(cons
     }
 
     auto tokenized_prompts =
-        tokenize_input_prompts(ctx_server.vocab, ctx_server.mctx, ctx_server.smt_ctx, prompt, true, true);
+        tokenize_input_prompts(ctx_server.vocab, ctx_server.mctx, server_smt_vision_supports_prompt_embeddings(ctx_server.smt_ctx) ? ctx_server.smt_ctx : nullptr, prompt, true, true);
     for (const auto & tokens : tokenized_prompts) {
         // this check is necessary for models that do not add BOS token to the input
         if (tokens.empty()) {

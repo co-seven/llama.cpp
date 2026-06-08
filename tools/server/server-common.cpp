@@ -1202,7 +1202,7 @@ static server_tokens tokenize_input_subprompt(const llama_vocab *         vocab,
                                               bool                        parse_special) {
     constexpr char JSON_STRING_PROMPT_KEY[] = "prompt_string";
     constexpr char JSON_MTMD_DATA_KEY[]     = "multimodal_data";
-    const bool     has_mtmd                 = mctx != nullptr || smt_ctx != nullptr;
+    const bool     has_mtmd                 = mctx != nullptr || server_smt_vision_supports_prompt_embeddings(smt_ctx);
     if (json_prompt.is_string() || json_is_array_of_mixed_numbers_strings(json_prompt)) {
         // string or mixed
         llama_tokens tmp = tokenize_mixed(vocab, json_prompt, add_special, parse_special);
@@ -1223,7 +1223,7 @@ static server_tokens tokenize_input_subprompt(const llama_vocab *         vocab,
             for (const auto & entry : json_prompt.at(JSON_MTMD_DATA_KEY)) {
                 files.push_back(base64_decode(entry));
             }
-            if (smt_ctx != nullptr) {
+            if (server_smt_vision_supports_prompt_embeddings(smt_ctx)) {
                 return process_smt_prompt(smt_ctx, vocab, json_prompt.at(JSON_STRING_PROMPT_KEY), files, add_special,
                                           parse_special);
             }
