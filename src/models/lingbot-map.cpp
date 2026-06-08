@@ -59,10 +59,10 @@ void llama_model_lingbot_map::load_arch_hparams(llama_model_loader & ml) {
     hparams.n_rot_swa = 0;
 }
 
-void llama_model_lingbot_map::load_arch_tensors(llama_model_loader &) {
+[[noreturn]] void llama_model_lingbot_map::load_arch_tensors(llama_model_loader &) {
     throw std::runtime_error("LingBot-MAP GGUF tensors are loaded by the mtmd SMT wrapper, not llama_model");
 }
 
-std::unique_ptr<llm_graph_context> llama_model_lingbot_map::build_arch_graph(const llm_graph_params &) const {
+[[noreturn]] std::unique_ptr<llm_graph_context> llama_model_lingbot_map::build_arch_graph(const llm_graph_params &) const {
     throw std::runtime_error("LingBot-MAP does not support llama_model text graph execution");
 }

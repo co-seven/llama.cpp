@@ -14,6 +14,7 @@
 
 bool llama_model_saver_supports_arch(llm_arch arch) {
     switch (arch) {
+        case LLM_ARCH_LINGBOT_MAP:
         case LLM_ARCH_QWEN3NEXT:
         case LLM_ARCH_QWEN35:
         case LLM_ARCH_QWEN35MOE:
