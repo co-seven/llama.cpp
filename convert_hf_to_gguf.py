@@ -7,8 +7,11 @@ import argparse
 import logging
 import os
 import sys
+from collections import OrderedDict
 from pathlib import Path
+from typing import Iterable
 
+import numpy as np
 import torch
 
 if 'NO_LOCAL_GGUF' not in os.environ:
@@ -25,6 +28,184 @@ from conversion import (
     _mistral_common_installed,
     _mistral_import_error_msg,
 )
+
+
+LINGBOT_MAP_ARCH = "lingbot-map"
+LINGBOT_MAP_DEFAULT_CHECKPOINT = Path("/home/cailinxi/modelzoo/lingbot-map/hf_model/lingbot-map.pt")
+LINGBOT_MAP_DEFAULT_OUTFILE = Path("/home/cailinxi/modelzoo/lingbot-map/mtmd_model/lingbot-map-agg-camera-f32.gguf")
+
+
+def unwrap_lingbot_map_state_dict(obj: object) -> OrderedDict[str, torch.Tensor]:
+    if isinstance(obj, dict) and "model" in obj and isinstance(obj["model"], dict):
+        obj = obj["model"]
+    if not isinstance(obj, dict):
+        raise TypeError(f"checkpoint must contain a state dict, got {type(obj)!r}")
+
+    state = OrderedDict()
+    for key, value in obj.items():
+        if isinstance(value, torch.Tensor):
+            state[str(key)] = value.detach().cpu()
+    if not state:
+        raise ValueError("checkpoint does not contain tensor entries")
+    return state
+
+
+def lingbot_map_selected_tensor_names(
+        state: OrderedDict[str, torch.Tensor],
+        include_patch_embed: bool,
+        include_depth_head: bool) -> list[str]:
+    names: list[str] = []
+    for name in state:
+        if name.startswith("aggregator."):
+            if not include_patch_embed and name.startswith("aggregator.patch_embed."):
+                continue
+            names.append(name)
+        elif name.startswith("camera_head."):
+            names.append(name)
+        elif include_depth_head and name.startswith("depth_head."):
+            names.append(name)
+    return names
+
+
+def lingbot_map_count_indexed_modules(names: Iterable[str], prefix: str) -> int:
+    indices: set[int] = set()
+    needle = prefix + "."
+    for name in names:
+        if not name.startswith(needle):
+            continue
+        rest = name[len(needle):]
+        first = rest.split(".", 1)[0]
+        if first.isdigit():
+            indices.add(int(first))
+    return max(indices) + 1 if indices else 0
+
+
+def lingbot_map_infer_metadata(
+        state: OrderedDict[str, torch.Tensor],
+        selected: list[str],
+        include_patch_embed: bool,
+        include_depth_head: bool) -> dict[str, object]:
+    camera_token = state.get("aggregator.camera_token")
+    if camera_token is None:
+        raise KeyError("missing required tensor: aggregator.camera_token")
+
+    embed_dim = int(camera_token.shape[-1])
+    num_camera_token_variants = int(camera_token.shape[1])
+    num_register_tokens = int(state["aggregator.register_token"].shape[2]) if "aggregator.register_token" in state else 0
+    has_scale_token = "aggregator.scale_token" in state
+    num_special_tokens = 1 + num_register_tokens + (1 if has_scale_token else 0)
+    frame_blocks = lingbot_map_count_indexed_modules(selected, "aggregator.frame_blocks")
+    global_blocks = lingbot_map_count_indexed_modules(selected, "aggregator.global_blocks")
+    camera_blocks = lingbot_map_count_indexed_modules(selected, "camera_head.trunk")
+
+    patch_proj = state.get("aggregator.patch_embed.patch_embed.proj.weight")
+    patch_size = int(patch_proj.shape[-1]) if patch_proj is not None else 14
+
+    camera_qkv = state.get("camera_head.trunk.0.attn.qkv.weight")
+    camera_dim = int(camera_qkv.shape[1]) if camera_qkv is not None else embed_dim * 2
+    camera_pose_dim = int(state["camera_head.empty_pose_tokens"].shape[-1]) if "camera_head.empty_pose_tokens" in state else 9
+
+    return {
+        "schema_version": 1,
+        "component": "aggregator_camera_head",
+        "includes_patch_embed": bool(include_patch_embed),
+        "includes_depth_head": bool(include_depth_head),
+        "embed_dim": embed_dim,
+        "camera_dim": camera_dim,
+        "camera_pose_dim": camera_pose_dim,
+        "patch_size": patch_size,
+        "num_register_tokens": num_register_tokens,
+        "num_special_tokens": num_special_tokens,
+        "num_camera_token_variants": num_camera_token_variants,
+        "has_scale_token": has_scale_token,
+        "aggregator_frame_block_count": frame_blocks,
+        "aggregator_global_block_count": global_blocks,
+        "camera_trunk_block_count": camera_blocks,
+        "aa_order": ["frame", "global"],
+        "aa_block_size": 1,
+        "rope_freq": 100.0,
+        "resnet_mean": [0.485, 0.456, 0.406],
+        "resnet_std": [0.229, 0.224, 0.225],
+    }
+
+
+def lingbot_map_add_metadata(writer: gguf.GGUFWriter, meta: dict[str, object], outtype: str) -> None:
+    writer.add_name("LingBot-MAP aggregator + camera head")
+    writer.add_type("model")
+    writer.add_description("LingBot-MAP non-LLM GGUF containing aggregator and camera head tensors.")
+    writer.add_file_type(int(gguf.LlamaFileType.MOSTLY_F16 if outtype == "f16" else gguf.LlamaFileType.ALL_F32))
+    writer.add_quantization_version(gguf.GGML_QUANT_VERSION)
+
+    for key, value in meta.items():
+        full_key = f"{LINGBOT_MAP_ARCH}.{key}"
+        if isinstance(value, bool):
+            writer.add_bool(full_key, value)
+        elif isinstance(value, int):
+            writer.add_uint32(full_key, value)
+        elif isinstance(value, float):
+            writer.add_float32(full_key, value)
+        elif isinstance(value, str):
+            writer.add_string(full_key, value)
+        elif isinstance(value, list):
+            writer.add_array(full_key, value)
+        else:
+            raise TypeError(f"unsupported metadata value for {key}: {type(value)!r}")
+
+
+def lingbot_map_tensor_to_numpy(tensor: torch.Tensor, outtype: str) -> np.ndarray:
+    if tensor.dtype.is_floating_point:
+        if outtype == "f16":
+            return tensor.to(torch.float16).numpy()
+        return tensor.to(torch.float32).numpy()
+
+    if tensor.dtype in (torch.int8, torch.int16, torch.int32, torch.int64):
+        return tensor.numpy()
+
+    raise TypeError(f"unsupported tensor dtype: {tensor.dtype}")
+
+
+def write_lingbot_map_gguf(args: argparse.Namespace) -> None:
+    outtype = "f32" if args.outtype == "auto" else args.outtype
+    if outtype not in ("f32", "f16"):
+        raise ValueError("LingBot-MAP GGUF conversion only supports --outtype f32 or f16")
+
+    checkpoint_path = args.checkpoint or LINGBOT_MAP_DEFAULT_CHECKPOINT
+    outfile = args.outfile or LINGBOT_MAP_DEFAULT_OUTFILE
+
+    logger.info("Loading LingBot-MAP checkpoint: %s", checkpoint_path)
+    checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+    state = unwrap_lingbot_map_state_dict(checkpoint)
+    selected = lingbot_map_selected_tensor_names(state, args.include_patch_embed, args.include_depth_head)
+    if not selected:
+        raise ValueError("no LingBot-MAP tensors selected for conversion")
+
+    meta = lingbot_map_infer_metadata(state, selected, args.include_patch_embed, args.include_depth_head)
+    total_params = sum(state[name].numel() for name in selected)
+    total_bytes = sum(lingbot_map_tensor_to_numpy(state[name], outtype).nbytes for name in selected)
+
+    logger.info("Selected LingBot-MAP tensors: %d", len(selected))
+    logger.info("Selected LingBot-MAP parameters: %.3f M", total_params / 1e6)
+    logger.info("Selected LingBot-MAP tensor bytes: %.3f MiB", total_bytes / (1024 * 1024))
+    for key, value in meta.items():
+        logger.info("LingBot-MAP meta %s = %s", key, value)
+
+    if args.dry_run:
+        return
+
+    outfile.parent.mkdir(parents=True, exist_ok=True)
+    writer = gguf.GGUFWriter(outfile, LINGBOT_MAP_ARCH)
+    lingbot_map_add_metadata(writer, meta, outtype)
+
+    for name in selected:
+        arr = lingbot_map_tensor_to_numpy(state[name].contiguous(), outtype)
+        writer.add_tensor(name, arr)
+
+    logger.info("Writing LingBot-MAP GGUF: %s", outfile)
+    writer.write_header_to_file()
+    writer.write_kv_data_to_file()
+    writer.write_tensors_to_file(progress=True)
+    writer.close()
+    logger.info("LingBot-MAP GGUF conversion done")
 
 
 def split_str_to_n_bytes(split_str: str) -> int:
@@ -61,6 +242,22 @@ def parse_args() -> argparse.Namespace:
         help="output format - use f32 for float32, f16 for float16, bf16 for bfloat16, q8_0 for Q8_0, tq1_0 or tq2_0 for ternary, and auto for the highest-fidelity 16-bit float type",
     )
     parser.add_argument(
+        "--lingbot-map", action="store_true",
+        help="Export LingBot-MAP aggregator and camera_head tensors from a PyTorch checkpoint to GGUF.",
+    )
+    parser.add_argument(
+        "--checkpoint", type=Path,
+        help="Path to LingBot-MAP .pt checkpoint. Only used with --lingbot-map.",
+    )
+    parser.add_argument(
+        "--include-patch-embed", action="store_true",
+        help="Also include aggregator.patch_embed.* tensors when converting LingBot-MAP.",
+    )
+    parser.add_argument(
+        "--include-depth-head", action="store_true",
+        help="Also include depth_head.* tensors when converting LingBot-MAP.",
+    )
+    parser.add_argument(
         "--bigendian", action="store_true",
         help="model is executed on big endian machine",
     )
@@ -95,7 +292,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--dry-run", action="store_true",
-        help="only print out a split plan and exit, without writing any new files",
+        help="only print out a split plan and exit, without writing any new files. In --lingbot-map mode, print selected tensors and inferred metadata without writing GGUF.",
     )
     parser.add_argument(
         "--no-tensor-first-split", action="store_true",
@@ -154,7 +351,7 @@ def parse_args() -> argparse.Namespace:
     )
 
     args = parser.parse_args()
-    if not args.print_supported_models and args.model is None:
+    if not args.print_supported_models and not args.lingbot_map and args.model is None:
         parser.error("the following arguments are required: model")
     return args
 
@@ -171,6 +368,10 @@ def main() -> None:
         logging.basicConfig(level=logging.DEBUG)
     else:
         logging.basicConfig(level=logging.INFO)
+
+    if args.lingbot_map:
+        write_lingbot_map_gguf(args)
+        return
 
     if args.remote:
         hf_repo_id = args.model

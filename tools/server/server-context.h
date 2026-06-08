@@ -22,6 +22,7 @@ struct server_context_meta {
     bool has_mtmd;
     bool has_inp_image;
     bool has_inp_audio;
+    bool has_reconstruction;
     json json_ui_settings;            // Primary: new name
     json json_webui_settings;            // Deprecated: use json_ui_settings instead (kept for backward compat)
     int slot_n_ctx;
@@ -117,6 +118,7 @@ struct server_routes {
     server_http_context::handler_t post_anthropic_messages;
     server_http_context::handler_t post_anthropic_count_tokens;
     server_http_context::handler_t post_apply_template;
+    server_http_context::handler_t post_reconstruct;
     server_http_context::handler_t get_models;
     server_http_context::handler_t post_tokenize;
     server_http_context::handler_t post_detokenize;

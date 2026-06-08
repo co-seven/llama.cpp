@@ -3,6 +3,7 @@
 #include "server-models.h"
 #include "server-cors-proxy.h"
 #include "server-tools.h"
+#include "server-smt-vision.h"
 
 #include "arg.h"
 #include "build-info.h"
@@ -89,9 +90,18 @@ int llama_server(int argc, char ** argv) {
     llama_backend_init();
     llama_numa_init(params.numa);
 
-    // router server never loads a model and must not touch the GPU
-    // skip device enumeration so the CUDA primary context stays uncreated
-    const bool is_router_server = params.model.path.empty();
+#if defined(LLAMA_SERVER_SMT_VISION)
+    const bool is_lingbot_map_reconstruct_server =
+        (params.media_backend == "smt" || params.media_backend == "auto") &&
+        server_smt_vision_config_is_lingbot_map(params.smt_config_dir);
+#else
+    const bool is_lingbot_map_reconstruct_server = false;
+#endif
+
+    // router server never loads a model and must not touch the GPU. A LingBot-MAP
+    // reconstruction server is model-less from llama's text-LLM perspective, but still
+    // needs local SMT initialization instead of router proxying.
+    const bool is_router_server = params.model.path.empty() && !is_lingbot_map_reconstruct_server;
     common_params_print_info(params, !is_router_server);
 
     // validate batch size for embeddings
@@ -161,6 +171,7 @@ int llama_server(int argc, char ** argv) {
         routes.post_tokenize               = models_routes->proxy_post;
         routes.post_detokenize             = models_routes->proxy_post;
         routes.post_apply_template         = models_routes->proxy_post;
+        routes.post_reconstruct            = models_routes->proxy_post;
         routes.get_lora_adapters           = models_routes->proxy_get;
         routes.post_lora_adapters          = models_routes->proxy_post;
         routes.get_slots                   = models_routes->proxy_get;
@@ -204,6 +215,8 @@ int llama_server(int argc, char ** argv) {
     ctx_http.post("/tokenize",                 ex_wrapper(routes.post_tokenize));
     ctx_http.post("/detokenize",               ex_wrapper(routes.post_detokenize));
     ctx_http.post("/apply-template",           ex_wrapper(routes.post_apply_template));
+    ctx_http.post("/reconstruct",              ex_wrapper(routes.post_reconstruct));
+    ctx_http.post("/v1/reconstruct",           ex_wrapper(routes.post_reconstruct));
     // LoRA adapters hotswap
     ctx_http.get ("/lora-adapters",            ex_wrapper(routes.get_lora_adapters));
     ctx_http.post("/lora-adapters",            ex_wrapper(routes.post_lora_adapters));

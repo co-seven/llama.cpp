@@ -351,6 +351,12 @@ static bool tensor_allows_quantization(const llama_model_quantize_params * param
     quantize &= name.find(".patch_embd")    == std::string::npos;
     quantize &= name.find(".patch_merger")  == std::string::npos;
 
+    if (arch == LLM_ARCH_LINGBOT_MAP) {
+        // Pose input projection has ne[0] = pose_dim = 9. Legacy block quantizers such as Q4_0
+        // require the first dimension to be divisible by 32, so keep such tiny projection tensors in F32.
+        quantize &= tensor->ne[0] % 32 == 0;
+    }
+
     return quantize;
 }
 
