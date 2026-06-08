@@ -42,12 +42,14 @@ jobs:
             exit 1
           fi
 
-          SPACEMIT_MTMD_RELEASE_TAG="${SPACEMIT_MTMD_RELEASE_TAG}.${VERSION_NUMBER}"
+          SPACEMIT_MTMD_RELEASE_TAG="v${VERSION_NUMBER}"
+          SPACEMIT_MTMD_PACKAGE_NAME="${SPACEMIT_MTMD_PACKAGE_PREFIX}.${VERSION_NUMBER}"
 
           {
             echo "SPACEMIT_TOOLCHAIN_URL=${SPACEMIT_TOOLCHAIN_URL}"
             echo "SPACEMIT_ORT_URL=${SPACEMIT_ORT_URL}"
             echo "SPACEMIT_MTMD_RELEASE_TAG=${SPACEMIT_MTMD_RELEASE_TAG}"
+            echo "SPACEMIT_MTMD_PACKAGE_NAME=${SPACEMIT_MTMD_PACKAGE_NAME}"
             echo "SPACEMIT_TOOLCHAIN_ARCHIVE=${SPACEMIT_TOOLCHAIN_ARCHIVE}"
             echo "SPACEMIT_ORT_ARCHIVE=${SPACEMIT_ORT_ARCHIVE}"
             echo "SPACEMIT_TOOLCHAIN_DIR=${SPACEMIT_TOOLCHAIN_DIR}"
@@ -59,7 +61,9 @@ jobs:
           {
             echo "toolchain_url=${SPACEMIT_TOOLCHAIN_URL}"
             echo "ort_url=${SPACEMIT_ORT_URL}"
+            echo "version_number=${VERSION_NUMBER}"
             echo "release_tag=${SPACEMIT_MTMD_RELEASE_TAG}"
+            echo "package_name=${SPACEMIT_MTMD_PACKAGE_NAME}"
             echo "toolchain_archive=${SPACEMIT_TOOLCHAIN_ARCHIVE}"
             echo "ort_archive=${SPACEMIT_ORT_ARCHIVE}"
             echo "toolchain_dir=${SPACEMIT_TOOLCHAIN_DIR}"
@@ -228,8 +232,8 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          PACKAGE_DIR="release/${SPACEMIT_MTMD_RELEASE_TAG}"
-          ASSET_NAME="${SPACEMIT_MTMD_RELEASE_TAG}.tar.gz"
+          PACKAGE_DIR="release/${SPACEMIT_MTMD_PACKAGE_NAME}"
+          ASSET_NAME="${SPACEMIT_MTMD_PACKAGE_NAME}.tar.gz"
 
           rm -rf "$PACKAGE_DIR"
           mkdir -p "$PACKAGE_DIR"
@@ -240,7 +244,7 @@ jobs:
             find "$PACKAGE_DIR/bin" -maxdepth 1 \( -type f -o -type l \) \( -name 'test*' -o -name 'export-graph-ops*' \) -exec rm -f {} +
           fi
 
-          tar -czf "release/${ASSET_NAME}" -C release "${SPACEMIT_MTMD_RELEASE_TAG}"
+          tar -czf "release/${ASSET_NAME}" -C release "${SPACEMIT_MTMD_PACKAGE_NAME}"
 
       - name: Inspect package
         if: ${{ github.event_name == 'pull_request' || (github.event_name == 'push' && steps.release_guard.outputs.should_publish == 'true') }}
@@ -248,9 +252,9 @@ jobs:
         run: |
           set -euo pipefail
 
-          ASSET_NAME="${SPACEMIT_MTMD_RELEASE_TAG}.tar.gz"
+          ASSET_NAME="${SPACEMIT_MTMD_PACKAGE_NAME}.tar.gz"
           echo "Package tree:"
-          find "release/${SPACEMIT_MTMD_RELEASE_TAG}" -maxdepth 2 -print | sort
+          find "release/${SPACEMIT_MTMD_PACKAGE_NAME}" -maxdepth 2 -print | sort
           echo "Package archive:"
           tar -tzf "release/${ASSET_NAME}"
 
@@ -259,7 +263,7 @@ jobs:
         uses: actions/upload-artifact@v6
         with:
           name: spacemit-mtmd-package
-          path: release/${{ steps.vars.outputs.release_tag }}.tar.gz
+          path: release/${{ steps.vars.outputs.package_name }}.tar.gz
           if-no-files-found: error
           retention-days: 7
 
@@ -271,9 +275,11 @@ jobs:
           tag_name: ${{ steps.vars.outputs.release_tag }}
           name: ${{ steps.vars.outputs.release_tag }}
           target_commitish: ${{ github.sha }}
-          files: release/${{ steps.vars.outputs.release_tag }}.tar.gz
+          files: release/${{ steps.vars.outputs.package_name }}.tar.gz
           body: |
             SpacemiT MTMD build for `spacemit-mtmd`.
+            Version: `${{ steps.vars.outputs.version_number }}`
+            Package: `${{ steps.vars.outputs.package_name }}.tar.gz`
             Commit: `${{ github.sha }}`
           make_latest: false
           overwrite_files: true
