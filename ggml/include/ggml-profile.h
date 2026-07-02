@@ -20,8 +20,8 @@ void ggml_set_current_token_idx(int idx);
 void ggml_trace_log_begin(const char * name, const char * cat, const char * args);
 void ggml_trace_log_end(const char * name, const char * cat, const char * args);
 
-void ggml_profile_log_op_begin(struct ggml_tensor * tensor);
-void ggml_profile_log_op_end(struct ggml_tensor * tensor);
+void ggml_profile_log_op_begin(struct ggml_tensor * tensor, int ith, int nth);
+void ggml_profile_log_op_end(struct ggml_tensor * tensor, int ith, int nth);
 
 void ggml_profile_flush_tls(void);
 #else
@@ -31,8 +31,8 @@ void ggml_profile_flush_tls(void);
 #define ggml_set_current_token_idx(idx) ;
 #define ggml_trace_log_begin(name, cat, args) ;
 #define ggml_trace_log_end(name, cat, args) ;
-#define ggml_profile_log_op_begin(tensor) ;
-#define ggml_profile_log_op_end(tensor) ;
+#define ggml_profile_log_op_begin(tensor, ith, nth) ;
+#define ggml_profile_log_op_end(tensor, ith, nth) ;
 #define ggml_profile_flush_tls() ;
 #endif
 
