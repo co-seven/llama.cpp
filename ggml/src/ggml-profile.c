@@ -27,12 +27,16 @@ void ggml_trace_log_end(const char * name, const char * cat, const char * args) 
     GGML_UNUSED(args);
 }
 
-void ggml_profile_log_op_begin(struct ggml_tensor * t) {
+void ggml_profile_log_op_begin(struct ggml_tensor * t, int ith, int nth) {
     GGML_UNUSED(t);
+    GGML_UNUSED(ith);
+    GGML_UNUSED(nth);
 }
 
-void ggml_profile_log_op_end(struct ggml_tensor * t) {
+void ggml_profile_log_op_end(struct ggml_tensor * t, int ith, int nth) {
     GGML_UNUSED(t);
+    GGML_UNUSED(ith);
+    GGML_UNUSED(nth);
 }
 
 void ggml_profile_flush_tls(void) {
@@ -51,10 +55,14 @@ void ggml_profile_flush_trace(void) {
 static int            g_trace_enabled = 0;
 static pthread_once_t g_trace_once    = PTHREAD_ONCE_INIT;
 
+void ggml_profile_flush_trace(void);
+
 static void ggml_trace_parse_env(void) {
     const char * env = getenv("GGML_TRACE");
     if (env && (env[0] == '1' || env[0] == 'y' || env[0] == 'Y')) {
         g_trace_enabled = 1;
+        // ensure the trace file gets its closing "]" and is flushed/closed on exit
+        atexit(ggml_profile_flush_trace);
     } else {
         g_trace_enabled = 0;
     }
@@ -83,6 +91,7 @@ static FILE *          g_trace_file  = NULL;
 
 __thread char   g_trace_tls_buffer[TRACE_BUFFER_SIZE];
 __thread size_t g_trace_tls_offset = 0;
+__thread int    g_trace_worker_named = 0;
 
 int g_current_token_idx = -1;
 
@@ -223,33 +232,85 @@ void ggml_trace_log_end(const char * name, const char * cat, const char * args) 
     ggml_trace_write(buf);
 }
 
-void ggml_profile_log_op_begin(struct ggml_tensor * t) {
+static void ggml_trace_log_begin_on_lane(const char * name, const char * cat, const char * args, int pid, int tid) {
     if (!TRACE_ENABLED()) {
         return;
     }
+
+    char buf[1024];
+
+    snprintf(buf, sizeof(buf),
+             "{\"name\":\"%s\",\"cat\":\"%s\",\"ph\":\"B\","
+             "\"ts\":%ld,\"pid\":%d,\"tid\":%d,\"args\":{%s}},\n",
+             name, cat, ggml_trace_now_us(), pid, tid, args ? args : "");
+
+    ggml_trace_write(buf);
+}
+
+static void ggml_trace_log_end_on_lane(const char * name, const char * cat, const char * args, int pid, int tid) {
+    if (!TRACE_ENABLED()) {
+        return;
+    }
+
+    char buf[1024];
+
+    snprintf(buf, sizeof(buf),
+             "{\"name\":\"%s\",\"cat\":\"%s\",\"ph\":\"E\","
+             "\"ts\":%ld,\"pid\":%d,\"tid\":%d,\"args\":{%s}},\n",
+             name, cat, ggml_trace_now_us(), pid, tid, args ? args : "");
+
+    ggml_trace_write(buf);
+}
+
+static void ggml_trace_log_worker_name(int ith) {
+    if (!TRACE_ENABLED() || g_trace_worker_named) {
+        return;
+    }
+
+    char buf[256];
+    snprintf(buf, sizeof(buf),
+             "{\"name\":\"thread_name\",\"ph\":\"M\",\"pid\":2,\"tid\":%d,"
+             "\"args\":{\"name\":\"ggml-worker-%d\"}},\n",
+             ith, ith);
+
+    ggml_trace_write(buf);
+    g_trace_worker_named = 1;
+}
+
+void ggml_profile_log_op_begin(struct ggml_tensor * t, int ith, int nth) {
+    if (!TRACE_ENABLED()) {
+        return;
+    }
+
+    ggml_trace_log_worker_name(ith);
 
     char args[1024];
     ggml_format_op_args(t, NULL, args, sizeof(args));
 
+    size_t args_len = strlen(args);
+    snprintf(args + args_len, sizeof(args) - args_len, ",\"ith\":%d,\"nth\":%d", ith, nth);
+
     char name[128], tname[64];
     ggml_json_escape(ggml_tensor_name_safe(t), tname, sizeof(tname));
 
     snprintf(name, sizeof(name), "%s (%s)", ggml_op_name(t->op), tname);
 
-    ggml_trace_log_begin(name, "Operator", args);
+    ggml_trace_log_begin_on_lane(name, "Operator", args, 2, ith);
 }
 
-void ggml_profile_log_op_end(struct ggml_tensor * t) {
+void ggml_profile_log_op_end(struct ggml_tensor * t, int ith, int nth) {
     if (!TRACE_ENABLED()) {
         return;
     }
 
+    GGML_UNUSED(nth);
+
     char name[128], tname[64];
     ggml_json_escape(ggml_tensor_name_safe(t), tname, sizeof(tname));
 
     snprintf(name, sizeof(name), "%s (%s)", ggml_op_name(t->op), tname);
 
-    ggml_trace_log_end(name, "Operator", NULL);
+    ggml_trace_log_end_on_lane(name, "Operator", NULL, 2, ith);
 }
 
 void ggml_profile_flush_tls(void) {
