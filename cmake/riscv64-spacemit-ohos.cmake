@@ -62,12 +62,18 @@ set(CMAKE_CXX_FLAGS
     "-Wno-unused-command-line-argument -fuse-ld=lld -stdlib=libc++ -static-libstdc++ -Wl,--push-state,-Bstatic -lc++ -lc++abi -Wl,--pop-state -Wl,-z,stack-size=${STACK_SIZE_BYTES} ${CMAKE_CXX_FLAGS}"
 )
 
+# NOTE: -Wl,--strip-debug drops only the .debug* DWARF sections at link time.
+# The SpacemiT musl toolchain's static libc++/libc++abi/libgcc archives carry
+# debug info, and static-linking them (-static-libstdc++ -Bstatic -lc++ ...)
+# would otherwise bloat every .so/exe by several MB of DWARF we never ship.
+# --strip-debug keeps the .symtab symbol table (function names for backtraces)
+# and does not affect runtime behaviour; it only removes debugger metadata.
 set(CMAKE_SHARED_LINKER_FLAGS
-    "${CMAKE_SHARED_LINKER_FLAGS} -stdlib=libc++ -static-libgcc -static-libstdc++ -Wl,--push-state,-Bstatic -lgcc -lc++ -lc++abi -Wl,--pop-state -lm -Wl,-z,stack-size=${STACK_SIZE_BYTES}"
+    "${CMAKE_SHARED_LINKER_FLAGS} -stdlib=libc++ -static-libgcc -static-libstdc++ -Wl,--push-state,-Bstatic -lgcc -lc++ -lc++abi -Wl,--pop-state -lm -Wl,--strip-debug -Wl,-z,stack-size=${STACK_SIZE_BYTES}"
 )
 
 set(CMAKE_EXE_LINKER_FLAGS
-    "${CMAKE_EXE_LINKER_FLAGS} -latomic -lm -Wl,-z,stack-size=${STACK_SIZE_BYTES}"
+    "${CMAKE_EXE_LINKER_FLAGS} -latomic -lm -Wl,--strip-debug -Wl,-z,stack-size=${STACK_SIZE_BYTES}"
 )
 set(CMAKE_MODULE_LINKER_FLAGS
-    "${CMAKE_MODULE_LINKER_FLAGS} -Wl,-z,stack-size=${STACK_SIZE_BYTES}")
+    "${CMAKE_MODULE_LINKER_FLAGS} -Wl,--strip-debug -Wl,-z,stack-size=${STACK_SIZE_BYTES}")
