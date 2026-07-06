@@ -1,5 +1,9 @@
 > [!IMPORTANT]
 > This document describes how to build and run llama.cpp with the SpacemiT SMT backend enabled.
+>
+> To develop a new multimodal model (how to split a HF VLM into GGUF + ONNX and
+> extend the SMT inference pipeline), see
+> [spacemit-mtmd-model-development.md](spacemit-mtmd-model-development.md).
 
 ## Build
 
