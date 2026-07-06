@@ -5,10 +5,12 @@
 #include "ggml-profile.h"
 #include "onnxruntime_cxx_api.h"
 
+#include <dlfcn.h>
+
 #include <cctype>
 #include <cstdio>
 #include <cstdlib>
-#include <dlfcn.h>
+#include <cstring>
 #include <fstream>
 #include <iostream>
 #include <limits>
@@ -164,10 +166,10 @@ public:
         return session_;
     }
 
-    Ort::Value & set_input_tensor(const std::string & input_binary_path) {
-        auto                      type_info   = session_.GetInputTypeInfo(0);
-        auto                      tensor_info = type_info.GetTensorTypeAndShapeInfo();
-        const std::vector<int64_t> input_shape = tensor_info.GetShape();
+    void query_input_layout(std::vector<int64_t> & input_shape, size_t & expected_bytes) {
+        auto type_info   = session_.GetInputTypeInfo(0);
+        auto tensor_info = type_info.GetTensorTypeAndShapeInfo();
+        input_shape      = tensor_info.GetShape();
 
         if (tensor_info.GetElementType() != ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT) {
             throw std::runtime_error("SMT vision expects float32 input tensor");
@@ -184,20 +186,48 @@ public:
             input_size *= static_cast<size_t>(dim);
         }
 
-        input_data_.resize(input_size);
+        if (input_size > std::numeric_limits<size_t>::max() / sizeof(float)) {
+            throw std::runtime_error("SMT vision input tensor is too large");
+        }
+
+        expected_bytes = input_size * sizeof(float);
+    }
+
+    Ort::Value & set_input_tensor_from_memory(const uint8_t * data, size_t len) {
+        std::vector<int64_t> input_shape;
+        size_t               expected_bytes = 0;
+        query_input_layout(input_shape, expected_bytes);
+
+        if (data == nullptr || len != expected_bytes) {
+            throw std::runtime_error("SMT vision input size mismatch: expected " + std::to_string(expected_bytes) +
+                                     ", actual " + std::to_string(len));
+        }
+
+        input_data_.resize(expected_bytes / sizeof(float));
+        std::memcpy(input_data_.data(), data, expected_bytes);
+
+        input_tensor_ = make_tensor_f32(input_shape, input_data_);
+        return input_tensor_;
+    }
+
+    Ort::Value & set_input_tensor(const std::string & input_binary_path) {
+        std::vector<int64_t> input_shape;
+        size_t               expected_bytes = 0;
+        query_input_layout(input_shape, expected_bytes);
+
         std::ifstream file(input_binary_path, std::ios::binary | std::ios::ate);
         if (!file.is_open()) {
             throw std::runtime_error("failed to open SMT vision input binary: " + input_binary_path);
         }
 
-        const std::streamoff actual_bytes   = file.tellg();
-        const size_t         expected_bytes = input_data_.size() * sizeof(float);
+        const std::streamoff actual_bytes = file.tellg();
         if (actual_bytes < 0 || static_cast<size_t>(actual_bytes) != expected_bytes) {
             throw std::runtime_error("SMT vision input binary size mismatch: expected " +
                                      std::to_string(expected_bytes) + ", actual " +
                                      std::to_string(actual_bytes < 0 ? 0 : static_cast<size_t>(actual_bytes)));
         }
 
+        input_data_.resize(expected_bytes / sizeof(float));
         file.seekg(0, std::ios::beg);
         file.read(reinterpret_cast<char *>(input_data_.data()), static_cast<std::streamsize>(expected_bytes));
         if (!file) {
@@ -818,6 +848,24 @@ std::vector<float> smt_vision_context::encode_image(const std::string & binary_p
 
     ggml_trace_log_begin("set_input_tensor", "Vision", NULL);
     Ort::Value & input_tensor = d.vision_engine->set_input_tensor(binary_path);
+    ggml_trace_log_end("set_input_tensor", "Vision", NULL);
+
+    ggml_trace_log_begin("vision_session_run", "Vision", NULL);
+    std::vector<float> result = d.vision_engine->run_session(input_tensor);
+    ggml_trace_log_end("vision_session_run", "Vision", NULL);
+
+    ggml_trace_log_end("encode_image", "Vision", NULL);
+    ggml_profile_flush_tls();
+    return result;
+}
+
+std::vector<float> smt_vision_context::encode_image_mem(const uint8_t * data, size_t len) {
+    auto & d = *pimpl_;
+
+    ggml_trace_log_begin("encode_image", "Vision", NULL);
+
+    ggml_trace_log_begin("set_input_tensor", "Vision", NULL);
+    Ort::Value & input_tensor = d.vision_engine->set_input_tensor_from_memory(data, len);
     ggml_trace_log_end("set_input_tensor", "Vision", NULL);
 
     ggml_trace_log_begin("vision_session_run", "Vision", NULL);

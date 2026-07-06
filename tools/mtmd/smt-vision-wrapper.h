@@ -5,6 +5,7 @@
 
 #include "smt-vision-preprocess.h"
 
+#include <cstddef>
 #include <cstdint>
 #include <memory>
 #include <string>
@@ -21,6 +22,8 @@ struct smt_vision_context {
     // Encode a preprocessed image binary file using ONNX vision engine
     // Returns image embedding vector (n_tokens * hidden_size floats)
     std::vector<float> encode_image(const std::string & binary_path);
+
+    std::vector<float> encode_image_mem(const uint8_t * data, size_t len);
 
     // Get the hidden size (embedding dimension)
     int64_t hidden_size() const;

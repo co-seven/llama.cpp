@@ -752,6 +752,11 @@ struct server_context_impl {
 
     bool has_multimodal() const { return mctx != nullptr || server_smt_vision_supports_prompt_embeddings(smt_ctx); }
 
+    bool prompt_cache_reuse_unsafe() const {
+        return has_multimodal() && model_tgt != nullptr &&
+               (llama_model_is_recurrent(model_tgt) || llama_model_is_hybrid(model_tgt));
+    }
+
     const char * vision_backend_name() const {
         switch (vision_backend) {
             case SERVER_VISION_BACKEND_MTMD:
@@ -1444,7 +1449,7 @@ struct server_context_impl {
         bool update_cache = false;
 
         // find the slot that has at least n% prompt similarity
-        if (ret == nullptr && slot_prompt_similarity != 0.0f) {
+        if (ret == nullptr && slot_prompt_similarity != 0.0f && !prompt_cache_reuse_unsafe()) {
             float sim_best = 0;
 
             for (server_slot & slot : slots) {
@@ -2900,7 +2905,7 @@ struct server_context_impl {
                                 continue;
                             }
 
-                            if (slot.task->params.cache_prompt) {
+                            if (slot.task->params.cache_prompt && !prompt_cache_reuse_unsafe()) {
                                 // reuse any previously computed tokens that are common with the new prompt
                                 n_past = slot.prompt.tokens.get_common_prefix(input_tokens);
 

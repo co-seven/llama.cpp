@@ -1330,18 +1330,12 @@ server_smt_image_chunk server_smt_vision_encode_image_bin(server_smt_vision_cont
         smt_input = std::move(preproc.tensor_bytes);
     }
 
-    const std::string tmp_file = write_temp_bin_file(smt_input);
-
     server_smt_image_chunk out;
     out.type = server_smt_media_type::image;
-    try {
+    {
         const int64_t t0 = ggml_time_us();
-        out.embd         = ctx->smt_vision->encode_image(tmp_file);
+        out.embd         = ctx->smt_vision->encode_image_mem(smt_input.data(), smt_input.size());
         out.t_encode_ms  = (ggml_time_us() - t0) / 1e3;
-        std::remove(tmp_file.c_str());
-    } catch (...) {
-        std::remove(tmp_file.c_str());
-        throw;
     }
 
     if (ctx->hidden_size <= 0 || out.embd.empty() || out.embd.size() % (size_t) ctx->hidden_size != 0) {
