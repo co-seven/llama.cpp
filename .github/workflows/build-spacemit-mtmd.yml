@@ -3,10 +3,10 @@ name: CI (SpacemiT MTMD)
 on:
   push:
     branches:
-      - spacemit-mtmd
+      - mtmd-backend
   pull_request:
     branches:
-      - spacemit-mtmd
+      - mtmd-backend
   workflow_dispatch:
     inputs:
       build_ohos:
