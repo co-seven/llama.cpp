@@ -489,6 +489,9 @@ struct ggml_threadpool {
     atomic_int GGML_CACHE_ALIGN n_barrier;
     atomic_int GGML_CACHE_ALIGN n_barrier_passed;
     atomic_int GGML_CACHE_ALIGN current_chunk; // currently processing chunk during Mat_Mul, shared between all the threads.
+#ifdef GGML_USE_CPU_RISCV64_SPACEMIT
+    atomic_int GGML_CACHE_ALIGN n_graph_done;
+#endif
 
     // these are atomic as an annotation for thread-sanitizer
     atomic_bool stop;         // Used for stopping the threadpool altogether
@@ -2709,7 +2712,13 @@ void ggml_threadpool_free(struct ggml_threadpool* threadpool) {
     ggml_cond_broadcast(&threadpool->cond);
     ggml_mutex_unlock(&threadpool->mutex);
 
-    for (int j = 1; j < n_threads; j++) {
+#ifdef GGML_USE_CPU_RISCV64_SPACEMIT
+    const int first_worker = 0;
+#else
+    const int first_worker = 1;
+#endif
+
+    for (int j = first_worker; j < n_threads; j++) {
         int32_t rc = ggml_thread_join(workers[j].thrd, NULL);
         GGML_ASSERT(rc == GGML_EXIT_SUCCESS || rc == GGML_EXIT_ABORTED);
         UNUSED(rc);
@@ -3182,6 +3191,20 @@ static inline bool ggml_graph_compute_check_for_work(struct ggml_compute_state *
     return state->pending;
 }
 
+#ifdef GGML_USE_CPU_RISCV64_SPACEMIT
+static void ggml_graph_compute_mark_worker_stopped(struct ggml_compute_state * state) {
+    struct ggml_threadpool * threadpool = state->threadpool;
+
+    const int n_graph   = atomic_load_explicit(&threadpool->n_graph, memory_order_acquire);
+    const int n_threads = n_graph & GGML_THREADPOOL_N_THREADS_MASK;
+
+    if (state->last_graph != n_graph && state->ith < n_threads) {
+        state->last_graph = n_graph;
+        atomic_fetch_add_explicit(&threadpool->n_graph_done, 1, memory_order_release);
+    }
+}
+#endif
+
 static thread_ret_t ggml_graph_compute_secondary_thread(void* data) {
     struct ggml_compute_state * state = (struct ggml_compute_state *) data;
     struct ggml_threadpool * threadpool = state->threadpool;
@@ -3204,7 +3227,12 @@ static thread_ret_t ggml_graph_compute_secondary_thread(void* data) {
         }
 
         // This needs to be checked for after the cond_wait
-        if (threadpool->stop) break;
+        if (threadpool->stop) {
+#ifdef GGML_USE_CPU_RISCV64_SPACEMIT
+            ggml_graph_compute_mark_worker_stopped(state);
+#endif
+            break;
+        }
 
         // Check if there is new work
         // The main thread is the only one that can dispatch new work
@@ -3213,11 +3241,45 @@ static thread_ret_t ggml_graph_compute_secondary_thread(void* data) {
         if (state->pending) {
             state->pending = false;
             ggml_graph_compute_thread(state);
+#ifdef GGML_USE_CPU_RISCV64_SPACEMIT
+            atomic_fetch_add_explicit(&threadpool->n_graph_done, 1, memory_order_release);
+#endif
         }
     }
 
     return (thread_ret_t) 0;
 }
+
+#ifdef GGML_USE_CPU_RISCV64_SPACEMIT
+static void ggml_graph_compute_wait_for_workers(struct ggml_threadpool * threadpool, int n_threads) {
+    // Spacemit keeps the ggml caller as a control thread: publish the graph here, then wait for all workers.
+    ggml_mutex_lock(&threadpool->mutex);
+
+    int n_graph = atomic_load_explicit(&threadpool->n_graph, memory_order_relaxed) >> GGML_THREADPOOL_N_THREADS_BITS;
+    n_graph = ((n_graph + 1) << GGML_THREADPOOL_N_THREADS_BITS) | (n_threads & GGML_THREADPOOL_N_THREADS_MASK);
+
+    GGML_PRINT_DEBUG("compute-kickoff: n_threads %d n_graph %d\n", n_threads, n_graph);
+
+    atomic_store_explicit(&threadpool->n_graph_done, 0, memory_order_relaxed);
+
+    // Indicate the graph is ready to be processed.
+    // We need the full seq-cst fence here because of the polling threads (used in thread_sync).
+    atomic_store_explicit(&threadpool->n_graph, n_graph, memory_order_seq_cst);
+
+    if (threadpool->pause) {
+       // resume does cond broadcast
+       ggml_threadpool_resume_locked(threadpool);
+    } else {
+       ggml_cond_broadcast(&threadpool->cond);
+    }
+
+    ggml_mutex_unlock(&threadpool->mutex);
+
+    while (atomic_load_explicit(&threadpool->n_graph_done, memory_order_acquire) < n_threads) {
+        ggml_thread_cpu_relax();
+    }
+}
+#else
 
 // Start processing new graph
 static void ggml_graph_compute_kickoff(struct ggml_threadpool * threadpool, int n_threads)
@@ -3252,6 +3314,8 @@ static void ggml_graph_compute_kickoff(struct ggml_threadpool * threadpool, int 
     ggml_mutex_unlock(&threadpool->mutex);
 }
 
+#endif
+
 #endif // GGML_USE_OPENMP
 
 static struct ggml_threadpool * ggml_threadpool_new_impl(
@@ -3268,6 +3332,9 @@ static struct ggml_threadpool * ggml_threadpool_new_impl(
         threadpool->n_barrier        = 0;
         threadpool->n_barrier_passed = 0;
         threadpool->current_chunk    = 0;
+#ifdef GGML_USE_CPU_RISCV64_SPACEMIT
+        threadpool->n_graph_done     = 0;
+#endif
         threadpool->stop             = false;
         threadpool->pause            = tpp->paused;
         threadpool->abort            = -1;
@@ -3306,6 +3373,15 @@ static struct ggml_threadpool * ggml_threadpool_new_impl(
 
     int32_t cpumask_iter = 0;
 
+#ifdef GGML_USE_CPU_RISCV64_SPACEMIT
+    // Spacemit uses a control caller for TCM wait/release, so worker0 is a real worker thread too.
+    for (int j = 0; j < tpp->n_threads; j++) {
+        ggml_thread_cpumask_next(tpp->cpumask, workers[j].cpumask, tpp->strict_cpu, &cpumask_iter);
+
+        int32_t rc = ggml_thread_create(&workers[j].thrd, NULL, ggml_graph_compute_secondary_thread, &workers[j]);
+        GGML_ASSERT(rc == 0);
+    }
+#else
     for (int j = 1; j < tpp->n_threads; j++) {
         ggml_thread_cpumask_next(tpp->cpumask, workers[j].cpumask, tpp->strict_cpu, &cpumask_iter);
 
@@ -3322,6 +3398,7 @@ static struct ggml_threadpool * ggml_threadpool_new_impl(
             ggml_thread_apply_affinity(threadpool->workers[0].cpumask);
         }
     }
+#endif
 #endif // GGML_USE_OPENMP
 
     return threadpool;
@@ -3389,11 +3466,19 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
         n_threads = threadpool->n_threads;
     }
 
+#ifdef GGML_USE_CPU_RISCV64_SPACEMIT
+    ggml_backend_cpu_riscv64_spacemit_tcm_mem_wait_all(n_threads);
+
+    ggml_graph_compute_wait_for_workers(threadpool, n_threads);
+
+    ggml_backend_cpu_riscv64_spacemit_tcm_mem_release_all(n_threads);
+#else
     // Kick all threads to start the new graph
     ggml_graph_compute_kickoff(threadpool, n_threads);
 
     // This is a work thread too
     ggml_graph_compute_thread(&threadpool->workers[0]);
+#endif
 #endif
 
     // don't leave affinity set on the main thread

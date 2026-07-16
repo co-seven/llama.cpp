@@ -12,6 +12,7 @@
 #include <string>
 #include <vector>
 #include <cinttypes>
+#include <memory>
 
 using json = nlohmann::ordered_json;
 
@@ -123,8 +124,53 @@ std::vector<size_t> lora_get_enabled_ids(const std::vector<common_adapter_lora_i
 // server_tokens
 //
 
+enum class server_media_chunk_type {
+    image,
+    audio,
+};
+
+struct server_media_embd_chunk {
+    std::string id;
+    server_media_chunk_type type = server_media_chunk_type::image;
+    std::vector<float> embd;
+
+    int32_t n_tokens = 0;
+    int32_t n_pos = 0;
+    int32_t hidden_size = 0;
+    int32_t grid_nx = 0;
+    int32_t grid_ny = 0;
+
+    bool use_mrope_pos = false;
+    std::vector<llama_token> tokens_begin;
+    std::vector<llama_token> tokens_end;
+
+    double t_encode_ms = 0.0;
+};
+
+struct server_media_chunk {
+    mtmd::input_chunk_ptr mtmd;
+    std::shared_ptr<const server_media_embd_chunk> embd;
+
+    server_media_chunk() = default;
+    explicit server_media_chunk(const mtmd_input_chunk * chunk);
+    explicit server_media_chunk(std::shared_ptr<const server_media_embd_chunk> chunk);
+
+    bool is_mtmd() const { return mtmd != nullptr; }
+    bool is_embd() const { return embd != nullptr; }
+
+    enum mtmd_input_chunk_type mtmd_type() const;
+    server_media_chunk_type type() const;
+    std::string id() const;
+    size_t n_tokens() const;
+    llama_pos n_pos() const;
+
+    server_media_chunk clone() const;
+};
+
+using server_media_chunk_ptr = std::shared_ptr<const server_media_chunk>;
+
 /**
- * server_tokens is a helper to manage the input tokens and image for the server.
+ * server_tokens is a helper to manage the input tokens and media for the server.
  * it is made this way to simplify the logic of KV cache management.
  */
 struct server_tokens {
@@ -132,9 +178,9 @@ struct server_tokens {
 
 private: // disallow accessing these members directly, risking out-of-sync
 
-    // map a **start** index in tokens to the image chunk
+    // map a **start** index in tokens to the media chunk
     // note: the order need to be in-sync with tokens
-    std::map<size_t, mtmd::input_chunk_ptr> map_idx_to_media;
+    std::map<size_t, server_media_chunk_ptr> map_idx_to_media;
 
     // list of tokens
     //   if the token is LLAMA_TOKEN_NULL, it indicates that this position is occupied by media chunk
@@ -178,16 +224,18 @@ public:
     // number of tokens with position < max_pos
     size_t size_up_to_pos(llama_pos max_pos) const;
 
-    const mtmd::input_chunk_ptr & find_chunk(size_t idx) const;
+    const server_media_chunk_ptr & find_chunk(size_t idx) const;
 
     // find next media chunk after idx
     // returns a pair of pointer to the chunk (nullptr if not found) and its start index in tokens
-    std::pair<const mtmd::input_chunk_ptr *, size_t> find_next_media_chunk(size_t idx) const;
+    std::pair<const server_media_chunk_ptr *, size_t> find_next_media_chunk(size_t idx) const;
 
     void push_back(llama_token tok);
 
     // will create a copy of the chunk if it contains non-text data
     void push_back(const mtmd_input_chunk * chunk);
+    void push_back(const server_media_embd_chunk & chunk);
+    void push_back(const server_media_chunk & chunk);
 
     // appends server tokens, updates the media map. copies media chunks.
     void push_back(server_tokens & tokens);

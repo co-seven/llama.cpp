@@ -2,6 +2,8 @@
 #include "server-chat.h"
 #include "server-common.h"
 #include "server-http.h"
+#include "media-worker.h"
+#include "server-media.h"
 #include "server-task.h"
 #include "server-queue.h"
 #include "server-schema.h"
@@ -165,6 +167,7 @@ struct server_slot {
     llama_context * ctx_dft = nullptr;
 
     // multimodal
+    server_media_context * media = nullptr;
     mtmd_context * mctx = nullptr;
     mtmd::batch_ptr mbatch = nullptr;
 
@@ -698,14 +701,41 @@ struct server_slot {
     // returns 0 on success
     // caller need to update prompt.tokens after a successful call to keep track of the processing progress
     int process_mtmd_chunk(size_t idx, size_t & n_tokens_out) {
-        GGML_ASSERT(mctx);
         const auto & input_tokens = task->tokens;
         const auto & chunk = input_tokens.find_chunk(idx);
         int32_t res = 0;
 
+        if (chunk->is_embd()) {
+            if (media == nullptr || chunk->embd == nullptr) {
+                return -1;
+            }
+
+            const char * name = chunk->type() == server_media_chunk_type::audio ? "audio" : "image";
+            SLT_INF(*this, "processing %s prefill (smt)...\n", name);
+            const int64_t t0 = ggml_time_ms();
+            llama_pos n_past = prompt.tokens.pos_next();
+            res = media->decode_embd_chunk(
+                    ctx_tgt,
+                    *chunk->embd,
+                    n_past,
+                    id,
+                    llama_n_batch(ctx_tgt),
+                    /* logits_last */ true);
+            SLT_INF(*this, "%s prefill (smt) processed in %" PRId64 " ms\n", name, ggml_time_ms() - t0);
+            if (res != 0) {
+                SLT_ERR(*this, "failed to decode SMT media chunk, idx = %zu, res = %d\n", idx, res);
+                return -1;
+            }
+            n_tokens_out = chunk->n_tokens();
+            return 0;
+        }
+
+        GGML_ASSERT(mctx);
+        GGML_ASSERT(chunk->mtmd != nullptr);
+
         auto try_decode = [&]() -> int32_t {
             if (mbatch) {
-                float * embd = mtmd_batch_get_output_embd(mbatch.get(), chunk.get());
+                float * embd = mtmd_batch_get_output_embd(mbatch.get(), chunk->mtmd.get());
                 if (embd) {
                     void * cb_data = spec;
                     static auto cb = [](llama_batch batch, void * user_data) {
@@ -720,7 +750,7 @@ struct server_slot {
                     res = mtmd_helper_decode_image_chunk(
                         mctx,
                         ctx_tgt,
-                        chunk.get(),
+                        chunk->mtmd.get(),
                         embd,
                         prompt.tokens.pos_next(),
                         id,
@@ -733,7 +763,7 @@ struct server_slot {
                         SLT_ERR(*this, "failed to decode mtmd chunk, idx = %zu, res = %d\n", idx, res);
                         return -1;
                     }
-                    n_tokens_out = mtmd_input_chunk_get_n_tokens(chunk.get());
+                    n_tokens_out = chunk->n_tokens();
                     return 0; // success
                 }
             }
@@ -753,7 +783,7 @@ struct server_slot {
         // otherwise, the batch is either uninitialized or is used up
         // we need to create & encode a new batch
         mbatch.reset(mtmd_batch_init(mctx));
-        res = mtmd_batch_add_chunk(mbatch.get(), chunk.get());
+        res = mtmd_batch_add_chunk(mbatch.get(), chunk->mtmd.get());
         GGML_ASSERT(res == 0); // we should never have an empty batch
 
         // try batching as much as possible
@@ -764,7 +794,10 @@ struct server_slot {
             if (next_chunk == nullptr) {
                 break;
             }
-            res = mtmd_batch_add_chunk(mbatch.get(), next_chunk->get());
+            if (!(*next_chunk)->is_mtmd()) {
+                break;
+            }
+            res = mtmd_batch_add_chunk(mbatch.get(), (*next_chunk)->mtmd.get());
             n_added += (res == 0 ? 1 : 0);
             idx_cur = next_idx;
             SLT_DBG(*this, "try adding media chunk idx = %zu to batch, res = %d\n", next_idx, res);
@@ -774,7 +807,10 @@ struct server_slot {
         // TODO @ngxson : move this log line to debug when it become more stable
         SLT_TRC(*this, "encoding mtmd batch from idx = %zu, n_chunks = %d\n", idx, n_added);
 
-        res = mtmd_batch_encode(mbatch.get());
+        if (media == nullptr) {
+            return -1;
+        }
+        res = media->encode_mtmd_batch(mbatch.get());
         if (res != 0) {
             SLT_ERR(*this, "failed to encode mtmd batch for chunk idx = %zu, res = %d\n", idx, res);
             return -1;
@@ -861,6 +897,7 @@ public:
     //  - and, with thread-safe APIs (e.g., tokenizer calls)
     llama_model * model_tgt = nullptr;
 
+    server_media_context * media = nullptr;
     mtmd_context * mctx = nullptr;
     const llama_vocab * vocab = nullptr;
 
@@ -892,6 +929,7 @@ private:
 
     // note: keep these alive - they determine the lifetime of the model, context, etc.
     common_init_result_ptr llama_init;
+    std::unique_ptr<server_media_context> media_init;
 
     llama_context * ctx_tgt = nullptr;
 
@@ -951,7 +989,8 @@ private:
         ctx_tgt = nullptr;
         model_tgt = nullptr;
 
-        mtmd_free(mctx);
+        media_init.reset();
+        media = nullptr;
         mctx = nullptr;
     }
 
@@ -1014,6 +1053,12 @@ private:
         params_base.n_outputs_max = server_n_outputs_max(params_base);
 
         const bool has_mmproj = !params.mmproj.path.empty();
+#if defined(LLAMA_SERVER_SMT_VISION)
+        const bool has_smt_media = !params.smt_config_dir.empty() &&
+                (params.media_backend == "auto" || params.media_backend == "smt");
+#else
+        const bool has_smt_media = false;
+#endif
         const bool has_draft = params.speculative.has_dft();
         const bool spec_mtp = std::find(params_base.speculative.types.begin(),
                                         params_base.speculative.types.end(),
@@ -1027,6 +1072,8 @@ private:
             }
             if (has_mmproj) {
                 stages.push_back("mmproj_model");
+            } else if (has_smt_media) {
+                stages.push_back("media_model");
             }
             load_progress_text.stages   = stages;
             load_progress_mmproj.stages = stages;
@@ -1036,6 +1083,16 @@ private:
             load_progress_callback(0.0f, &load_progress_text);
         }
 
+        std::unique_ptr<media_worker> media_worker_init;
+        if (has_mmproj || has_smt_media) {
+            std::string worker_backend = "mtmd";
+#if defined(LLAMA_SERVER_SMT_VISION)
+            if (params_base.media_backend == "smt" || (params_base.media_backend == "auto" && !has_mmproj && has_smt_media)) {
+                worker_backend = "smt";
+            }
+#endif
+            media_worker_init.reset(new media_worker(worker_backend));
+        }
 
         SRV_INF("loading model '%s'\n", params.model.get_name().c_str());
         SRV_TRC("local path '%s'\n", params.model.path.c_str());
@@ -1197,21 +1254,28 @@ private:
             load_progress_callback(1.0f, &load_progress_spec);
         }
 
-        if (has_mmproj) {
+        if (has_mmproj || has_smt_media) {
             if (callback_state) {
-                callback_state(SERVER_STATE_LOADING, {{"stage", "mmproj_model"}});
+                callback_state(SERVER_STATE_LOADING, {{"stage", has_mmproj ? "mmproj_model" : "media_model"}});
             }
 
             if (!is_resume) {
                 mtmd_helper_log_set(common_log_default_callback, nullptr);
             }
 
-            mctx = mtmd_init_from_file(mmproj_path.c_str(), model_tgt, mparams);
-            if (mctx == nullptr) {
-                SRV_ERR("failed to load multimodal model, '%s'\n", mmproj_path.c_str());
+            try {
+                media_init = server_media_context::init(ctx_tgt, model_tgt, vocab, params_base, mparams, std::move(media_worker_init));
+            } catch (const std::exception & e) {
+                SRV_ERR("failed to load media backend: %s\n", e.what());
                 return false;
             }
-            SRV_INF("loaded multimodal model, '%s'\n", mmproj_path.c_str());
+            media = media_init.get();
+            mctx = media != nullptr ? media->mtmd() : nullptr;
+            if (media == nullptr) {
+                SRV_ERR("%s", "media backend was requested but no backend was initialized\n");
+                return false;
+            }
+            SRV_INF("loaded media backend '%s'\n", media->backend_name());
 
             if (params_base.ctx_shift) {
                 params_base.ctx_shift = false;
@@ -1306,8 +1370,9 @@ private:
             slot.spec    = spec.get();
             slot.n_ctx   = n_ctx_slot;
 
+            slot.media                  = media;
             slot.mctx                   = mctx;
-            slot.prompt.tokens.has_mtmd = mctx != nullptr;
+            slot.prompt.tokens.has_mtmd = media != nullptr && media->supports_prompt_embeddings();
 
             SLT_TRC(slot, "new slot, n_ctx = %d\n", slot.n_ctx);
 
@@ -1474,9 +1539,9 @@ private:
                 /* reasoning_format      */ params_base.reasoning_format,
                 /* chat_template_kwargs  */ params_base.default_template_kwargs,
                 /* tmpls                 */ std::move(chat_templates),
-                /* allow_image           */ mctx ? mtmd_support_vision(mctx) : false,
-                /* allow_audio           */ mctx ? mtmd_support_audio (mctx) : false,
-                /* allow_video           */ mctx ? mtmd_helper_support_video(mctx) : false,
+                /* allow_image           */ media ? media->supports_vision() : false,
+                /* allow_audio           */ media ? media->supports_audio()  : false,
+                /* allow_video           */ media ? media->supports_video()  : false,
                 /* enable_thinking       */ enable_thinking,
                 /* reasoning_budget      */ params_base.sampling.reasoning_budget_tokens,
                 /* reasoning_budget_msg  */ params_base.sampling.reasoning_budget_message,
@@ -2019,7 +2084,7 @@ private:
 
     // if multimodal is enabled, send an error and return false
     bool check_no_mtmd(const int id_task) {
-        if (mctx) {
+        if (media != nullptr && media->supports_prompt_embeddings()) {
             send_error(id_task, "This feature is not supported by multimodal", ERROR_TYPE_NOT_SUPPORTED);
             return false;
         }
@@ -2216,8 +2281,8 @@ private:
     bool tokenize_cli_input(server_task & task) {
         try {
             auto & prompt = task.cli_prompt;
-            if (mctx != nullptr) {
-                task.tokens = process_mtmd_prompt(mctx, prompt, task.cli_files);
+            if (media != nullptr && media->supports_prompt_embeddings()) {
+                task.tokens = media->process_prompt(prompt, task.cli_files);
             } else {
                 task.tokens = std::move(tokenize_input_prompts(vocab, mctx, prompt, true, true)[0]);
             }
@@ -2831,9 +2896,9 @@ private:
                     return;
                 }
 
-                if (mctx) {
+                if (media != nullptr && media->supports_prompt_embeddings()) {
                     // we should never reach this because params_base.ctx_shift is automatically disabled if mmproj is loaded
-                    // we don't support ctx_shift because an image chunk may contains multiple tokens
+                    // we don't support ctx_shift because a media chunk may contains multiple tokens
                     GGML_ABORT("not supported by multimodal");
                 }
 
@@ -3155,7 +3220,7 @@ private:
                                     size_t head_c = n_past; // cache
                                     size_t head_p = n_past; // current prompt
 
-                                    if (mctx) {
+                                    if (media != nullptr && media->supports_prompt_embeddings()) {
                                         // we should never reach this
                                         GGML_ABORT("not supported by multimodal");
                                     }
@@ -3404,22 +3469,22 @@ private:
                             break;
                         }
 
-                        // process the image
+                        // process the media span
                         size_t n_tokens_out = 0;
                         int32_t res = slot.process_mtmd_chunk(cur_token_idx, n_tokens_out);
                         if (res != 0) {
-                            SLT_ERR(slot, "failed to process image, res = %d\n", res);
-                            send_error(slot, "failed to process image", ERROR_TYPE_SERVER);
+                            SLT_ERR(slot, "failed to process media, res = %d\n", res);
+                            send_error(slot, "failed to process media", ERROR_TYPE_SERVER);
                             slot.release();
                             continue;
                         }
 
                         slot.n_prompt_tokens_processed += n_tokens_out;
 
-                        // add the image chunk to cache
+                        // add the media chunk to cache
                         {
                             const auto & chunk = input_tokens.find_chunk(cur_token_idx);
-                            slot.prompt.tokens.push_back(chunk.get()); // copy
+                            slot.prompt.tokens.push_back(*chunk); // copy
                         }
 
                         has_mtmd = true;
@@ -3970,7 +4035,7 @@ server_context_meta server_context::get_meta() const {
         /* model_aliases          */ impl->model_aliases,
         /* model_tags             */ impl->model_tags,
         /* model_path             */ impl->params_base.model.path,
-        /* has_mtmd               */ impl->mctx != nullptr,
+        /* has_mtmd               */ impl->media != nullptr && impl->media->supports_prompt_embeddings(),
         /* has_inp_image          */ impl->chat_params.allow_image,
         /* has_inp_audio          */ impl->chat_params.allow_audio,
         /* has_inp_video          */ impl->chat_params.allow_video,
@@ -4075,9 +4140,11 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
         // process prompt
         std::vector<server_tokens> inputs;
 
-        if (res_type != TASK_RESPONSE_TYPE_NONE && ctx_server.mctx != nullptr) {
-            // This is the case used by OAI compatible chat path with MTMD. TODO It can be moved to the path below.
-            inputs.push_back(process_mtmd_prompt(ctx_server.mctx, prompt.get<std::string>(), files));
+        if (res_type != TASK_RESPONSE_TYPE_NONE &&
+                ctx_server.media != nullptr &&
+                ctx_server.media->supports_prompt_embeddings()) {
+            // OAI-compatible chat path pre-resolves media files into backend-neutral media chunks.
+            inputs.push_back(ctx_server.media->process_prompt(prompt.get<std::string>(), files));
         } else {
             // Everything else, including multimodal completions.
             inputs = tokenize_input_prompts(ctx_server.vocab, ctx_server.mctx, prompt, true, true);

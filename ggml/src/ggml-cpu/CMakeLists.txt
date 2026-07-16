@@ -491,9 +491,12 @@ function(ggml_add_cpu_backend_variant_impl tag_name)
                 string(APPEND MARCH_STR "_zba")
             endif()
             if (GGML_CPU_RISCV64_SPACEMIT)
-                # `xsmtvdotii' is only required for GCC >= 15.
-                if (CMAKE_C_COMPILER_ID STREQUAL "GNU" AND
-                    CMAKE_C_COMPILER_VERSION VERSION_GREATER_EQUAL 15)
+                # `xsmtvdotii' is required for GCC >= 15 and for Clang
+                # (the SpacemiT musl/OHOS clang toolchain needs it to emit
+                # the IME `vmadot` family of instructions).
+                if ((CMAKE_C_COMPILER_ID STREQUAL "GNU" AND
+                     CMAKE_C_COMPILER_VERSION VERSION_GREATER_EQUAL 15) OR
+                    CMAKE_C_COMPILER_ID MATCHES "Clang")
                     string(APPEND MARCH_STR "_xsmtvdotii")
                 endif()
             endif()

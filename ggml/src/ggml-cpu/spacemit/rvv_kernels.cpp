@@ -3156,6 +3156,167 @@ template <typename T> void forward_concat(ggml_compute_params * params, ggml_ten
     }
 }
 
+void forward_unary_tanh_f32(ggml_compute_params * params, ggml_tensor * op) {
+    const ggml_tensor * src0 = op->src[0];
+    ggml_tensor *       dst  = op;
+
+    GGML_ASSERT(ggml_is_contiguous(src0) && ggml_is_contiguous(dst) && ggml_are_same_shape(src0, dst));
+    GGML_ASSERT(src0->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32);
+
+    const int64_t ne  = ggml_nelements(src0);
+    const int64_t ith = params->ith;
+    const int64_t nth = params->nth;
+
+    const int64_t dr = (ne + nth - 1) / nth;
+    const int64_t i0 = dr * ith;
+    const int64_t i1 = MIN(i0 + dr, ne);
+
+    const float * src_ptr = (const float *) src0->data + i0;
+    float *       dst_ptr = (float *) dst->data + i0;
+
+    int64_t remaining = i1 - i0;
+
+    if (params->use_ref) {
+        for (int64_t k = 0; k < remaining; ++k) {
+            dst_ptr[k] = tanhf(src_ptr[k]);
+        }
+        return;
+    }
+
+    while (remaining > 0) {
+        const size_t vl = __riscv_vsetvl_e32m2(remaining);
+        vfloat32m2_t v  = __riscv_vle32_v_f32m2(src_ptr, vl);
+        v               = rvv_tanh_approx_f32m2(v, vl);
+        __riscv_vse32_v_f32m2(dst_ptr, v, vl);
+        src_ptr   += vl;
+        dst_ptr   += vl;
+        remaining -= vl;
+    }
+}
+
+void forward_unary_gelu_f32(ggml_compute_params * params, ggml_tensor * op) {
+    const ggml_tensor * src0 = op->src[0];
+    ggml_tensor *       dst  = op;
+
+    GGML_ASSERT(ggml_is_contiguous(src0) && ggml_is_contiguous(dst) && ggml_are_same_shape(src0, dst));
+    GGML_ASSERT(src0->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32);
+
+    const int64_t ne  = ggml_nelements(src0);
+    const int64_t ith = params->ith;
+    const int64_t nth = params->nth;
+
+    const int64_t dr = (ne + nth - 1) / nth;
+    const int64_t i0 = dr * ith;
+    const int64_t i1 = MIN(i0 + dr, ne);
+
+    const float * src_ptr = (const float *) src0->data;
+    float *       dst_ptr = (float *) dst->data;
+
+    static constexpr float GELU_ALPHA = 0.7978845608f;
+    static constexpr float GELU_BETA  = 0.044715f;
+
+    if (params->use_ref) {
+        for (int64_t i = i0; i < i1; ++i) {
+            const float x     = src_ptr[i];
+            const float inner = GELU_ALPHA * x * (1.0f + GELU_BETA * x * x);
+            dst_ptr[i]        = 0.5f * x * (1.0f + tanhf(inner));
+        }
+        return;
+    }
+
+    int64_t i = i0;
+    while (i < i1) {
+        const size_t vl = __riscv_vsetvl_e32m2(i1 - i);
+
+        vfloat32m2_t x     = __riscv_vle32_v_f32m2(src_ptr + i, vl);
+        vfloat32m2_t x2    = __riscv_vfmul_vv_f32m2(x, x, vl);
+        vfloat32m2_t inner = __riscv_vfmacc_vf_f32m2(__riscv_vfmv_v_f_f32m2(1.0f, vl), GELU_BETA, x2, vl);
+        inner              = __riscv_vfmul_vf_f32m2(__riscv_vfmul_vv_f32m2(x, inner, vl), GELU_ALPHA, vl);
+        vfloat32m2_t th    = rvv_tanh_approx_f32m2(inner, vl);
+        vfloat32m2_t out   = __riscv_vfmul_vf_f32m2(
+                __riscv_vfmul_vv_f32m2(x, __riscv_vfadd_vf_f32m2(th, 1.0f, vl), vl), 0.5f, vl);
+        __riscv_vse32_v_f32m2(dst_ptr + i, out, vl);
+        i += vl;
+    }
+}
+
+void forward_glu_geglu_f32(ggml_compute_params * params, ggml_tensor * op) {
+    const ggml_tensor * src0 = op->src[0];
+    const ggml_tensor * src1 = op->src[1];
+
+    GGML_ASSERT(src0->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32);
+
+    const int64_t nc    = src1 ? src0->ne[0] : src0->ne[0] / 2;
+    const int64_t nr    = ggml_nrows(src0);
+    const int64_t total = nr * nc;
+    const int64_t ith   = params->ith;
+    const int64_t nth   = params->nth;
+
+    const int64_t dr = (total + nth - 1) / nth;
+    const int64_t e0 = dr * ith;
+    const int64_t e1 = MIN(e0 + dr, total);
+
+    const int32_t swapped = ggml_get_op_params_i32(op, 1);
+
+    static constexpr float GELU_ALPHA = 0.79788456080286535587989211986876f;
+    static constexpr float GELU_BETA  = 0.044715f;
+
+    int64_t e = e0;
+    while (e < e1) {
+        const int64_t r   = e / nc;
+        const int64_t c   = e % nc;
+        const int64_t run = MIN(nc - c, e1 - e);
+
+        const float * x_row = (const float *) ((const char *) src0->data + r * src0->nb[1]);
+        const float * g_row;
+        if (src1) {
+            g_row = (const float *) ((const char *) src1->data + r * src1->nb[1]);
+        } else {
+            x_row = x_row + (swapped ? nc : 0);
+            g_row = (const float *) ((const char *) src0->data + r * src0->nb[1]) + (swapped ? 0 : nc);
+        }
+        float * y_row = (float *) ((char *) op->data + r * op->nb[1]);
+
+        const float * xp = x_row + c;
+        const float * gp = g_row + c;
+        float *       yp = y_row + c;
+
+        if (params->use_ref) {
+            for (int64_t i = 0; i < run; ++i) {
+                const float xv    = xp[i];
+                const float inner = GELU_ALPHA * xv * (1.0f + GELU_BETA * xv * xv);
+                yp[i]             = 0.5f * xv * (1.0f + tanhf(inner)) * gp[i];
+            }
+            e += run;
+            continue;
+        }
+
+        int64_t remaining = run;
+        while (remaining > 0) {
+            const size_t vl = __riscv_vsetvl_e32m2(remaining);
+
+            vfloat32m2_t xv = __riscv_vle32_v_f32m2(xp, vl);
+            vfloat32m2_t gv = __riscv_vle32_v_f32m2(gp, vl);
+
+            vfloat32m2_t x2    = __riscv_vfmul_vv_f32m2(xv, xv, vl);
+            vfloat32m2_t inner = __riscv_vfmacc_vf_f32m2(__riscv_vfmv_v_f_f32m2(1.0f, vl), GELU_BETA, x2, vl);
+            inner              = __riscv_vfmul_vf_f32m2(__riscv_vfmul_vv_f32m2(xv, inner, vl), GELU_ALPHA, vl);
+
+            vfloat32m2_t th   = rvv_tanh_approx_f32m2(inner, vl);
+            vfloat32m2_t gelu = __riscv_vfmul_vf_f32m2(
+                    __riscv_vfmul_vv_f32m2(xv, __riscv_vfadd_vf_f32m2(th, 1.0f, vl), vl), 0.5f, vl);
+
+            __riscv_vse32_v_f32m2(yp, __riscv_vfmul_vv_f32m2(gelu, gv, vl), vl);
+
+            xp        += vl;
+            gp        += vl;
+            yp        += vl;
+            remaining -= vl;
+        }
+        e += run;
+    }
+}
+
 template void forward_binary<GGML_OP_ADD, float>(ggml_compute_params * params, ggml_tensor * op);
 template void forward_binary<GGML_OP_SUB, float>(ggml_compute_params * params, ggml_tensor * op);
 template void forward_binary<GGML_OP_MUL, float>(ggml_compute_params * params, ggml_tensor * op);

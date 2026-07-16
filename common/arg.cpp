@@ -2358,6 +2358,25 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.mmproj_use_gpu = value;
         }
     ).set_examples(mmproj_examples).set_env("LLAMA_ARG_MMPROJ_OFFLOAD"));
+#if defined(LLAMA_SERVER_SMT_VISION)
+    add_opt(common_arg(
+        {"--media-backend", "--vision-backend"}, "{auto|mtmd|smt}",
+        string_format("multimodal backend selection (default: %s)", params.media_backend.c_str()),
+        [](common_params & params, const std::string & value) {
+            if (value != "auto" && value != "mtmd" && value != "smt") {
+                throw std::invalid_argument("media-backend must be one of: auto, mtmd, smt");
+            }
+            params.media_backend = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_MTMD}).set_env("LLAMA_ARG_MEDIA_BACKEND"));
+    add_opt(common_arg(
+        {"--smt-config-dir"}, "DIR",
+        "path to SMT config directory (config.json + ONNX model files)",
+        [](common_params & params, const std::string & value) {
+            params.smt_config_dir = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_MTMD}).set_env("LLAMA_ARG_SMT_CONFIG_DIR"));
+#endif
     add_opt(common_arg(
         {"--image", "--audio", "--video"}, "FILE",
         "path to an image, audio, or video file. use with multimodal models, use comma-separated values for multiple files\n",
