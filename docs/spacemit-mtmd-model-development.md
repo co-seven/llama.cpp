@@ -151,7 +151,7 @@ After export, check the input/output `name`, `dtype`, `shape`, and verify:
 FastVLM already has a default branch in the server: architecture matching
 `LlavaQwen2ForCausalLM` / `llavaqwen2` / `fastvlm`, resize to `512x512`, RGB,
 quantize to uint8 after resize, convert to NCHW float32, normalize to `0..1`
-(`tools/mtmd/smt-vision-preprocess.cpp`).
+(`tools/smt-mtmd/smt/smt-vision-preprocess.cpp`).
 
 For a new model, express fixed input size through `config.json` first:
 
@@ -263,10 +263,11 @@ Core paths of the current SMT multimodal solution:
 common/arg.cpp
 tools/server/server-context.cpp
 tools/server/server-common.cpp
-tools/server/server-smt-vision.{h,cpp}
-tools/mtmd/smt-vision-wrapper.{h,cpp}
-tools/mtmd/smt-vision-preprocess.{h,cpp}
-tools/mtmd/CMakeLists.txt
+tools/server/server-media.{h,cpp}
+tools/smt-mtmd/media-worker.{h,cpp}
+tools/smt-mtmd/smt/smt-vision-wrapper.{h,cpp}
+tools/smt-mtmd/smt/smt-vision-preprocess.{h,cpp}
+tools/smt-mtmd/CMakeLists.txt
 tools/server/CMakeLists.txt
 convert_hf_to_gguf.py
 gguf-py/gguf/constants.py
@@ -307,7 +308,8 @@ Backend selection in `tools/server/server-context.cpp`:
 
 - `--media-backend auto` with a non-empty `--smt-config-dir` selects SMT.
 - `--media-backend smt` forces SMT.
-- SMT init calls `server_smt_vision_init(ctx_tgt, smt_config_dir, warmup)`.
+- SMT init goes through `server_media_context::init()` and creates the requested
+  SMT vision/audio contexts on the dedicated media worker thread.
 
 Request parsing in `tools/server/server-common.cpp`:
 
@@ -317,16 +319,17 @@ Request parsing in `tools/server/server-common.cpp`:
   replaced with `<__media__>`.
 - If an image is present but the prompt has no marker, the server prepends one.
 
-SMT encoding in `tools/server/server-smt-vision.cpp`:
+SMT encoding in `tools/server/server-media.cpp`:
 
-1. `server_smt_vision_encode_media_bin`
-2. image goes through `server_smt_vision_encode_image_bin`
-3. `smt_vision_preprocess_if_image`
-4. `smt_vision_context::encode_image`
-5. check embedding shape
-6. produce `server_smt_image_chunk`
+1. `server_media_context::process_prompt`
+2. media bytes go through `server_media_encode_smt_media`
+3. image data goes through `server_media_encode_smt_image`
+4. `smt_vision_preprocess_if_image`
+5. `smt_vision_context::encode_image`
+6. check embedding shape
+7. produce a `server_media_embd_chunk`
 
-SMT injection into the LLM in `server_smt_vision_decode_chunk`:
+SMT injection into the LLM in `server_media_context::decode_embd_chunk`:
 
 1. optionally decode an image-begin token
 2. inject image embeddings via `llama_batch.embd`
@@ -335,7 +338,7 @@ SMT injection into the LLM in `server_smt_vision_decode_chunk`:
 
 ## B.3 config.json support surface
 
-Parsed in `tools/mtmd/smt-vision-wrapper.cpp`. Current vision-side fields:
+Parsed in `tools/smt-mtmd/smt/smt-vision-wrapper.cpp`. Current vision-side fields:
 
 - `architectures`
 - `vision_model.model_path`
@@ -381,7 +384,7 @@ GGUF unless the runtime explicitly needs them.
 
 ## B.5 Add or adjust vision ONNX support
 
-Main files: `tools/mtmd/smt-vision-wrapper.{cpp,h}`.
+Main files: `tools/smt-mtmd/smt/smt-vision-wrapper.{cpp,h}`.
 
 `smt_vision_context::create()` loads `config.json`, normalizes the architecture
 name, initializes the ORT API, creates the `SpineVisionModelEngine`, creates the
@@ -400,7 +403,7 @@ Do not let `server-common` understand a model's ONNX output details directly.
 
 ## B.6 Add image preprocessing
 
-Main file: `tools/mtmd/smt-vision-preprocess.cpp`. Existing branches:
+Main file: `tools/smt-mtmd/smt/smt-vision-preprocess.cpp`. Existing branches:
 
 - Qwen3VL: `768x768`, keep the model's internal normalize, quantize to u8 after
   resize then convert to float.
@@ -418,9 +421,9 @@ crop or pad, RGB/BGR, layout, rescale, mean/std, output dtype, output shape.
 
 ## B.7 Add image boundary token rules
 
-Main file: `tools/server/server-smt-vision.cpp`. Functions:
-`detect_image_boundary_tokens_native`, `detect_image_boundary_tokens_auto`,
-`resolve_image_boundary_tokens`. Existing rules:
+Main file: `tools/server/server-media.cpp`. Functions:
+`server_media_detect_image_boundary_tokens_native`,
+`server_media_resolve_image_boundary_tokens`. Existing rules:
 
 - Qwen2VL / Qwen2.5VL / Qwen3VL / YoutuVL: `<|vision_start|>` / `<|vision_end|>`
 - Llama4: `<|image_start|>` / `<|image_end|>`
@@ -441,8 +444,9 @@ injected by the server.
 
 ## B.8 Add M-RoPE or special position rules
 
-Main file: `tools/server/server-smt-vision.cpp`. Functions: `arch_requires_mrope`,
-`infer_image_grid_xy`, `decode_embd`. Architectures currently requiring M-RoPE:
+Main file: `tools/server/server-media.cpp`. Functions:
+`server_media_arch_requires_mrope`, `server_media_infer_image_grid_xy`,
+`server_media_decode_embd`. Architectures currently requiring M-RoPE:
 Qwen2VL, Qwen2.5VL, Qwen3VL, GLM4V, PaddleOCR.
 
 The M-RoPE path generates multi-dimensional positions per image embedding and
