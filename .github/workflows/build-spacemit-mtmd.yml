@@ -435,7 +435,31 @@ jobs:
 
           echo "Using RISCV_ROOT_PATH=${RISCV_ROOT_PATH}"
           echo "Using SPACEMIT_ORT_DIR=${SPACEMIT_ORT_DIR}"
-          bash build_spacemit.sh ohos
+
+          rm -rf build-ohos/CMakeCache.txt
+          rm -f build-ohos/tools/ui/llama-ui-embed-host
+          cmake -B build-ohos \
+              -DCMAKE_BUILD_TYPE=Release \
+              -DGGML_CPU_RISCV64_SPACEMIT=ON \
+              -DGGML_CPU_REPACK=OFF \
+              -DGGML_OPENMP=OFF \
+              -DLLAMA_CURL=OFF \
+              -DGGML_RVV=ON \
+              -DGGML_RV_ZVFH=ON \
+              -DGGML_RV_ZFH=ON \
+              -DGGML_RV_ZICBOP=ON \
+              -DGGML_RV_ZIHINTPAUSE=ON \
+              -DGGML_RV_ZBA=ON \
+              -DCMAKE_INSTALL_PREFIX=build-ohos/installed \
+              -DCMAKE_TOOLCHAIN_FILE=${PWD}/cmake/riscv64-spacemit-ohos.cmake \
+              -DLLAMA_SERVER_SMT_VISION=ON \
+              -DSPACEMIT_ORT_DIR=${SPACEMIT_ORT_DIR}
+
+          cmake --build build-ohos --parallel "$(nproc)" --config Release
+
+          pushd build-ohos >/dev/null
+          make install
+          popd >/dev/null
 
       - name: Pack artifacts (OHOS)
         shell: bash
