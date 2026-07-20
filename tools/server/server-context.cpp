@@ -1053,7 +1053,7 @@ private:
         params_base.n_outputs_max = server_n_outputs_max(params_base);
 
         const bool has_mmproj = !params.mmproj.path.empty();
-#if defined(LLAMA_SERVER_SMT_VISION)
+#if defined(LLAMA_SERVER_SMT_MTMD)
         const bool has_smt_media = !params.smt_config_dir.empty() &&
                 (params.media_backend == "auto" || params.media_backend == "smt");
 #else
@@ -1086,7 +1086,7 @@ private:
         std::unique_ptr<media_worker> media_worker_init;
         if (has_mmproj || has_smt_media) {
             std::string worker_backend = "mtmd";
-#if defined(LLAMA_SERVER_SMT_VISION)
+#if defined(LLAMA_SERVER_SMT_MTMD)
             if (params_base.media_backend == "smt" || (params_base.media_backend == "auto" && !has_mmproj && has_smt_media)) {
                 worker_backend = "smt";
             }

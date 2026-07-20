@@ -14,13 +14,13 @@ target_include_directories(${TARGET} PRIVATE ${CMAKE_SOURCE_DIR})
 target_link_libraries(${TARGET} PUBLIC ${CMAKE_THREAD_LIBS_INIT})
 target_compile_features(${TARGET} PRIVATE cxx_std_17)
 
-if(LLAMA_SERVER_SMT_VISION)
+if(LLAMA_SERVER_SMT_MTMD)
     if(WIN32)
-        message(FATAL_ERROR "LLAMA_SERVER_SMT_VISION is not supported on Windows because the SMT audio backend depends on POSIX APIs")
+        message(FATAL_ERROR "LLAMA_SERVER_SMT_MTMD is not supported on Windows because the SMT audio backend depends on POSIX APIs")
     endif()
 
     if(NOT DEFINED SPACEMIT_ORT_DIR)
-        message(FATAL_ERROR "SPACEMIT_ORT_DIR must be set when LLAMA_SERVER_SMT_VISION=ON")
+        message(FATAL_ERROR "SPACEMIT_ORT_DIR must be set when LLAMA_SERVER_SMT_MTMD=ON")
     endif()
 
     set(SPACEMIT_ORT_INC_DIR "${SPACEMIT_ORT_DIR}/include")

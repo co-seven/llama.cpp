@@ -11,7 +11,7 @@
 #include <fstream>
 #include <stdexcept>
 
-#if defined(LLAMA_SERVER_SMT_VISION)
+#if defined(LLAMA_SERVER_SMT_MTMD)
 #    include "smt-audio-wrapper.h"
 #    include "smt-vision-preprocess.h"
 #    include "smt-vision-wrapper.h"
@@ -77,7 +77,7 @@ struct server_media_context::impl {
     mtmd::context_ptr mtmd_ctx;
     const llama_vocab * vocab = nullptr;
 
-#if defined(LLAMA_SERVER_SMT_VISION)
+#if defined(LLAMA_SERVER_SMT_MTMD)
     std::unique_ptr<smt_vision_context> smt_vision;
     std::unique_ptr<smt_audio_context> smt_audio;
 
@@ -121,7 +121,7 @@ bool server_media_context::supports_vision() const {
     if (pimpl->mode == server_media_backend::mtmd) {
         return mtmd_support_vision(pimpl->mtmd_ctx.get());
     }
-#if defined(LLAMA_SERVER_SMT_VISION)
+#if defined(LLAMA_SERVER_SMT_MTMD)
     if (pimpl->mode == server_media_backend::smt) {
         return pimpl->smt_vision != nullptr;
     }
@@ -133,7 +133,7 @@ bool server_media_context::supports_audio() const {
     if (pimpl->mode == server_media_backend::mtmd) {
         return mtmd_support_audio(pimpl->mtmd_ctx.get());
     }
-#if defined(LLAMA_SERVER_SMT_VISION)
+#if defined(LLAMA_SERVER_SMT_MTMD)
     if (pimpl->mode == server_media_backend::smt) {
         return pimpl->smt_audio != nullptr;
     }
@@ -145,7 +145,7 @@ bool server_media_context::supports_video() const {
     return pimpl->mode == server_media_backend::mtmd && mtmd_helper_support_video(pimpl->mtmd_ctx.get());
 }
 
-#if defined(LLAMA_SERVER_SMT_VISION)
+#if defined(LLAMA_SERVER_SMT_MTMD)
 static std::string server_media_to_lower_ascii(std::string s) {
     std::transform(s.begin(), s.end(), s.begin(), [](unsigned char c) { return (char) std::tolower(c); });
     return s;
@@ -628,7 +628,7 @@ std::unique_ptr<server_media_context> server_media_context::init(
     const bool has_mmproj = !params.mmproj.path.empty();
 
     std::string backend_pref = "auto";
-#if defined(LLAMA_SERVER_SMT_VISION)
+#if defined(LLAMA_SERVER_SMT_MTMD)
     backend_pref = params.media_backend;
     const bool has_smt_config = !params.smt_config_dir.empty();
 #else
@@ -677,7 +677,7 @@ std::unique_ptr<server_media_context> server_media_context::init(
         return ctx;
     }
 
-#if defined(LLAMA_SERVER_SMT_VISION)
+#if defined(LLAMA_SERVER_SMT_MTMD)
     if (selected == server_media_backend::smt) {
         if (!has_smt_config) {
             throw std::runtime_error("media backend 'smt' selected but --smt-config-dir is not set");
@@ -745,7 +745,7 @@ std::unique_ptr<server_media_context> server_media_context::init(
 #else
     if (selected == server_media_backend::smt) {
         GGML_UNUSED(ctx_llama);
-        throw std::runtime_error("SMT media backend is not compiled. Rebuild with LLAMA_SERVER_SMT_VISION=ON.");
+        throw std::runtime_error("SMT media backend is not compiled. Rebuild with LLAMA_SERVER_SMT_MTMD=ON.");
     }
 #endif
 
@@ -796,7 +796,7 @@ server_tokens server_media_context::process_prompt(
         });
     }
 
-#if defined(LLAMA_SERVER_SMT_VISION)
+#if defined(LLAMA_SERVER_SMT_MTMD)
     if (pimpl->mode == server_media_backend::smt) {
         if (is_placeholder) {
             throw std::runtime_error("SMT media placeholder token counting is not implemented");
@@ -869,7 +869,7 @@ int32_t server_media_context::decode_embd_chunk(
         int32_t seq_id,
         int32_t n_batch,
         bool logits_last) const {
-#if defined(LLAMA_SERVER_SMT_VISION)
+#if defined(LLAMA_SERVER_SMT_MTMD)
     if (chunk.hidden_size <= 0 || chunk.embd.empty() || chunk.embd.size() % (size_t) chunk.hidden_size != 0) {
         return -1;
     }

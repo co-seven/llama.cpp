@@ -2358,7 +2358,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.mmproj_use_gpu = value;
         }
     ).set_examples(mmproj_examples).set_env("LLAMA_ARG_MMPROJ_OFFLOAD"));
-#if defined(LLAMA_SERVER_SMT_VISION)
+#if defined(LLAMA_SERVER_SMT_MTMD)
     add_opt(common_arg(
         {"--media-backend", "--vision-backend"}, "{auto|mtmd|smt}",
         string_format("multimodal backend selection (default: %s)", params.media_backend.c_str()),

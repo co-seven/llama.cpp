@@ -473,7 +473,7 @@ SMT-related CMake: `CMakeLists.txt`, `tools/mtmd/CMakeLists.txt`,
 `tools/server/CMakeLists.txt`. Build switches:
 
 ```text
-LLAMA_SERVER_SMT_VISION=ON
+LLAMA_SERVER_SMT_MTMD=ON
 SPACEMIT_ORT_DIR=/path/to/spacemit-ort
 ```
 

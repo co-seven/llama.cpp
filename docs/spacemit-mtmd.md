@@ -41,7 +41,7 @@ cmake -B build \
     -DGGML_RV_ZBA=ON \
     -DCMAKE_INSTALL_PREFIX=build/installed \
     -DCMAKE_TOOLCHAIN_FILE=${PWD}/cmake/riscv64-spacemit-linux-gnu-gcc.cmake \
-    -DLLAMA_SERVER_SMT_VISION=ON \
+    -DLLAMA_SERVER_SMT_MTMD=ON \
     -DSPACEMIT_ORT_DIR=${SPACEMIT_ORT_DIR}
 
 cmake --build build --parallel "$(nproc)" --config Release
