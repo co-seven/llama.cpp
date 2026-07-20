@@ -9,7 +9,7 @@
 
 namespace spacemit_kernels {
 
-constexpr auto div_round_up(auto up, auto down) {
+template <typename T, typename U> constexpr auto div_round_up(T up, U down) {
     return (up + down - 1) / down;
 }
 
@@ -71,6 +71,11 @@ template <typename T> void forward_get_rows(ggml_compute_params * params, ggml_t
 template <typename T> void forward_concat(ggml_compute_params * params, ggml_tensor * op);
 
 template <ggml_op op_type, typename T> void forward_binary(ggml_compute_params * params, ggml_tensor * op);
+
+void forward_unary_tanh_f32(ggml_compute_params * params, ggml_tensor * op);
+void forward_unary_gelu_f32(ggml_compute_params * params, ggml_tensor * op);
+
+void forward_glu_geglu_f32(ggml_compute_params * params, ggml_tensor * op);
 
 template <typename T> void forward_sum_rows(const ggml_compute_params * params, ggml_tensor * op);
 

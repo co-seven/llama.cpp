@@ -235,6 +235,57 @@ static inline raw_buffer base64_decode(const std::string & encoded_string) {
 // server_tokens implementation
 //
 
+server_media_chunk::server_media_chunk(const mtmd_input_chunk * chunk) : mtmd(mtmd_input_chunk_copy(chunk)) {
+}
+
+server_media_chunk::server_media_chunk(std::shared_ptr<const server_media_embd_chunk> chunk) : embd(std::move(chunk)) {
+}
+
+enum mtmd_input_chunk_type server_media_chunk::mtmd_type() const {
+    GGML_ASSERT(mtmd != nullptr);
+    return mtmd_input_chunk_get_type(mtmd.get());
+}
+
+server_media_chunk_type server_media_chunk::type() const {
+    if (embd != nullptr) {
+        return embd->type;
+    }
+    const auto type = mtmd_type();
+    if (type == MTMD_INPUT_CHUNK_TYPE_AUDIO) {
+        return server_media_chunk_type::audio;
+    }
+    return server_media_chunk_type::image;
+}
+
+std::string server_media_chunk::id() const {
+    if (embd != nullptr) {
+        return embd->id;
+    }
+    const char * chunk_id = mtmd_input_chunk_get_id(mtmd.get());
+    return chunk_id == nullptr ? std::string() : std::string(chunk_id);
+}
+
+size_t server_media_chunk::n_tokens() const {
+    if (embd != nullptr) {
+        return (size_t) embd->n_tokens;
+    }
+    return mtmd_input_chunk_get_n_tokens(mtmd.get());
+}
+
+llama_pos server_media_chunk::n_pos() const {
+    if (embd != nullptr) {
+        return embd->n_pos;
+    }
+    return mtmd_input_chunk_get_n_pos(mtmd.get());
+}
+
+server_media_chunk server_media_chunk::clone() const {
+    if (embd != nullptr) {
+        return server_media_chunk(embd);
+    }
+    return server_media_chunk(mtmd.get());
+}
+
 server_tokens::server_tokens(mtmd::input_chunks & mtmd_chunks, bool has_mtmd) : has_mtmd(has_mtmd) {
     for (size_t i = 0; i < mtmd_chunks.size(); ++i) {
         push_back(mtmd_chunks[i]);
@@ -258,7 +309,7 @@ llama_pos server_tokens::pos_next(int64_t n_tokens) const {
 
         for (auto it = map_idx_to_media.begin(); it != map_idx_to_media.end(); ++it) {
             const auto & chunk = it->second;
-            res += mtmd_input_chunk_get_n_pos(chunk.get()) - mtmd_input_chunk_get_n_tokens(chunk.get());
+            res += chunk->n_pos() - chunk->n_tokens();
         }
 
         return res;
@@ -273,8 +324,8 @@ llama_pos server_tokens::pos_next(int64_t n_tokens) const {
         const auto media_it = map_idx_to_media.find(idx);
         if (media_it != map_idx_to_media.end()) {
             const auto & chunk = media_it->second;
-            const llama_pos n_pos = mtmd_input_chunk_get_n_pos(chunk.get());
-            const size_t n_tok = mtmd_input_chunk_get_n_tokens(chunk.get());
+            const llama_pos n_pos = chunk->n_pos();
+            const size_t n_tok = chunk->n_tokens();
 
             pos += n_pos;
             idx += n_tok;
@@ -299,8 +350,8 @@ size_t server_tokens::size_up_to_pos(llama_pos max_pos) const {
         const auto media_it = map_idx_to_media.find(idx);
         if (media_it != map_idx_to_media.end()) {
             const auto & chunk = media_it->second;
-            const llama_pos n_pos = mtmd_input_chunk_get_n_pos(chunk.get());
-            const size_t n_tok = mtmd_input_chunk_get_n_tokens(chunk.get());
+            const llama_pos n_pos = chunk->n_pos();
+            const size_t n_tok = chunk->n_tokens();
 
             pos += n_pos;
             idx += n_tok;
@@ -337,7 +388,7 @@ std::string server_tokens::str() const {
     return oss.str();
 }
 
-const mtmd::input_chunk_ptr & server_tokens::find_chunk(size_t idx) const {
+const server_media_chunk_ptr & server_tokens::find_chunk(size_t idx) const {
     auto it = map_idx_to_media.find(idx);
     if (it != map_idx_to_media.end()) {
         return it->second;
@@ -345,7 +396,7 @@ const mtmd::input_chunk_ptr & server_tokens::find_chunk(size_t idx) const {
     throw std::runtime_error("Chunk not found");
 }
 
-std::pair<const mtmd::input_chunk_ptr *, size_t> server_tokens::find_next_media_chunk(size_t idx) const {
+std::pair<const server_media_chunk_ptr *, size_t> server_tokens::find_next_media_chunk(size_t idx) const {
     auto it = map_idx_to_media.upper_bound(idx);
     if (it != map_idx_to_media.end()) {
         return { &it->second, it->first };
@@ -369,8 +420,7 @@ void server_tokens::push_back(const mtmd_input_chunk * chunk) {
         for (size_t i = 0; i < n_tokens; ++i) {
             tokens.emplace_back(LLAMA_TOKEN_NULL);
         }
-        mtmd::input_chunk_ptr new_chunk(mtmd_input_chunk_copy(chunk));
-        map_idx_to_media[start_idx] = std::move(new_chunk);
+        map_idx_to_media[start_idx] = std::make_shared<const server_media_chunk>(chunk);
     } else if (type == MTMD_INPUT_CHUNK_TYPE_TEXT) {
         size_t n_tokens;
         const auto * text_tokens = mtmd_input_chunk_get_tokens_text(chunk, &n_tokens);
@@ -382,19 +432,51 @@ void server_tokens::push_back(const mtmd_input_chunk * chunk) {
     }
 }
 
+void server_tokens::push_back(const server_media_embd_chunk & chunk) {
+    GGML_ASSERT(has_mtmd);
+    if (chunk.n_tokens <= 0 || chunk.n_pos <= 0) {
+        throw std::runtime_error("Invalid media embedding chunk");
+    }
+    size_t start_idx = tokens.size();
+    for (int32_t i = 0; i < chunk.n_tokens; ++i) {
+        tokens.emplace_back(LLAMA_TOKEN_NULL);
+    }
+    auto chunk_ptr = std::make_shared<const server_media_embd_chunk>(chunk);
+    map_idx_to_media[start_idx] = std::make_shared<const server_media_chunk>(chunk_ptr);
+}
+
+void server_tokens::push_back(const server_media_chunk & chunk) {
+    if (chunk.is_embd()) {
+        push_back(*chunk.embd);
+    } else if (chunk.is_mtmd()) {
+        push_back(chunk.mtmd.get());
+    } else {
+        throw std::runtime_error("Invalid media chunk");
+    }
+}
+
 void server_tokens::push_back(server_tokens & tokens) {
     size_t start_idx = size();
-    for (size_t i = 0; i < tokens.size(); i++) {
-        push_back(tokens[i]);
-    }
     if (tokens.has_mtmd) {
         // Assert if we are copying MTMD chunks to a server_tokens that does not have mtmd.
         // We could also just check, but this will prevent silently dropping MTMD data.
         GGML_ASSERT(has_mtmd);
-        for (auto it = tokens.map_idx_to_media.begin(); it != tokens.map_idx_to_media.end(); ) {
-            auto * chunk = tokens.map_idx_to_media[it->first].get();
-            mtmd::input_chunk_ptr new_chunk(mtmd_input_chunk_copy(chunk));
-            map_idx_to_media[start_idx + it->first] = std::move(new_chunk);
+        for (size_t i = 0; i < tokens.size(); ) {
+            if (tokens[i] == LLAMA_TOKEN_NULL) {
+                const auto & chunk = tokens.find_chunk(i);
+                for (size_t j = 0; j < chunk->n_tokens(); ++j) {
+                    this->tokens.emplace_back(LLAMA_TOKEN_NULL);
+                }
+                map_idx_to_media[start_idx + i] = std::make_shared<const server_media_chunk>(chunk->clone());
+                i += chunk->n_tokens();
+            } else {
+                push_back(tokens[i]);
+                ++i;
+            }
+        }
+    } else {
+        for (size_t i = 0; i < tokens.size(); i++) {
+            push_back(tokens[i]);
         }
     }
 }
@@ -493,11 +575,11 @@ size_t server_tokens::get_common_prefix(const server_tokens & b) const {
 
             GGML_ASSERT(a_chunk && b_chunk);
 
-            const std::string id_ai = mtmd_input_chunk_get_id(a_chunk.get());
-            const std::string id_bi = mtmd_input_chunk_get_id(b_chunk.get());
+            const std::string id_ai = a_chunk->id();
+            const std::string id_bi = b_chunk->id();
 
-            const size_t n_tok_a = mtmd_input_chunk_get_n_tokens(a_chunk.get());
-            const size_t n_tok_b = mtmd_input_chunk_get_n_tokens(b_chunk.get());
+            const size_t n_tok_a = a_chunk->n_tokens();
+            const size_t n_tok_b = b_chunk->n_tokens();
 
             if (id_ai == id_bi && n_tok_a == n_tok_b) {
                 GGML_ASSERT(n_tok_a > 0 && "Invalid media chunk"); // should never happen
@@ -521,7 +603,7 @@ size_t server_tokens::get_common_prefix(const server_tokens & b) const {
 common_chat_msg_spans server_tokens::find_message_spans(const common_chat_msg_delimiters & delims) const {
     std::map<size_t, size_t> skips;
     for (const auto & it : map_idx_to_media) {
-        skips[it.first] = mtmd_input_chunk_get_n_tokens(it.second.get());
+        skips[it.first] = it.second->n_tokens();
     }
     return delims.split(tokens, skips);
 }
@@ -536,7 +618,7 @@ bool server_tokens::validate(const struct llama_context * ctx) const {
         if (t == LLAMA_TOKEN_NULL) {
             try {
                 const auto & chunk = find_chunk(i);
-                size_t n_tokens = mtmd_input_chunk_get_n_tokens(chunk.get());
+                size_t n_tokens = chunk->n_tokens();
                 i += n_tokens - 1; // will be +1 by the for loop
             } catch (const std::exception & e) {
                 return false;
@@ -554,8 +636,8 @@ server_tokens server_tokens::clone() const {
     res.tokens   = tokens;
     for (auto it = map_idx_to_media.begin(); it != map_idx_to_media.end(); ++it) {
         size_t idx = it->first;
-        const mtmd::input_chunk_ptr & chunk = it->second;
-        res.map_idx_to_media[idx] = mtmd::input_chunk_ptr(mtmd_input_chunk_copy(chunk.get()));
+        const server_media_chunk_ptr & chunk = it->second;
+        res.map_idx_to_media[idx] = std::make_shared<const server_media_chunk>(chunk->clone());
     }
     return res;
 }

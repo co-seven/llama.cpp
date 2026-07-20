@@ -439,55 +439,68 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS> class tensor_
             }
             uint8_t * b_col_zp = block_type_has_zp<BLOC_TYPE>() ? b_col : nullptr;
 
-            int64_t ni      = ith * NB_COLS;
-            int64_t nb_real = std::min(gemm_n - ni, NB_COLS);
+            const bool has_pair = ((ith & 1) != 0) || (ith + 1 < nth);
 
-            if (ith % 2 == 0 && nb_real > 0) {
-                spacemit_kernels::rvv::memcpy1d(b_col, reinterpret_cast<uint8_t *>(w_data) + ni * row_stride_b,
-                                                nb_real * row_stride_b);
+            const int64_t ni0     = (int64_t) ith * NB_COLS;
+            const bool    active0 = ni0 < gemm_n;
+            const int64_t nb0     = active0 ? std::min(gemm_n - ni0, (int64_t) NB_COLS) : 0;
+
+            if (ith % 2 == 0 && active0) {
+                spacemit_kernels::rvv::memcpy1d(b_col, reinterpret_cast<uint8_t *>(w_data) + ni0 * row_stride_b,
+                                                nb0 * row_stride_b);
                 if (a_row != quant_a_buffer) {
                     spacemit_kernels::rvv::memcpy1d(a_row, quant_a_buffer, gemm_workspace_size);
                 }
             }
 
-            spine_barrier_wait(cur_barrier);
+            if (has_pair) {
+                spine_barrier_wait(cur_barrier);
+            }
 
-            if (ith % 2 != 0 && nb_real > 0) {
+            if (ith % 2 != 0 && active0) {
                 if (a_row != quant_a_buffer) {
                     spacemit_kernels::rvv::memcpy1d(a_row, quant_a_buffer, gemm_workspace_size);
                 }
-                spacemit_kernels::rvv::memcpy1d(b_col, reinterpret_cast<uint8_t *>(w_data) + ni * row_stride_b,
-                                                nb_real * row_stride_b);
+                spacemit_kernels::rvv::memcpy1d(b_col, reinterpret_cast<uint8_t *>(w_data) + ni0 * row_stride_b,
+                                                nb0 * row_stride_b);
             }
 
-            for (; ni < gemm_n; ni += NB_COLS * nth) {
-                int64_t rows_remaining = gemm_m;
-                float * c_blk          = output + ni;
-                auto *  a_row_cur      = a_row;
+            const int64_t base_start = (int64_t) (ith & ~1) * NB_COLS;
+            const int64_t lane_off   = (int64_t) (ith & 1) * NB_COLS;
+            for (int64_t base = base_start; base < gemm_n; base += NB_COLS * nth) {
+                const int64_t ni      = base + lane_off;
+                const bool    active  = ni < gemm_n;
+                const int64_t nb_real = active ? std::min(gemm_n - ni, (int64_t) NB_COLS) : 0;
 
-                if (ith % 2 != 0) {
+                if (has_pair && ith % 2 != 0) {
                     spine_barrier_wait(cur_barrier);
                 }
 
-                while (rows_remaining > 0) {
-                    auto rows_handled = gemm_kernel(b_blk_len, a_row_cur, b_col, b_col_zp, c_blk, rows_remaining,
-                                                    nb_real, b_k_blks, gemm_n);
+                if (active) {
+                    int64_t rows_remaining = gemm_m;
+                    float * c_blk          = output + ni;
+                    auto *  a_row_cur      = a_row;
 
-                    c_blk += rows_handled * gemm_n;
-                    a_row_cur += rows_handled * row_stride_a;
+                    while (rows_remaining > 0) {
+                        auto rows_handled = gemm_kernel(b_blk_len, a_row_cur, b_col, b_col_zp, c_blk, rows_remaining,
+                                                        nb_real, b_k_blks, gemm_n);
 
-                    rows_remaining -= rows_handled;
+                        c_blk += rows_handled * gemm_n;
+                        a_row_cur += rows_handled * row_stride_a;
+
+                        rows_remaining -= rows_handled;
+                    }
                 }
 
-                if (ith % 2 == 0) {
+                if (has_pair && ith % 2 == 0) {
                     spine_barrier_wait(cur_barrier);
                 }
 
                 const int64_t next_ni = ni + NB_COLS * nth;
                 if (next_ni < gemm_n) {
-                    nb_real = std::min(gemm_n - next_ni, NB_COLS);
+                    const int64_t next_nb = std::min(gemm_n - next_ni, (int64_t) NB_COLS);
                     spacemit_kernels::rvv::memcpy1d(b_col, reinterpret_cast<uint8_t *>(w_data) + next_ni * row_stride_b,
-                                                    nb_real * row_stride_b);
+                                                    next_nb * row_stride_b);
                 }
             }
         } else {
@@ -725,6 +738,8 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS> class tensor_
 
         if (valid_ep_count_t % nth == 0 && tcm_buffer != nullptr && valid_ep_count_t == n_as &&
             valid_act_count_t == n_as && per_nb_cols_wsize <= tcm_buffer_size) {
+            const bool has_pair = ((ith & 1) != 0) || (ith + 1 < nth);
+
             for (int64_t valid_id = ith; valid_id < valid_ep_count_t; valid_id += nth) {
                 const int64_t cur_a = valid_matrix_row_counts[valid_id];
 
@@ -756,7 +771,9 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS> class tensor_
                     }
                 }
 
-                spine_barrier_wait(cur_barrier);
+                if (has_pair) {
+                    spine_barrier_wait(cur_barrier);
+                }
 
                 if (ith % 2 != 0) {
                     if (a_row != src1_col) {
@@ -768,13 +785,13 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS> class tensor_
 
                 int64_t nb_real = std::min(ne01, NB_COLS);
                 for (int64_t ni = 0; ni < ne01; ni += NB_COLS) {
-                    if (ith % 2 != 0) {
+                    if (has_pair && ith % 2 != 0) {
                         spine_barrier_wait(cur_barrier);
                     }
 
                     gemm_kernel(b_blk_len, a_row, b_col, b_col_zp, c_blk + ni, 1, nb_real, b_k_blks, ne01);
 
-                    if (ith % 2 == 0) {
+                    if (has_pair && ith % 2 == 0) {
                         spine_barrier_wait(cur_barrier);
                     }
 
@@ -1032,6 +1049,23 @@ class tensor_traits_common : public tensor_traits_base {
                         ggml_compute_forward_div(params, op);
                         return true;
                 }
+            case GGML_OP_UNARY:
+                switch (ggml_get_unary_op(op)) {
+                    case GGML_UNARY_OP_TANH:
+                        spacemit_kernels::rvv::forward_unary_tanh_f32(params, op);
+                        return true;
+                    case GGML_UNARY_OP_GELU:
+                        spacemit_kernels::rvv::forward_unary_gelu_f32(params, op);
+                        return true;
+                    default:
+                        return false;
+                }
+            case GGML_OP_GLU:
+                if (ggml_get_glu_op(op) == GGML_GLU_OP_GEGLU && op->src[0]->type == GGML_TYPE_F32) {
+                    spacemit_kernels::rvv::forward_glu_geglu_f32(params, op);
+                    return true;
+                }
+                return false;
             case GGML_OP_FLASH_ATTN_EXT:
                 forward_flash_attn_ext_f16(params, op);
                 return true;
@@ -1633,6 +1667,21 @@ class extra_buffer_type : ggml::cpu::extra_buffer_type {
             case GGML_OP_CONCAT:
                 // case GGML_OP_GATED_DELTA_NET:
                 return (ggml::cpu::tensor_traits *) (&ggml::cpu::riscv64_spacemit::rvv_impl);
+            case GGML_OP_UNARY:
+                if (ggml_get_unary_op(op) == GGML_UNARY_OP_TANH && op->src[0]->type == GGML_TYPE_F32 &&
+                    ggml_is_contiguous(op->src[0])) {
+                    return (ggml::cpu::tensor_traits *) (&ggml::cpu::riscv64_spacemit::rvv_impl);
+                }
+                if (ggml_get_unary_op(op) == GGML_UNARY_OP_GELU && op->src[0]->type == GGML_TYPE_F32 &&
+                    ggml_is_contiguous(op->src[0])) {
+                    return (ggml::cpu::tensor_traits *) (&ggml::cpu::riscv64_spacemit::rvv_impl);
+                }
+                break;
+            case GGML_OP_GLU:
+                if (ggml_get_glu_op(op) == GGML_GLU_OP_GEGLU && op->src[0]->type == GGML_TYPE_F32) {
+                    return (ggml::cpu::tensor_traits *) (&ggml::cpu::riscv64_spacemit::rvv_impl);
+                }
+                break;
             default:
                 // GGML_ABORT("fatal error");
                 break;
@@ -1663,6 +1712,25 @@ ggml_backend_buffer_type_t ggml_backend_cpu_riscv64_spacemit_buffer_type(void) {
 
     return &ggml_backend_cpu_buffer_type_riscv64_spacemit;
 }
+
+namespace {
+
+static int ggml_spacemit_ai_cpu_id_for_thread(int thread_n) {
+    const auto & perfer_core_ids = ggml::cpu::riscv64_spacemit::global_spine_env_info.perfer_core_ids;
+    if (thread_n < 0 || static_cast<size_t>(thread_n) >= perfer_core_ids.size()) {
+        GGML_ABORT("thread_n %d exceeds perfer_core_ids size %zu\n", thread_n, perfer_core_ids.size());
+    }
+
+    return perfer_core_ids[static_cast<size_t>(thread_n)] -
+           ggml::cpu::riscv64_spacemit::global_spine_env_info.aicpu_id_offset;
+}
+
+static void * ggml_spacemit_tcm_buffer_for_thread(int thread_n) {
+    const int ai_cpu_id = ggml_spacemit_ai_cpu_id_for_thread(thread_n);
+    return ggml::cpu::riscv64_spacemit::spine_mem_pool_tcm_mem_get(ai_cpu_id);
+}
+
+}  // namespace
 
 extern "C" {
 static int bind_ai_thread() {
@@ -1711,30 +1779,65 @@ void ggml_backend_cpu_riscv64_spacemit_set_numa_thread_affinity(int thread_n) {
             GGML_ABORT("set thread affinity error for thread_n %d, cpu_id %d\n", thread_n, perfer_cpu_id);
         }
 
-        int ai_cpu_id = perfer_cpu_id - ggml::cpu::riscv64_spacemit::global_spine_env_info.aicpu_id_offset;
+        int ai_cpu_id                                   = ggml_spacemit_ai_cpu_id_for_thread(thread_n);
         ggml::cpu::riscv64_spacemit::tls_context.cpu_id = ai_cpu_id;
         ggml::cpu::riscv64_spacemit::tls_context.tcm_buffer =
             ggml::cpu::riscv64_spacemit::spine_mem_pool_tcm_mem_get(ai_cpu_id);
         ggml::cpu::riscv64_spacemit::tls_context.tcm_buffer_size =
             ggml::cpu::riscv64_spacemit::global_spine_env_info.tcm_blk_size;
     }
+}
 
-    if (ggml::cpu::riscv64_spacemit::tls_context.tcm_buffer != nullptr) {
-        void * rt =
-            ggml::cpu::riscv64_spacemit::spine_mem_pool_tcm_mem_wait(ggml::cpu::riscv64_spacemit::tls_context.cpu_id);
+void ggml_backend_cpu_riscv64_spacemit_clear_numa_thread_affinity_threaded(int thread_n) {
+    (void) thread_n;
+}
+
+void ggml_backend_cpu_riscv64_spacemit_tcm_mem_wait_all(int n_threads) {
+    if (!ggml::cpu::riscv64_spacemit::global_spine_env_info.use_tcm) {
+        return;
+    }
+
+    for (int i = 0; i < n_threads; ++i) {
+        if (ggml_spacemit_tcm_buffer_for_thread(i) == nullptr) {
+            continue;
+        }
+
+        const int ai_cpu_id = ggml_spacemit_ai_cpu_id_for_thread(i);
+        void *    rt        = ggml::cpu::riscv64_spacemit::spine_mem_pool_tcm_mem_wait(ai_cpu_id);
         if (rt == nullptr) {
-            GGML_ABORT("wait tcm buffer failed for cpu_id: %d", ggml::cpu::riscv64_spacemit::tls_context.cpu_id);
+            for (int j = i; j-- > 0;) {
+                if (ggml_spacemit_tcm_buffer_for_thread(j) == nullptr) {
+                    continue;
+                }
+
+                const int acquired_ai_cpu_id = ggml_spacemit_ai_cpu_id_for_thread(j);
+                ggml::cpu::riscv64_spacemit::spine_mem_pool_tcm_mem_release(acquired_ai_cpu_id);
+            }
+            GGML_ABORT("wait tcm buffer failed for cpu_id: %d", ai_cpu_id);
         }
     }
 }
 
-void ggml_backend_cpu_riscv64_spacemit_clear_numa_thread_affinity_threaded(int thread_n) {
-    if (ggml::cpu::riscv64_spacemit::tls_context.tcm_buffer != nullptr) {
-        auto rt = ggml::cpu::riscv64_spacemit::spine_mem_pool_tcm_mem_release(
-            ggml::cpu::riscv64_spacemit::tls_context.cpu_id);
-        if (rt != 0) {
-            GGML_ABORT("release tcm buffer failed for cpu_id: %d", ggml::cpu::riscv64_spacemit::tls_context.cpu_id);
+void ggml_backend_cpu_riscv64_spacemit_tcm_mem_release_all(int n_threads) {
+    if (!ggml::cpu::riscv64_spacemit::global_spine_env_info.use_tcm) {
+        return;
+    }
+
+    int first_failed_cpu_id = -1;
+    for (int i = n_threads; i-- > 0;) {
+        if (ggml_spacemit_tcm_buffer_for_thread(i) == nullptr) {
+            continue;
         }
+
+        const int ai_cpu_id = ggml_spacemit_ai_cpu_id_for_thread(i);
+        auto      rt        = ggml::cpu::riscv64_spacemit::spine_mem_pool_tcm_mem_release(ai_cpu_id);
+        if (rt != 0 && first_failed_cpu_id < 0) {
+            first_failed_cpu_id = ai_cpu_id;
+        }
+    }
+
+    if (first_failed_cpu_id >= 0) {
+        GGML_ABORT("release tcm buffer failed for cpu_id: %d", first_failed_cpu_id);
     }
 }
 }

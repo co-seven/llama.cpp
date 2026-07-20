@@ -96,6 +96,33 @@ struct mtmd_audio_preprocessor_gemma4a : mtmd_audio_preprocessor {
     mtmd_audio_cache cache;
 };
 
+// Generic helper to compute a log-mel spectrogram with the same implementation used by mtmd.
+// The output layout is [n_mel, n_len] flattened in row-major order per mel bin.
+bool mtmd_audio_compute_log_mel_spectrogram(const float * samples,
+                                            size_t        n_samples,
+                                            int           n_threads,
+                                            int           n_mel,
+                                            int           n_fft,
+                                            int           window_len,
+                                            int           hop_len,
+                                            int           sample_rate,
+                                            bool          center_padding,
+                                            float         preemph,
+                                            bool          use_natural_log,
+                                            bool          norm_per_feature,
+                                            mtmd_audio_mel & out);
+
+// Gemma4 audio frontend features. Output layout: [n_frames, n_mel].
+bool mtmd_audio_compute_gemma4_features(const float * samples,
+                                        size_t        n_samples,
+                                        int           sample_rate,
+                                        int           n_mel,
+                                        int           n_fft,
+                                        int           window_len,
+                                        int           hop_len,
+                                        std::vector<float> & features,
+                                        int &         n_frames_out);
+
 struct mtmd_audio_preprocessor_gemma4ua : mtmd_audio_preprocessor {
     mtmd_audio_preprocessor_gemma4ua(const clip_ctx * ctx) : mtmd_audio_preprocessor(ctx) {}
     void initialize() override;
@@ -110,6 +137,28 @@ struct mtmd_audio_preprocessor_qwen3a : mtmd_audio_preprocessor {
   private:
     mtmd_audio_cache cache;
 };
+
+// Kaldi-compatible fbank features (used by FunASR/SenseVoice models).
+// Output layout is [n_frames, n_mel] flattened in row-major order per time frame.
+bool mtmd_audio_compute_kaldi_fbank(const float * samples,
+                                    size_t        n_samples,
+                                    int           sample_rate,
+                                    int           n_mel,
+                                    int           frame_len,
+                                    int           frame_shift,
+                                    float         preemph_coeff,
+                                    std::vector<float> & features,
+                                    int &         n_frames_out);
+
+// Low Frame Rate frame stacking for FunASR models.
+// Stacks lfr_m consecutive frames with stride lfr_n using boundary clamping.
+bool mtmd_audio_compute_lfr(const std::vector<float> & features,
+                            int n_frames,
+                            int n_mel,
+                            int lfr_m,
+                            int lfr_n,
+                            std::vector<float> & lfr_features,
+                            int & n_lfr_frames_out);
 
 //
 // streaming ISTFT - converts spectrogram frames back to audio one frame at a time

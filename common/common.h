@@ -595,6 +595,10 @@ struct common_params {
     struct common_params_model mmproj;
     bool mmproj_use_gpu = true;     // use GPU for multimodal model
     bool no_mmproj = false;         // explicitly disable multimodal model
+#if defined(LLAMA_SERVER_SMT_MTMD)
+    std::string media_backend = "auto"; // multimodal backend: auto|mtmd|smt
+    std::string smt_config_dir;         // SMT config dir (config.json + ONNX)
+#endif
     std::vector<std::string> image; // path to image file(s) ; TODO: change the name to "media"
     int image_min_tokens = -1;
     int image_max_tokens = -1;

@@ -1,0 +1,71 @@
+set(TARGET llama-media)
+
+add_library(${TARGET} STATIC
+    media-worker.cpp
+    media-worker.h
+)
+
+if (BUILD_SHARED_LIBS)
+    set_target_properties(${TARGET} PROPERTIES POSITION_INDEPENDENT_CODE ON)
+endif()
+
+target_include_directories(${TARGET} PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+target_include_directories(${TARGET} PRIVATE ${CMAKE_SOURCE_DIR})
+target_link_libraries(${TARGET} PUBLIC ${CMAKE_THREAD_LIBS_INIT})
+target_compile_features(${TARGET} PRIVATE cxx_std_17)
+
+if(LLAMA_SERVER_SMT_MTMD)
+    if(WIN32)
+        message(FATAL_ERROR "LLAMA_SERVER_SMT_MTMD is not supported on Windows because the SMT audio backend depends on POSIX APIs")
+    endif()
+
+    if(NOT DEFINED SPACEMIT_ORT_DIR)
+        message(FATAL_ERROR "SPACEMIT_ORT_DIR must be set when LLAMA_SERVER_SMT_MTMD=ON")
+    endif()
+
+    set(SPACEMIT_ORT_INC_DIR "${SPACEMIT_ORT_DIR}/include")
+    set(SPACEMIT_ORT_LIB_DIR "${SPACEMIT_ORT_DIR}/lib")
+    set(SPACEMIT_ORT_SAMPLE_DIR "${SPACEMIT_ORT_DIR}/samples")
+
+    if(NOT EXISTS "${SPACEMIT_ORT_SAMPLE_DIR}/spine_vision_engine.cc")
+        message(FATAL_ERROR "Could not find spine_vision_engine.cc in SPACEMIT_ORT_DIR='${SPACEMIT_ORT_DIR}'")
+    endif()
+    if(NOT EXISTS "${SPACEMIT_ORT_SAMPLE_DIR}/spine_llm_argparser.cc")
+        message(FATAL_ERROR "Could not find spine_llm_argparser.cc in SPACEMIT_ORT_DIR='${SPACEMIT_ORT_DIR}'")
+    endif()
+
+    if(EXISTS "${SPACEMIT_ORT_LIB_DIR}/libonnxruntime.so")
+        set(ONNXRUNTIME_LIB "${SPACEMIT_ORT_LIB_DIR}/libonnxruntime.so")
+    elseif(EXISTS "${SPACEMIT_ORT_LIB_DIR}/libonnxruntime.a")
+        set(ONNXRUNTIME_LIB "${SPACEMIT_ORT_LIB_DIR}/libonnxruntime.a")
+    else()
+        message(FATAL_ERROR "Could not find libonnxruntime.{so,a} in SPACEMIT_ORT_DIR='${SPACEMIT_ORT_DIR}'")
+    endif()
+
+    target_sources(${TARGET} PRIVATE
+        smt/smt-audio-wrapper.cpp
+        smt/smt-audio-wrapper.h
+        smt/smt-media-common.cpp
+        smt/smt-media-common.h
+        smt/smt-profile.h
+        smt/smt-vision-preprocess.cpp
+        smt/smt-vision-preprocess.h
+        smt/smt-vision-wrapper.cpp
+        smt/smt-vision-wrapper.h
+        ${SPACEMIT_ORT_SAMPLE_DIR}/spine_vision_engine.cc
+        ${SPACEMIT_ORT_SAMPLE_DIR}/spine_llm_argparser.cc
+    )
+    target_include_directories(${TARGET} PUBLIC
+        ${CMAKE_CURRENT_SOURCE_DIR}/smt
+    )
+    target_include_directories(${TARGET} PRIVATE
+        ${CMAKE_SOURCE_DIR}/tools/mtmd
+        ${CMAKE_SOURCE_DIR}/vendor
+        ${SPACEMIT_ORT_SAMPLE_DIR}
+        ${SPACEMIT_ORT_INC_DIR}
+    )
+    target_link_libraries(${TARGET} PRIVATE mtmd ${ONNXRUNTIME_LIB})
+    if(CMAKE_DL_LIBS)
+        target_link_libraries(${TARGET} PRIVATE ${CMAKE_DL_LIBS})
+    endif()
+endif()
