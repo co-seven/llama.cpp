@@ -45,6 +45,8 @@ if(LLAMA_SERVER_SMT_MTMD)
     target_sources(${TARGET} PRIVATE
         smt/smt-audio-wrapper.cpp
         smt/smt-audio-wrapper.h
+        smt/smt-media-common.cpp
+        smt/smt-media-common.h
         smt/smt-profile.h
         smt/smt-vision-preprocess.cpp
         smt/smt-vision-preprocess.h

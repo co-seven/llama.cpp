@@ -2,14 +2,9 @@
 
 #include "smt-vision-wrapper.h"
 
-#include "onnxruntime_cxx_api.h"
+#include "smt-media-common.h"
 #include "smt-profile.h"
 
-#include <dlfcn.h>
-
-#include <cctype>
-#include <cstdio>
-#include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <iostream>
@@ -17,110 +12,24 @@
 #include <stdexcept>
 #include <unordered_map>
 
-#if defined(_WIN32)
-#    include <io.h>
-#    include <windows.h>
-#else
-#    include <fcntl.h>
-#    include <unistd.h>
-#endif
-
-namespace onnxruntime {
-const OrtApi * g_ort = NULL;
-}  // namespace onnxruntime
-
 namespace {
 
-static int get_ep_thread_num(const std::unordered_map<std::string, std::string> & ep_config,
-                             const std::string &                                  key,
-                             int                                                  default_value) {
-    auto it = ep_config.find(key);
-    if (it == ep_config.end() || it->second.empty()) {
-        return default_value;
-    }
-    return std::stoi(it->second);
-}
-
-static bool has_spacemit_ep_affinity(const std::unordered_map<std::string, std::string> & ep_config) {
-    auto it = ep_config.find("SPACEMIT_EP_INTRA_THREAD_AFFINITY");
-    return it != ep_config.end() && !it->second.empty();
-}
-
-static std::unordered_map<std::string, std::string> make_provider_options(
-    const std::unordered_map<std::string, std::string> & ep_config, const char * backend_name) {
-    std::unordered_map<std::string, std::string> provider_options = ep_config;
-    if (provider_options.find("SPACEMIT_EP_INTRA_THREAD_NUM") == provider_options.end()) {
-        provider_options["SPACEMIT_EP_INTRA_THREAD_NUM"] = "1";
-    }
-    if (provider_options.find("SPACEMIT_EP_INTER_THREAD_NUM") == provider_options.end()) {
-        provider_options["SPACEMIT_EP_INTER_THREAD_NUM"] = "1";
-    }
-    (void) backend_name;
-    return provider_options;
-}
-
-static bool init_spacemit_execution_provider(Ort::SessionOptions &                                options,
-                                             const std::unordered_map<std::string, std::string> & provider_options,
-                                             std::string &                                        error_message) {
-    std::vector<const char *> keys;
-    std::vector<const char *> values;
-    keys.reserve(provider_options.size());
-    values.reserve(provider_options.size());
-    for (const auto & entry : provider_options) {
-        keys.push_back(entry.first.c_str());
-        values.push_back(entry.second.c_str());
-    }
-
-    void * handle = dlopen("libspacemit_ep.so", RTLD_NOW);
-    if (!handle) {
-        error_message = std::string("failed to load libspacemit_ep.so: ") + dlerror();
-        return false;
-    }
-
-    auto * ep_init =
-        reinterpret_cast<OrtStatus * (*) (OrtSessionOptions *, const char * const *, const char * const *, size_t)>(
-            dlsym(handle, "OrtSessionOptionsSpaceMITEnvInit"));
-    if (!ep_init) {
-        error_message = std::string("failed to find OrtSessionOptionsSpaceMITEnvInit: ") + dlerror();
-        return false;
-    }
-
-    if (OrtStatus * status = ep_init(options, keys.data(), values.data(), keys.size())) {
-        error_message = Ort::GetApi().GetErrorMessage(status);
-        Ort::GetApi().ReleaseStatus(status);
-        return false;
-    }
-
-    return true;
-}
-
-static std::vector<const char *> make_name_ptrs(const std::vector<std::string> & names) {
-    std::vector<const char *> ptrs;
-    ptrs.reserve(names.size());
-    for (const auto & name : names) {
-        ptrs.push_back(name.c_str());
-    }
-    return ptrs;
-}
-
-static std::vector<std::string> get_io_names(Ort::Session & session, bool inputs) {
-    std::vector<std::string>         names;
-    Ort::AllocatorWithDefaultOptions allocator;
-    const size_t                     count = inputs ? session.GetInputCount() : session.GetOutputCount();
-    names.reserve(count);
-    for (size_t i = 0; i < count; ++i) {
-        auto allocated =
-            inputs ? session.GetInputNameAllocated(i, allocator) : session.GetOutputNameAllocated(i, allocator);
-        names.emplace_back(allocated.get());
-    }
-    return names;
-}
-
-static Ort::Value make_tensor_f32(const std::vector<int64_t> & shape, std::vector<float> & data) {
-    Ort::MemoryInfo memory_info =
-        Ort::MemoryInfo::CreateCpu(OrtAllocatorType::OrtArenaAllocator, OrtMemType::OrtMemTypeDefault);
-    return Ort::Value::CreateTensor<float>(memory_info, data.data(), data.size(), shape.data(), shape.size());
-}
+using smt_media::extract_double_value;
+using smt_media::extract_int64_value;
+using smt_media::extract_number_array;
+using smt_media::extract_string_array;
+using smt_media::extract_string_map;
+using smt_media::extract_string_value;
+using smt_media::find_closing_brace;
+using smt_media::get_ep_thread_num;
+using smt_media::get_io_names;
+using smt_media::has_spacemit_ep_affinity;
+using smt_media::init_spacemit_execution_provider;
+using smt_media::make_name_ptrs;
+using smt_media::make_tensor_f32;
+using smt_media::normalize_path;
+using smt_media::read_file_to_string;
+using smt_media::trim_ascii;
 
 class smt_ort_vision_engine {
   public:
@@ -135,7 +44,7 @@ class smt_ort_vision_engine {
     Ort::Session & create_session() {
         session_options_.SetGraphOptimizationLevel(GraphOptimizationLevel::ORT_ENABLE_ALL);
 
-        provider_options_ = make_provider_options(ep_config_, "vision");
+        provider_options_ = smt_media::make_provider_options(ep_config_, 1, 1);
 
         const int intra_thread_num = get_ep_thread_num(provider_options_, "SPACEMIT_EP_INTRA_THREAD_NUM", 1);
         const int inter_thread_num = get_ep_thread_num(provider_options_, "SPACEMIT_EP_INTER_THREAD_NUM", 1);
@@ -374,328 +283,6 @@ struct smt_vision_config {
     smt_vision_preprocess_config                 preprocess_config;
 };
 
-static std::string read_file_to_string(const std::string & path) {
-    std::ifstream file(path);
-    if (!file.is_open()) {
-        return {};
-    }
-
-    return std::string((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
-}
-
-static size_t find_closing_brace(const std::string & text, size_t start_pos) {
-    int depth = 0;
-    for (size_t index = start_pos; index < text.size(); ++index) {
-        if (text[index] == '{') {
-            ++depth;
-        } else if (text[index] == '}') {
-            --depth;
-            if (depth == 0) {
-                return index;
-            }
-        }
-    }
-    return std::string::npos;
-}
-
-static std::string trim_ascii(std::string value) {
-    while (!value.empty() && std::isspace(static_cast<unsigned char>(value.front()))) {
-        value.erase(value.begin());
-    }
-    while (!value.empty() && std::isspace(static_cast<unsigned char>(value.back()))) {
-        value.pop_back();
-    }
-    return value;
-}
-
-static std::string extract_string_value(const std::string & text, const std::string & key) {
-    const std::string marker  = "\"" + key + "\"";
-    const size_t      key_pos = text.find(marker);
-    if (key_pos == std::string::npos) {
-        return {};
-    }
-
-    const size_t colon_pos = text.find(':', key_pos + marker.size());
-    if (colon_pos == std::string::npos) {
-        return {};
-    }
-
-    const size_t first_quote = text.find('"', colon_pos + 1);
-    if (first_quote == std::string::npos) {
-        return {};
-    }
-
-    const size_t second_quote = text.find('"', first_quote + 1);
-    if (second_quote == std::string::npos) {
-        return {};
-    }
-
-    return text.substr(first_quote + 1, second_quote - first_quote - 1);
-}
-
-static int64_t extract_int64_value(const std::string & text, const std::string & key, int64_t default_value) {
-    const std::string marker  = "\"" + key + "\"";
-    const size_t      key_pos = text.find(marker);
-    if (key_pos == std::string::npos) {
-        return default_value;
-    }
-
-    const size_t colon_pos = text.find(':', key_pos + marker.size());
-    if (colon_pos == std::string::npos) {
-        return default_value;
-    }
-
-    size_t value_start = colon_pos + 1;
-    while (value_start < text.size() && std::isspace(static_cast<unsigned char>(text[value_start]))) {
-        ++value_start;
-    }
-
-    size_t value_end = value_start;
-    if (value_end < text.size() && (text[value_end] == '-' || text[value_end] == '+')) {
-        ++value_end;
-    }
-    while (value_end < text.size() && std::isdigit(static_cast<unsigned char>(text[value_end]))) {
-        ++value_end;
-    }
-
-    if (value_end == value_start) {
-        return default_value;
-    }
-
-    try {
-        return std::stoll(text.substr(value_start, value_end - value_start));
-    } catch (...) {
-        return default_value;
-    }
-}
-
-static double extract_double_value(const std::string & text, const std::string & key, double default_value) {
-    const std::string marker  = "\"" + key + "\"";
-    const size_t      key_pos = text.find(marker);
-    if (key_pos == std::string::npos) {
-        return default_value;
-    }
-
-    const size_t colon_pos = text.find(':', key_pos + marker.size());
-    if (colon_pos == std::string::npos) {
-        return default_value;
-    }
-
-    size_t value_start = colon_pos + 1;
-    while (value_start < text.size() && std::isspace(static_cast<unsigned char>(text[value_start]))) {
-        ++value_start;
-    }
-
-    size_t value_end = value_start;
-    if (value_end < text.size() && (text[value_end] == '-' || text[value_end] == '+')) {
-        ++value_end;
-    }
-    bool seen_dot = false;
-    while (value_end < text.size()) {
-        const unsigned char ch = static_cast<unsigned char>(text[value_end]);
-        if (std::isdigit(ch)) {
-            ++value_end;
-            continue;
-        }
-        if (ch == '.' && !seen_dot) {
-            seen_dot = true;
-            ++value_end;
-            continue;
-        }
-        break;
-    }
-
-    if (value_end == value_start) {
-        return default_value;
-    }
-
-    try {
-        return std::stod(text.substr(value_start, value_end - value_start));
-    } catch (...) {
-        return default_value;
-    }
-}
-
-static std::unordered_map<std::string, std::string> extract_string_map(const std::string & text,
-                                                                       const std::string & key) {
-    std::unordered_map<std::string, std::string> values;
-
-    const std::string marker  = "\"" + key + "\"";
-    const size_t      key_pos = text.find(marker);
-    if (key_pos == std::string::npos) {
-        return values;
-    }
-
-    const size_t brace_start = text.find('{', key_pos + marker.size());
-    const size_t brace_end   = find_closing_brace(text, brace_start);
-    if (brace_start == std::string::npos || brace_end == std::string::npos || brace_end <= brace_start) {
-        return values;
-    }
-
-    std::string content = text.substr(brace_start + 1, brace_end - brace_start - 1);
-    size_t      pos     = 0;
-    while (pos < content.size()) {
-        // Skip whitespace
-        while (pos < content.size() && std::isspace(static_cast<unsigned char>(content[pos]))) {
-            ++pos;
-        }
-        if (pos >= content.size()) {
-            break;
-        }
-
-        // Find key
-        if (content[pos] != '"') {
-            break;
-        }
-        const size_t key_start = pos + 1;
-        const size_t key_end   = content.find('"', key_start);
-        if (key_end == std::string::npos) {
-            break;
-        }
-        std::string map_key = content.substr(key_start, key_end - key_start);
-        pos                 = key_end + 1;
-
-        // Skip :
-        while (pos < content.size() && std::isspace(static_cast<unsigned char>(content[pos]))) {
-            ++pos;
-        }
-        if (pos >= content.size() || content[pos] != ':') {
-            break;
-        }
-        ++pos;
-
-        // Skip whitespace
-        while (pos < content.size() && std::isspace(static_cast<unsigned char>(content[pos]))) {
-            ++pos;
-        }
-
-        // Find value
-        if (content[pos] != '"') {
-            break;
-        }
-        const size_t value_start = pos + 1;
-        const size_t value_end   = content.find('"', value_start);
-        if (value_end == std::string::npos) {
-            break;
-        }
-        std::string map_value = content.substr(value_start, value_end - value_start);
-        pos                   = value_end + 1;
-
-        values[map_key] = map_value;
-
-        // Skip comma or end
-        while (pos < content.size() && std::isspace(static_cast<unsigned char>(content[pos]))) {
-            ++pos;
-        }
-        if (pos < content.size() && content[pos] == ',') {
-            ++pos;
-        }
-    }
-
-    return values;
-}
-
-static std::vector<std::string> extract_string_array(const std::string & text, const std::string & key) {
-    std::vector<std::string> values;
-
-    const std::string marker  = "\"" + key + "\"";
-    const size_t      key_pos = text.find(marker);
-    if (key_pos == std::string::npos) {
-        return values;
-    }
-
-    const size_t bracket_start = text.find('[', key_pos + marker.size());
-    const size_t bracket_end   = text.find(']', bracket_start == std::string::npos ? key_pos : bracket_start + 1);
-    if (bracket_start == std::string::npos || bracket_end == std::string::npos || bracket_end <= bracket_start) {
-        return values;
-    }
-
-    std::string content = text.substr(bracket_start + 1, bracket_end - bracket_start - 1);
-    size_t      pos     = 0;
-    while (pos < content.size()) {
-        const size_t first_quote = content.find('"', pos);
-        if (first_quote == std::string::npos) {
-            break;
-        }
-        const size_t second_quote = content.find('"', first_quote + 1);
-        if (second_quote == std::string::npos) {
-            break;
-        }
-        values.push_back(content.substr(first_quote + 1, second_quote - first_quote - 1));
-        pos = second_quote + 1;
-    }
-
-    return values;
-}
-
-static std::vector<double> extract_number_array(const std::string & text, const std::string & key) {
-    std::vector<double> values;
-
-    const std::string marker  = "\"" + key + "\"";
-    const size_t      key_pos = text.find(marker);
-    if (key_pos == std::string::npos) {
-        return values;
-    }
-
-    const size_t bracket_start = text.find('[', key_pos + marker.size());
-    const size_t bracket_end   = text.find(']', bracket_start == std::string::npos ? key_pos : bracket_start + 1);
-    if (bracket_start == std::string::npos || bracket_end == std::string::npos || bracket_end <= bracket_start) {
-        return values;
-    }
-
-    std::string content = text.substr(bracket_start + 1, bracket_end - bracket_start - 1);
-    size_t      pos     = 0;
-    while (pos < content.size()) {
-        while (pos < content.size() &&
-               (std::isspace(static_cast<unsigned char>(content[pos])) || content[pos] == ',')) {
-            ++pos;
-        }
-        if (pos >= content.size()) {
-            break;
-        }
-        size_t end      = pos;
-        bool   seen_dot = false;
-        if (content[end] == '-' || content[end] == '+') {
-            ++end;
-        }
-        while (end < content.size()) {
-            const unsigned char ch = static_cast<unsigned char>(content[end]);
-            if (std::isdigit(ch)) {
-                ++end;
-                continue;
-            }
-            if (ch == '.' && !seen_dot) {
-                seen_dot = true;
-                ++end;
-                continue;
-            }
-            break;
-        }
-        if (end > pos) {
-            try {
-                values.push_back(std::stod(content.substr(pos, end - pos)));
-            } catch (...) {
-                values.clear();
-                return values;
-            }
-        }
-        pos = end + 1;
-    }
-
-    return values;
-}
-
-static std::string normalize_path(const std::string & base_dir, const std::string & path) {
-    const std::string trimmed = trim_ascii(path);
-    if (trimmed.empty()) {
-        return {};
-    }
-    if (!trimmed.empty() && trimmed.front() == '/') {
-        return trimmed;
-    }
-    return base_dir + "/" + trimmed;
-}
-
 static std::string canonicalize_vision_architecture(std::string arch) {
     const std::string trimmed = trim_ascii(arch);
     if (trimmed == "Qwen3_5ForConditionalGeneration") {
@@ -704,48 +291,18 @@ static std::string canonicalize_vision_architecture(std::string arch) {
     return trimmed;
 }
 
-static bool contains_legacy_spacemit_ep_config(const std::string & text) {
-    return text.find("\"spacemit_ep_intra_thread_num\"") != std::string::npos ||
-           text.find("\"spacemit_ep_inter_thread_num\"") != std::string::npos ||
-           text.find("\"spacemit_ep_intra_thread_affinity\"") != std::string::npos;
-}
-
 static void warn_legacy_spacemit_ep_config_if_needed(const std::string & text, const char * section_name) {
-    if (!contains_legacy_spacemit_ep_config(text)) {
-        return;
-    }
-
-    std::cerr << "[SMT][vision] warning: detected deprecated legacy Spacemit EP config keys";
-    if (section_name != nullptr && section_name[0] != '\0') {
-        std::cerr << " in " << section_name;
-    }
-    std::cerr << "; this style will be removed in a future release. "
-              << "Please migrate to the `ep_config` format.\n";
+    smt_media::warn_legacy_spacemit_ep_config_if_needed(text, "vision", section_name);
 }
 
 static void apply_legacy_spacemit_ep_config(const std::string & text, smt_vision_config & config) {
-    const int32_t intra_thread_num =
-        (int32_t) extract_int64_value(text, "spacemit_ep_intra_thread_num",
-                                      config.ep_config.count("SPACEMIT_EP_INTRA_THREAD_NUM") ?
-                                          std::stoll(config.ep_config.at("SPACEMIT_EP_INTRA_THREAD_NUM")) :
-                                          4);
-    const int32_t inter_thread_num =
-        (int32_t) extract_int64_value(text, "spacemit_ep_inter_thread_num",
-                                      config.ep_config.count("SPACEMIT_EP_INTER_THREAD_NUM") ?
-                                          std::stoll(config.ep_config.at("SPACEMIT_EP_INTER_THREAD_NUM")) :
-                                          1);
-
-    if (config.ep_config.find("SPACEMIT_EP_INTRA_THREAD_NUM") == config.ep_config.end()) {
-        config.ep_config["SPACEMIT_EP_INTRA_THREAD_NUM"] = std::to_string(intra_thread_num);
-    }
-    if (config.ep_config.find("SPACEMIT_EP_INTER_THREAD_NUM") == config.ep_config.end()) {
-        config.ep_config["SPACEMIT_EP_INTER_THREAD_NUM"] = std::to_string(inter_thread_num);
-    }
-
-    const std::string affinity = extract_string_value(text, "spacemit_ep_intra_thread_affinity");
-    if (!affinity.empty() && config.ep_config.find("SPACEMIT_EP_INTRA_THREAD_AFFINITY") == config.ep_config.end()) {
-        config.ep_config["SPACEMIT_EP_INTRA_THREAD_AFFINITY"] = affinity;
-    }
+    int32_t intra_thread_num = config.ep_config.count("SPACEMIT_EP_INTRA_THREAD_NUM") ?
+                                   (int32_t) std::stoll(config.ep_config.at("SPACEMIT_EP_INTRA_THREAD_NUM")) :
+                                   4;
+    int32_t inter_thread_num = config.ep_config.count("SPACEMIT_EP_INTER_THREAD_NUM") ?
+                                   (int32_t) std::stoll(config.ep_config.at("SPACEMIT_EP_INTER_THREAD_NUM")) :
+                                   1;
+    smt_media::apply_legacy_spacemit_ep_config(text, config.ep_config, intra_thread_num, inter_thread_num);
 }
 
 static bool load_smt_vision_config(const std::string & config_dir, smt_vision_config & config) {
