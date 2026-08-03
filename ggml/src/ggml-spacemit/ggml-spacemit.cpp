@@ -23,6 +23,13 @@
 #include "ime_env.h"
 #include "repack.h"
 #include "spine_mem_pool.h"
+#include "rvv_kernels.h"
+
+// ggml-cpu ops.h for generic compute_forward functions
+#include "ggml-cpu-impl.h"
+#include "ops.h"
+#include "binary-ops.h"
+#include "traits.h"
 
 // spine-runtime C++ API (hard dependency)
 #include <spert.hpp>
@@ -380,27 +387,110 @@ static ggml_status ggml_backend_spacemit_graph_compute(ggml_backend_t backend, g
 #if SPACEMIT_HAS_SPERT
     // spert::Stream is created per graph_compute and RAII destructs at scope exit.
     // It acquires CC cores on construction and releases them on destruction.
-    spert::Stream stream(sess->num_cores);
+    uint32_t num_cores = sess->num_cores > 0 ? sess->num_cores : 1;
+    spert::Stream stream(num_cores);
     if (!stream.valid()) {
         GGML_LOG_ERROR("ggml-spacemit: failed to create spert stream\n");
         return GGML_STATUS_FAILED;
     }
 
-    // dispatch each opnode via stream.launch()
-    for (const auto & node : *nodes_ptr) {
-        // TODO: implement per-opcode kernel dispatch via stream.launch(Grid, lambda)
-        // Each opcode maps to a kernel that runs on CC cores in SPMD fashion.
-        // Example for MUL_MAT:
-        //   spert::Future fut = stream.launch(
-        //       spert::Grid{M / M_tile, N / N_tile},
-        //       [src0, src1, dst, M_tile, N_tile](spert::Context * ctx) {
-        //           uint32_t m = ctx->program_id(0) * M_tile;
-        //           uint32_t n = ctx->program_id(1) * N_tile;
-        //           mul_mat_tile(src0, src1, dst, m, n, M_tile, N_tile);
-        //       });
-        //   fut.wait();
-        SPACEMIT_VERBOSE("ggml-spacemit: dispatch %s\n", node.op_name().c_str());
+    // If no compute nodes, skip launch
+    if (nodes_ptr->empty()) {
+        return GGML_STATUS_SUCCESS;
     }
+
+    // Copy node pointers into a flat array for the CC cores to iterate.
+    // The lambda captures raw pointers to ggml_tensor, which are in shared memory.
+    std::vector<ggml_tensor *> node_ptrs;
+    node_ptrs.reserve(nodes_ptr->size());
+    for (const auto & node : *nodes_ptr) {
+        node_ptrs.push_back(node.node);
+    }
+    size_t num_nodes = node_ptrs.size();
+    ggml_tensor ** nodes_arr = node_ptrs.data();
+
+    // Launch the entire graph as a single SPMD kernel.
+    // Each CC core (identified by program_id) processes every op in the graph,
+    // using ith/nth for data parallelism within each op.
+    // A grid barrier (ctx->sync()) between ops ensures all cores finish one op
+    // before moving to the next, preserving graph dependencies.
+    auto fut = stream.launch(
+        spert::Grid{num_cores},
+        [nodes_arr, num_nodes](spert::Context * ctx) {
+            uint32_t ith = ctx->program_id(0);
+            uint32_t nth = ctx->grid_dim(0);
+
+            ggml_compute_params params;
+            params.ith = (int)ith;
+            params.nth = (int)nth;
+            params.wsize = 0;
+            params.wdata = nullptr;
+            params.threadpool = nullptr;
+            params.use_ref = false;
+
+            for (size_t i = 0; i < num_nodes; i++) {
+                ggml_tensor * op = nodes_arr[i];
+
+                // dispatch based on the original ggml op, not the fused opcode
+                switch (op->op) {
+                    case GGML_OP_NONE:
+                    case GGML_OP_RESHAPE:
+                    case GGML_OP_VIEW:
+                    case GGML_OP_PERMUTE:
+                    case GGML_OP_TRANSPOSE:
+                        break;
+
+                    case GGML_OP_MUL_MAT:
+                    case GGML_OP_MUL_MAT_ID: {
+                        // use the spacemit IME kernels via tensor traits
+                        auto * traits = (ggml::cpu::tensor_traits *) op->src[0]->extra;
+                        if (traits && traits->compute_forward(&params, op)) {
+                            break;
+                        }
+                        // fallback to generic
+                        ggml_compute_forward_mul_mat(&params, op);
+                        break;
+                    }
+
+                    case GGML_OP_RMS_NORM:
+                        if (op->src[0]->type == GGML_TYPE_F32) {
+                            spacemit_kernels::rvv::forward_rms_norm_f32(&params, op);
+                        } else {
+                            ggml_compute_forward_rms_norm(&params, op);
+                        }
+                        break;
+
+                    case GGML_OP_ADD:
+                        if (op->src[0]->type == GGML_TYPE_F32) {
+                            spacemit_kernels::rvv::forward_binary<GGML_OP_ADD, float>(&params, op);
+                        } else {
+                            ggml_compute_forward_add(&params, op);
+                        }
+                        break;
+
+                    case GGML_OP_UNARY:
+                        ggml_compute_forward_unary(&params, op);
+                        break;
+
+                    case GGML_OP_ROPE:
+                        ggml_compute_forward_rope(&params, op);
+                        break;
+
+                    case GGML_OP_SOFT_MAX:
+                        ggml_compute_forward_soft_max(&params, op);
+                        break;
+
+                    default:
+                        break;
+                }
+
+                // grid barrier: all cores finish this op before the next one
+                ctx->sync();
+            }
+        }
+    );
+
+    fut.sync();
 
     // Stream destructs here, releasing CC cores (RAII)
     return GGML_STATUS_SUCCESS;
@@ -515,8 +605,9 @@ static bool ggml_backend_spacemit_device_supports_op(ggml_backend_dev_t dev, con
         return false;
     }
 
-    // Phase 1: claim only view ops (no compute) so the scheduler routes
-    // compute ops to CPU. Kernel dispatch is implemented in Phase 2.
+    // Phase 2: claim compute ops for SPMD dispatch via spert::Stream::launch.
+    // Each graph_compute creates a Stream, launches the entire graph as one
+    // SPMD kernel, and syncs. CC cores use ith/nth for intra-op parallelism.
     bool supp = false;
     switch (op->op) {
         case GGML_OP_NONE:
