@@ -515,6 +515,8 @@ static bool ggml_backend_spacemit_device_supports_op(ggml_backend_dev_t dev, con
         return false;
     }
 
+    // Phase 1: claim only view ops (no compute) so the scheduler routes
+    // compute ops to CPU. Kernel dispatch is implemented in Phase 2.
     bool supp = false;
     switch (op->op) {
         case GGML_OP_NONE:
@@ -522,41 +524,6 @@ static bool ggml_backend_spacemit_device_supports_op(ggml_backend_dev_t dev, con
         case GGML_OP_VIEW:
         case GGML_OP_PERMUTE:
         case GGML_OP_TRANSPOSE:
-            supp = true;
-            break;
-
-        case GGML_OP_MUL_MAT:
-            supp = ggml_is_quantized(op->src[0]->type) || op->src[0]->type == GGML_TYPE_F16 || op->src[0]->type == GGML_TYPE_F32;
-            break;
-
-        case GGML_OP_MUL_MAT_ID:
-            supp = ggml_is_quantized(op->src[0]->type);
-            break;
-
-        case GGML_OP_RMS_NORM:
-            supp = true;
-            break;
-
-        case GGML_OP_ADD:
-            supp = true;
-            break;
-
-        case GGML_OP_UNARY:
-            switch (ggml_get_unary_op(op)) {
-                case GGML_UNARY_OP_SILU:
-                case GGML_UNARY_OP_GELU:
-                    supp = true;
-                    break;
-                default:
-                    break;
-            }
-            break;
-
-        case GGML_OP_ROPE:
-            supp = true;
-            break;
-
-        case GGML_OP_SOFT_MAX:
             supp = true;
             break;
 
