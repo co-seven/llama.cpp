@@ -24,14 +24,9 @@
 #include "repack.h"
 #include "spine_mem_pool.h"
 
-// spert::Stream is available only when spine-runtime is installed.
-// Guard all usage with SPACEMIT_HAS_SPERT so the backend compiles without it.
-#if __has_include(<spert.hpp>)
-#    include <spert.hpp>
-#    define SPACEMIT_HAS_SPERT 1
-#else
-#    define SPACEMIT_HAS_SPERT 0
-#endif
+// spine-runtime C++ API (hard dependency)
+#include <spert.hpp>
+#define SPACEMIT_HAS_SPERT 1
 
 using namespace ggml::cpu::riscv64_spacemit;
 
@@ -410,7 +405,6 @@ static ggml_status ggml_backend_spacemit_graph_compute(ggml_backend_t backend, g
     // Stream destructs here, releasing CC cores (RAII)
     return GGML_STATUS_SUCCESS;
 #else
-    GGML_LOG_ERROR("ggml-spacemit: spine-runtime (spert.hpp) not available, cannot compute graph\n");
     GGML_UNUSED(nodes_ptr);
     return GGML_STATUS_FAILED;
 #endif
