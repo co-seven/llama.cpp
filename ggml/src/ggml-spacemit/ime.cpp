@@ -1661,12 +1661,20 @@ static size_t ggml_backend_cpu_riscv64_spacemit_nbytes(ggml_backend_buffer_type_
 
 namespace ggml::cpu::riscv64_spacemit {
 
+// Check if a buffer type is a spacemit buffer type (either CPU extra or SPACEMIT device).
+static bool ggml_buft_is_spacemit(ggml_backend_buffer_type_t buft) {
+    if (!buft || !buft->iface.get_name) return false;
+    const char * name = buft->iface.get_name(buft);
+    if (!name) return false;
+    return strcmp(name, "CPU_RISCV64_SPACEMIT") == 0 || strcmp(name, "SPACEMIT") == 0;
+}
+
 class extra_buffer_type : ggml::cpu::extra_buffer_type {
     bool supports_op(ggml_backend_dev_t, const ggml_tensor * op) override {
         switch (op->op) {
             case GGML_OP_MUL_MAT:
                 if (op->src[0]->buffer && (ggml_n_dims(op->src[0]) == 2) &&
-                    op->src[0]->buffer->buft == ggml_backend_cpu_riscv64_spacemit_buffer_type() &&
+                    ggml_buft_is_spacemit(op->src[0]->buffer->buft) &&
                     ggml_riscv64_spacemit_get_optimal_repack_type(op->src[0])) {
                     if (op->src[1]->buffer && !ggml_backend_buft_is_host(op->src[1]->buffer->buft)) {
                         return false;
@@ -1678,7 +1686,7 @@ class extra_buffer_type : ggml::cpu::extra_buffer_type {
                 break;
             case GGML_OP_MUL_MAT_ID:
                 if (op->src[0]->buffer && (ggml_n_dims(op->src[0]) == 3) &&
-                    op->src[0]->buffer->buft == ggml_backend_cpu_riscv64_spacemit_buffer_type() &&
+                    ggml_buft_is_spacemit(op->src[0]->buffer->buft) &&
                     ggml_riscv64_spacemit_get_optimal_repack_type(op->src[0])) {
                     if (op->src[1]->buffer && !ggml_backend_buft_is_host(op->src[1]->buffer->buft)) {
                         return false;
@@ -1699,7 +1707,7 @@ class extra_buffer_type : ggml::cpu::extra_buffer_type {
         switch (op->op) {
             case GGML_OP_MUL_MAT:
             case GGML_OP_MUL_MAT_ID:
-                if (op->src[0]->buffer && op->src[0]->buffer->buft == ggml_backend_cpu_riscv64_spacemit_buffer_type()) {
+                if (op->src[0]->buffer && ggml_buft_is_spacemit(op->src[0]->buffer->buft)) {
                     return (ggml::cpu::tensor_traits *) op->src[0]->extra;
                 }
                 break;
@@ -1769,6 +1777,11 @@ void ggml_spacemit_get_tcm_buffer(void ** ptr, size_t * size) {
 __attribute__((visibility("default")))
 void ggml_spacemit_set_spert_ctx(void * ctx) {
     ggml::cpu::riscv64_spacemit::tls_context.spert_ctx = ctx;
+}
+
+__attribute__((visibility("default")))
+void * ggml_spacemit_create_extra_buffer_type() {
+    return new ggml::cpu::riscv64_spacemit::extra_buffer_type();
 }
 
 __attribute__((visibility("default")))

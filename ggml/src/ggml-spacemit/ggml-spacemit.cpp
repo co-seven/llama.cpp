@@ -363,13 +363,22 @@ static void ggml_backend_spacemit_buffer_set_tensor(ggml_backend_buffer_t buffer
     GGML_UNUSED(buffer);
 }
 
+static void ggml_backend_spacemit_buffer_get_tensor(ggml_backend_buffer_t buffer,
+                                                     const ggml_tensor *   tensor,
+                                                     void *                data,
+                                                     size_t                offset,
+                                                     size_t                size) {
+    memcpy(data, (const char *) tensor->data + offset, size);
+    GGML_UNUSED(buffer);
+}
+
 static const ggml_backend_buffer_i ggml_backend_spacemit_buffer_i = {
     /* .free_buffer     = */ ggml_backend_spacemit_buffer_free_buffer,
     /* .get_base        = */ ggml_backend_spacemit_buffer_get_base,
     /* .init_tensor     = */ ggml_backend_spacemit_buffer_init_tensor,
     /* .memset_tensor   = */ ggml_backend_spacemit_buffer_memset_tensor,
     /* .set_tensor      = */ ggml_backend_spacemit_buffer_set_tensor,
-    /* .get_tensor      = */ nullptr,
+    /* .get_tensor      = */ ggml_backend_spacemit_buffer_get_tensor,
     /* .set_tensor_2d   = */ nullptr,
     /* .get_tensor_2d   = */ nullptr,
     /* .cpy_tensor      = */ nullptr,
@@ -405,6 +414,11 @@ static size_t ggml_backend_spacemit_buffer_type_get_max_size(ggml_backend_buffer
 }
 
 static size_t ggml_backend_spacemit_buffer_type_get_alloc_size(ggml_backend_buffer_type_t buft, const ggml_tensor * tensor) {
+    // Delegate to the CPU spacemit buffer type which computes repacked size
+    auto cpu_buft = ggml_backend_cpu_riscv64_spacemit_buffer_type();
+    if (cpu_buft && cpu_buft->iface.get_alloc_size) {
+        return cpu_buft->iface.get_alloc_size(cpu_buft, tensor);
+    }
     return ggml_nbytes(tensor);
     GGML_UNUSED(buft);
 }
@@ -424,17 +438,22 @@ static ggml_backend_buffer_type_i ggml_backend_spacemit_buffer_type_interface = 
 };
 
 static ggml_backend_buffer_type_t ggml_backend_spacemit_buffer_type(ggml_backend_dev_t dev) {
-    // Use the same buffer type as ggml-cpu/spacemit so that
-    // extra_buffer_type::get_tensor_traits() can match src[0]->buffer->buft.
-    auto buft = ggml_backend_cpu_riscv64_spacemit_buffer_type();
-    if (buft->device == nullptr) {
-        buft->device = dev;
+    // The extra_buffer_type context is provided by ime.cpp via this extern.
+    // It matches both "CPU_RISCV64_SPACEMIT" and "SPACEMIT" buft names.
+    extern void * ggml_spacemit_create_extra_buffer_type();
+    static struct ggml_backend_buffer_type buft_s = {
+        /* .iface   = */ ggml_backend_spacemit_buffer_type_interface,
+        /* .device  = */ nullptr,
+        /* .context = */ ggml_spacemit_create_extra_buffer_type(),
+    };
+    if (buft_s.device == nullptr) {
+        buft_s.device = dev;
     }
-    return buft;
+    return &buft_s;
 }
 
 static bool ggml_backend_buffer_is_spacemit(const struct ggml_backend_buffer * b) {
-    return b && b->buft == ggml_backend_cpu_riscv64_spacemit_buffer_type();
+    return b && b->buft->iface.get_name == ggml_backend_spacemit_buffer_type_get_name;
 }
 
 //** backend interface
@@ -763,7 +782,7 @@ static bool ggml_backend_spacemit_device_supports_op(ggml_backend_dev_t dev, con
 }
 
 static bool ggml_backend_spacemit_device_supports_buft(ggml_backend_dev_t dev, ggml_backend_buffer_type_t buft) {
-    return buft == ggml_backend_cpu_riscv64_spacemit_buffer_type();
+    return buft->iface.get_name == ggml_backend_spacemit_buffer_type_get_name;
     GGML_UNUSED(dev);
 }
 
