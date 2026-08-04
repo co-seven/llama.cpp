@@ -25,10 +25,7 @@
 #include "spine_mem_pool.h"
 #include "rvv_kernels.h"
 
-// ggml-cpu ops.h for generic compute_forward functions
 #include "ggml-cpu-impl.h"
-#include "ops.h"
-#include "binary-ops.h"
 #include "traits.h"
 #include "ggml-cpu.h"
 
@@ -36,6 +33,11 @@
 const ggml::cpu::tensor_traits * ggml_riscv64_spacemit_get_optimal_repack_type(const ggml_tensor * cur);
 int ggml_riscv64_spacemit_repack_tensor(ggml_tensor * tensor, const void * data, size_t size);
 extern "C" ggml_backend_buffer_type_t ggml_backend_cpu_riscv64_spacemit_buffer_type(void);
+
+void * ggml_spacemit_create_extra_buffer_type();
+
+// Op dispatch: use SPACEMIT's own extra_buffer_type. No ggml-cpu fallback.
+bool ggml_spacemit_compute_forward(struct ggml_compute_params * params, struct ggml_tensor * op);
 
 // TCM buffer accessors (defined in ime.cpp, operate on thread-local tls_context)
 void ggml_spacemit_set_tcm_buffer(void * ptr, size_t size);
@@ -438,9 +440,6 @@ static ggml_backend_buffer_type_i ggml_backend_spacemit_buffer_type_interface = 
 };
 
 static ggml_backend_buffer_type_t ggml_backend_spacemit_buffer_type(ggml_backend_dev_t dev) {
-    // The extra_buffer_type context is provided by ime.cpp via this extern.
-    // It matches both "CPU_RISCV64_SPACEMIT" and "SPACEMIT" buft names.
-    extern void * ggml_spacemit_create_extra_buffer_type();
     static struct ggml_backend_buffer_type buft_s = {
         /* .iface   = */ ggml_backend_spacemit_buffer_type_interface,
         /* .device  = */ nullptr,
@@ -534,60 +533,7 @@ static ggml_status ggml_backend_spacemit_graph_compute(ggml_backend_t backend, g
                     continue;
                 }
 
-                if (!ggml_cpu_extra_compute_forward(&params, node)) {
-                    switch (node->op) {
-                        case GGML_OP_RMS_NORM:
-                            ggml_compute_forward_rms_norm(&params, node);
-                            break;
-                        case GGML_OP_NORM:
-                            ggml_compute_forward_norm(&params, node);
-                            break;
-                        case GGML_OP_ADD:
-                            ggml_compute_forward_add(&params, node);
-                            break;
-                        case GGML_OP_SUB:
-                            ggml_compute_forward_sub(&params, node);
-                            break;
-                        case GGML_OP_MUL:
-                            ggml_compute_forward_mul(&params, node);
-                            break;
-                        case GGML_OP_DIV:
-                            ggml_compute_forward_div(&params, node);
-                            break;
-                        case GGML_OP_ROPE:
-                            ggml_compute_forward_rope(&params, node);
-                            break;
-                        case GGML_OP_SOFT_MAX:
-                            ggml_compute_forward_soft_max(&params, node);
-                            break;
-                        case GGML_OP_UNARY:
-                            ggml_compute_forward_unary(&params, node);
-                            break;
-                        case GGML_OP_CONCAT:
-                            ggml_compute_forward_concat(&params, node);
-                            break;
-                        case GGML_OP_GET_ROWS:
-                            ggml_compute_forward_get_rows(&params, node);
-                            break;
-                        case GGML_OP_CPY:
-                            ggml_compute_forward_cpy(&params, node);
-                            break;
-                        case GGML_OP_CONT:
-                            ggml_compute_forward_cont(&params, node);
-                            break;
-                        case GGML_OP_REPEAT:
-                            ggml_compute_forward_repeat(&params, node);
-                            break;
-                        case GGML_OP_SUM_ROWS:
-                            ggml_compute_forward_sum_rows(&params, node);
-                            break;
-                        case GGML_OP_FLASH_ATTN_EXT:
-                            ggml_compute_forward_flash_attn_ext(&params, node);
-                            break;
-                        default:
-                            break;
-                    }
-                }
+                ggml_spacemit_compute_forward(&params, node);
 
                 if (i + 1 < n_nodes) {
                     ctx->sync();

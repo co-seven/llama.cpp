@@ -1669,7 +1669,8 @@ static bool ggml_buft_is_spacemit(ggml_backend_buffer_type_t buft) {
     return strcmp(name, "CPU_RISCV64_SPACEMIT") == 0 || strcmp(name, "SPACEMIT") == 0;
 }
 
-class extra_buffer_type : ggml::cpu::extra_buffer_type {
+class extra_buffer_type : public ggml::cpu::extra_buffer_type {
+  public:
     bool supports_op(ggml_backend_dev_t, const ggml_tensor * op) override {
         switch (op->op) {
             case GGML_OP_MUL_MAT:
@@ -1782,6 +1783,18 @@ void ggml_spacemit_set_spert_ctx(void * ctx) {
 __attribute__((visibility("default")))
 void * ggml_spacemit_create_extra_buffer_type() {
     return new ggml::cpu::riscv64_spacemit::extra_buffer_type();
+}
+
+__attribute__((visibility("default")))
+bool ggml_spacemit_compute_forward(struct ggml_compute_params * params, struct ggml_tensor * op) {
+    // Get the SPACEMIT extra_buffer_type singleton from the SPACEMIT buffer type.
+    // We use a static local instance to avoid depending on buft lookup at runtime.
+    static ggml::cpu::riscv64_spacemit::extra_buffer_type ebt;
+    auto traits = ebt.get_tensor_traits(op);
+    if (traits && traits->compute_forward(params, op)) {
+        return true;
+    }
+    return false;
 }
 
 __attribute__((visibility("default")))
