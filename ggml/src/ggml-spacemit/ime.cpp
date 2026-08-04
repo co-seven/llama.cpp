@@ -3,20 +3,17 @@
 
 #include "ime.h"
 
-#include "binary-ops.h"
 #include "common.h"
 #include "ggml-backend-impl.h"
 #include "ggml-common.h"
 #include "ggml-cpu.h"
-#include "ime_env.h"
 #include "ime_kernels.h"
-#include "ops.h"
 #include "repack.h"
 #include "rvv_kernels.h"
+#include "spacemit-context.h"
+#include "spacemit-env.h"
 #include "spine_mem_pool.h"
-#include "traits.h"
 #include "vec.h"
-#include <spert.hpp>
 
 #include <fcntl.h>
 #include <sys/mman.h>
@@ -66,22 +63,7 @@
 
 // clang-format on
 
-extern "C" {
-extern void ggml_threadpool_chunk_set(struct ggml_threadpool * tp, int value);
-extern int  ggml_threadpool_chunk_add(struct ggml_threadpool * tp, int value);
-}
-
 namespace ggml::cpu::riscv64_spacemit {
-
-struct TLSContext {
-    int       cpu_id{ -1 };
-    cpu_set_t cpuset;
-    void *    tcm_buffer{ nullptr };
-    size_t    tcm_buffer_size{ 0 };
-    void *    spert_ctx{ nullptr };  // spert::Context* for ctx->sync() calls
-};
-
-thread_local TLSContext tls_context;
 
 template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS> constexpr size_t get_repacked_block_type_size() {
     if constexpr (std::is_same_v<BLOC_TYPE, block_q6_K> || std::is_same_v<BLOC_TYPE, block_q8_0>) {
@@ -121,13 +103,9 @@ template <typename BLOC_TYPE> constexpr bool block_type_has_zp() {
     }
 }
 
-class tensor_traits_base : public ggml::cpu::tensor_traits {
-  public:
-    virtual int repack(ggml_tensor * t, const void * data, size_t data_size) = 0;
-};
-
-template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS> class tensor_traits : public tensor_traits_base {
-    bool work_size(int /* n_threads */, const ggml_tensor * op, size_t & size) override {
+template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS>
+class tensor_traits : public ggml::spacemit::tensor_traits_base {
+    bool work_size(int /* n_threads */, const ggml_tensor * op, size_t & size) const override {
         switch (op->op) {
             case GGML_OP_MUL_MAT:
                 {
@@ -186,7 +164,7 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS> class tensor_
         return false;
     }
 
-    bool compute_forward(ggml_compute_params * params, ggml_tensor * op) override {
+    bool compute_forward(ggml::spacemit::context & ctx, ggml_tensor * op) const override {
         switch (op->op) {
             case GGML_OP_MUL_MAT:
                 switch (op->src[0]->type) {
@@ -200,8 +178,7 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS> class tensor_
                     case GGML_TYPE_Q5_1:
                     case GGML_TYPE_Q5_K:
                         //case GGML_TYPE_MXFP4:
-                        forward_mul_mat(params, op);
-                        return true;
+                        return forward_mul_mat(ctx, op);
                     default:
                         // GGML_ABORT("fatal error: unsupported type for src0 in MUL_MAT");
                         return false;
@@ -219,8 +196,7 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS> class tensor_
                     case GGML_TYPE_Q5_1:
                     case GGML_TYPE_Q5_K:
                         //case GGML_TYPE_MXFP4:
-                        forward_mul_mat_id(params, op);
-                        return true;
+                        return forward_mul_mat_id(ctx, op);
                     default:
                         // GGML_ABORT("fatal error: unsupported type for src0 in MUL_MAT_ID");
                         return false;
@@ -233,7 +209,7 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS> class tensor_
         return false;
     }
 
-    void forward_mul_mat(ggml_compute_params * params, ggml_tensor * op) {
+    bool forward_mul_mat(ggml::spacemit::context & ctx, ggml_tensor * op) const {
         constexpr size_t a_blk_len = INTER_SIZE;
         constexpr size_t b_blk_len = INTER_SIZE;
 
@@ -243,8 +219,8 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS> class tensor_
 
         GGML_TENSOR_BINARY_OP_LOCALS
 
-        int ith = params->ith;
-        int nth = params->nth;
+        int ith = ctx.ith;
+        int nth = ctx.nth;
 
         [[maybe_unused]] const enum ggml_type type = src0->type;
 
@@ -334,14 +310,14 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS> class tensor_
         const int64_t row_stride_a        = a_k_blks * block_stride_a;
         const int64_t gemm_workspace_size = GGML_PAD(gemm_m * row_stride_a, alignof(int64_t));
 
-        if (ith == 0 && params->wsize < gemm_workspace_size) {
+        if (ith == 0 && ctx.workspace_size < gemm_workspace_size) {
             GGML_ABORT("wsize less than gemm_workspace_size");
         }
 
-        uintptr_t ws_ptr = reinterpret_cast<uintptr_t>(params->wdata);
+        uintptr_t ws_ptr = reinterpret_cast<uintptr_t>(ctx.workspace);
 
-        void *        tcm_buffer      = ggml::cpu::riscv64_spacemit::tls_context.tcm_buffer;
-        const int64_t tcm_buffer_size = ggml::cpu::riscv64_spacemit::tls_context.tcm_buffer_size;
+        void *        tcm_buffer      = ctx.shared.data;
+        const int64_t tcm_buffer_size = ctx.shared.size;
 
         auto * quant_a_buffer = reinterpret_cast<uint8_t *>(ws_ptr);
 
@@ -390,11 +366,7 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS> class tensor_
             }
         }
 
-        if (params->threadpool) {
-            ggml_barrier(params->threadpool);
-        } else if (ggml::cpu::riscv64_spacemit::tls_context.spert_ctx) {
-            ((spert::Context *) ggml::cpu::riscv64_spacemit::tls_context.spert_ctx)->sync();
-        }
+        ctx.sync();
 
         const int64_t gemm_m_stride     = gemm_n / gemm_m > 64 ? gemm_m : 16;
         const int64_t gemm_m_blocked    = spacemit_kernels::div_round_up(gemm_m, gemm_m_stride);
@@ -463,7 +435,7 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS> class tensor_
                         uint8_t *     b_row_zp = block_type_has_zp<BLOC_TYPE>() ? b_row : nullptr;
                         gemm_kernel(b_blk_len, a_row, b_row, b_row_zp, output + ni, 1, nb_real, b_k_blks, gemm_n);
                     }
-                    return;
+                    return true;
                 }
             }
 
@@ -579,9 +551,10 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS> class tensor_
                 }
             }
         }
+        return true;
     }
 
-    void forward_mul_mat_id(ggml_compute_params * params, ggml_tensor * op) {
+    bool forward_mul_mat_id(ggml::spacemit::context & ctx, ggml_tensor * op) const {
         constexpr size_t a_blk_len = INTER_SIZE;
         constexpr size_t b_blk_len = INTER_SIZE;
 
@@ -592,8 +565,8 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS> class tensor_
 
         GGML_TENSOR_BINARY_OP_LOCALS
 
-        int ith = params->ith;
-        int nth = params->nth;
+        int ith = ctx.ith;
+        int nth = ctx.nth;
 
         // row groups
         const int n_ids = ids->ne[0];  // n_expert_used
@@ -678,7 +651,7 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS> class tensor_
         const size_t nbw3                = nbw2 * ne12;
         const size_t gemm_workspace_size = GGML_PAD(nbw3, alignof(int64_t));
 
-        const uintptr_t ws_ptr         = reinterpret_cast<uintptr_t>(params->wdata);
+        const uintptr_t ws_ptr         = reinterpret_cast<uintptr_t>(ctx.workspace);
         auto *          quant_a_buffer = reinterpret_cast<uint8_t *>(ws_ptr);
 
         if (ne11 == 1) {
@@ -743,11 +716,7 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS> class tensor_
         GGML_ASSERT(barrier_idx < spine_init_barrier_count);
         spine_barrier_t * cur_barrier = &global_spine_env_info.init_barrier[barrier_idx];
 
-        if (params->threadpool) {
-            ggml_barrier(params->threadpool);
-        } else if (ggml::cpu::riscv64_spacemit::tls_context.spert_ctx) {
-            ((spert::Context *) ggml::cpu::riscv64_spacemit::tls_context.spert_ctx)->sync();
-        }
+        ctx.sync();
 
         const size_t row_stride_b      = b_k_blks * get_repacked_block_type_size<BLOC_TYPE, INTER_SIZE, NB_COLS>();
         const size_t expert_b_stride   = ne01 * row_stride_b;
@@ -756,8 +725,8 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS> class tensor_
         std::array<const uint8_t *, 2> src_workspaces;
         std::array<float *, 2>         dst_workspaces;
 
-        auto *     tcm_buffer      = ggml::cpu::riscv64_spacemit::tls_context.tcm_buffer;
-        const auto tcm_buffer_size = ggml::cpu::riscv64_spacemit::tls_context.tcm_buffer_size;
+        auto *     tcm_buffer      = ctx.shared.data;
+        const auto tcm_buffer_size = ctx.shared.size;
 
         const auto valid_ep_count_t  = valid_ep_count[0];
         const auto valid_act_count_t = valid_act_count[0];
@@ -975,17 +944,18 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS> class tensor_
             }
         }
 #undef MMID_MATRIX_ROW
+        return true;
     }
 
-    int repack(ggml_tensor * t, const void * data, size_t data_size) override {
+    int repack(ggml_tensor * t, const void * data, size_t data_size) const override {
         GGML_LOG_DEBUG("%s: repack tensor %s with %s_%dx%d\n", __func__, t->name, ggml_type_name(t->type),
                        (int) NB_COLS, (int) INTER_SIZE);
         return ggml::cpu::riscv64_spacemit::repack<BLOC_TYPE, INTER_SIZE, NB_COLS>(t, data, data_size);
     }
 };
 
-class tensor_traits_common : public tensor_traits_base {
-    bool work_size(int n_threads, const ggml_tensor * op, size_t & size) override {
+class tensor_traits_common : public ggml::spacemit::tensor_traits_base {
+    bool work_size(int n_threads, const ggml_tensor * op, size_t & size) const override {
         switch (op->op) {
             case GGML_OP_FLASH_ATTN_EXT:
                 {
@@ -998,7 +968,8 @@ class tensor_traits_common : public tensor_traits_base {
                     // Per-thread: Q_q + KQ + mask + VKQ32 + V32 + K_f32 + padding
                     size_t prefill = sizeof(float) *
                                      (GGML_FA_TILE_Q * DK + 2 * GGML_FA_TILE_Q * GGML_FA_TILE_KV + GGML_FA_TILE_Q * DV +
-                                      GGML_FA_TILE_KV * DV + GGML_FA_TILE_KV * DK) *
+                                      GGML_FA_TILE_KV * DV + GGML_FA_TILE_KV * DK +
+                                      ggml::spacemit::cache_line_size_f32) *
                                      n_tasks;
 
                     // Decode path: n_kv_chunks = n_tasks (one chunk per thread)
@@ -1015,12 +986,12 @@ class tensor_traits_common : public tensor_traits_base {
         return false;
     }
 
-    bool compute_forward(ggml_compute_params * params, ggml_tensor * op) override {
+    bool compute_forward(ggml::spacemit::context & ctx, ggml_tensor * op) const override {
         switch (op->op) {
             case GGML_OP_NORM:
                 switch (op->src[0]->type) {
                     case GGML_TYPE_F32:
-                        spacemit_kernels::rvv::forward_norm_f32(params, op);
+                        spacemit_kernels::rvv::forward_norm_f32(ctx, op);
                         return true;
                     default:
                         GGML_ABORT("fatal error");
@@ -1028,7 +999,7 @@ class tensor_traits_common : public tensor_traits_base {
             case GGML_OP_RMS_NORM:
                 switch (op->src[0]->type) {
                     case GGML_TYPE_F32:
-                        spacemit_kernels::rvv::forward_rms_norm_f32(params, op);
+                        spacemit_kernels::rvv::forward_rms_norm_f32(ctx, op);
                         return true;
                     default:
                         GGML_ABORT("fatal error");
@@ -1036,92 +1007,87 @@ class tensor_traits_common : public tensor_traits_base {
             case GGML_OP_ADD:
                 switch (op->src[0]->type) {
                     case GGML_TYPE_F32:
-                        spacemit_kernels::rvv::forward_binary<GGML_OP_ADD, float>(params, op);
+                        spacemit_kernels::rvv::forward_binary<GGML_OP_ADD, float>(ctx, op);
                         return true;
                     case GGML_TYPE_F16:
-                        spacemit_kernels::rvv::forward_binary<GGML_OP_ADD, _Float16>(params, op);
+                        spacemit_kernels::rvv::forward_binary<GGML_OP_ADD, _Float16>(ctx, op);
                         return true;
                     default:
-                        ggml_compute_forward_add(params, op);
-                        return true;
+                        return false;
                 }
             case GGML_OP_SUB:
                 switch (op->src[0]->type) {
                     case GGML_TYPE_F32:
-                        spacemit_kernels::rvv::forward_binary<GGML_OP_SUB, float>(params, op);
+                        spacemit_kernels::rvv::forward_binary<GGML_OP_SUB, float>(ctx, op);
                         return true;
                     case GGML_TYPE_F16:
-                        spacemit_kernels::rvv::forward_binary<GGML_OP_SUB, _Float16>(params, op);
+                        spacemit_kernels::rvv::forward_binary<GGML_OP_SUB, _Float16>(ctx, op);
                         return true;
                     default:
-                        ggml_compute_forward_sub(params, op);
-                        return true;
+                        return false;
                 }
             case GGML_OP_MUL:
                 switch (op->src[0]->type) {
                     case GGML_TYPE_F32:
-                        spacemit_kernels::rvv::forward_binary<GGML_OP_MUL, float>(params, op);
+                        spacemit_kernels::rvv::forward_binary<GGML_OP_MUL, float>(ctx, op);
                         return true;
                     case GGML_TYPE_F16:
-                        spacemit_kernels::rvv::forward_binary<GGML_OP_MUL, _Float16>(params, op);
+                        spacemit_kernels::rvv::forward_binary<GGML_OP_MUL, _Float16>(ctx, op);
                         return true;
                     default:
-                        ggml_compute_forward_mul(params, op);
-                        return true;
+                        return false;
                 }
             case GGML_OP_DIV:
                 switch (op->src[0]->type) {
                     case GGML_TYPE_F32:
-                        spacemit_kernels::rvv::forward_binary<GGML_OP_DIV, float>(params, op);
+                        spacemit_kernels::rvv::forward_binary<GGML_OP_DIV, float>(ctx, op);
                         return true;
                     case GGML_TYPE_F16:
-                        spacemit_kernels::rvv::forward_binary<GGML_OP_DIV, _Float16>(params, op);
+                        spacemit_kernels::rvv::forward_binary<GGML_OP_DIV, _Float16>(ctx, op);
                         return true;
                     default:
-                        ggml_compute_forward_div(params, op);
-                        return true;
+                        return false;
                 }
             case GGML_OP_UNARY:
                 switch (ggml_get_unary_op(op)) {
                     case GGML_UNARY_OP_TANH:
-                        spacemit_kernels::rvv::forward_unary_tanh_f32(params, op);
+                        spacemit_kernels::rvv::forward_unary_tanh_f32(ctx, op);
                         return true;
                     case GGML_UNARY_OP_GELU:
-                        spacemit_kernels::rvv::forward_unary_gelu_f32(params, op);
+                        spacemit_kernels::rvv::forward_unary_gelu_f32(ctx, op);
                         return true;
                     default:
                         return false;
                 }
             case GGML_OP_GLU:
                 if (ggml_get_glu_op(op) == GGML_GLU_OP_GEGLU && op->src[0]->type == GGML_TYPE_F32) {
-                    spacemit_kernels::rvv::forward_glu_geglu_f32(params, op);
+                    spacemit_kernels::rvv::forward_glu_geglu_f32(ctx, op);
                     return true;
                 }
                 return false;
             case GGML_OP_FLASH_ATTN_EXT:
-                forward_flash_attn_ext_f16(params, op);
-                return true;
+                return forward_flash_attn_ext_f16(ctx, op);
             case GGML_OP_CONT:
                 {
                     const ggml_tensor * src0 = op->src[0];
                     if (op->type == src0->type && op->nb[0] != src0->nb[0] && op->nb[0] == src0->nb[1] &&
                         op->ne[3] * op->ne[2] * op->nb[2] == src0->ne[3] * src0->ne[2] * src0->nb[2]) {
-                        spacemit_kernels::rvv::forward_cont_with_permute(params, op);
+                        spacemit_kernels::rvv::forward_cont_with_permute(ctx, op);
+                        return true;
                     } else {
-                        ggml_compute_forward_cont(params, op);
+                        return false;
                     }
-                    return true;
                 }
             case GGML_OP_CPY:
                 {
                     const ggml_tensor * src0 = op->src[0];
                     if (op->type == src0->type && op->nb[0] == src0->nb[1] && src0->nb[0] != src0->nb[1] &&
                         ggml_nelements(src0) == ggml_nelements(op)) {
-                        spacemit_kernels::rvv::forward_cpy_with_permute(params, op);
+                        spacemit_kernels::rvv::forward_cpy_with_permute(ctx, op);
+                        return true;
                     } else {
-                        ggml_compute_forward_cpy(params, op);
+                        return false;
                     }
-                    return true;
                 }
             case GGML_OP_REPEAT:
                 {
@@ -1131,10 +1097,10 @@ class tensor_traits_common : public tensor_traits_base {
                     if (rows_equal && broadcast_or_equal) {
                         switch (op->src[0]->type) {
                             case GGML_TYPE_F32:
-                                spacemit_kernels::rvv::forward_repeat_nrows<int32_t>(params, op);
+                                spacemit_kernels::rvv::forward_repeat_nrows<int32_t>(ctx, op);
                                 return true;
                             case GGML_TYPE_F16:
-                                spacemit_kernels::rvv::forward_repeat_nrows<int16_t>(params, op);
+                                spacemit_kernels::rvv::forward_repeat_nrows<int16_t>(ctx, op);
                                 return true;
                             default:
                                 break;
@@ -1144,25 +1110,25 @@ class tensor_traits_common : public tensor_traits_base {
                     if (op->src[0]->ne[1] == 1 && op->src[0]->ne[0] == op->ne[0]) {
                         switch (op->src[0]->type) {
                             case GGML_TYPE_F32:
-                                spacemit_kernels::rvv::forward_repeat_dim1<int32_t>(params, op);
+                                spacemit_kernels::rvv::forward_repeat_dim1<int32_t>(ctx, op);
                                 return true;
                             case GGML_TYPE_F16:
-                                spacemit_kernels::rvv::forward_repeat_dim1<int16_t>(params, op);
+                                spacemit_kernels::rvv::forward_repeat_dim1<int16_t>(ctx, op);
                                 return true;
                             default:
                                 break;
                         }
                     }
 
-                    ggml_compute_forward_repeat(params, op);
+                    return false;
                 }
                 return true;
             case GGML_OP_SUM_ROWS:
                 {
                     if (op->src[0]->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32) {
-                        spacemit_kernels::rvv::forward_sum_rows<float>(params, op);
+                        spacemit_kernels::rvv::forward_sum_rows<float>(ctx, op);
                     } else {
-                        ggml_compute_forward_sum_rows(params, op);
+                        return false;
                     }
                 }
                 return true;
@@ -1171,17 +1137,17 @@ class tensor_traits_common : public tensor_traits_base {
                     if (op->src[0]->type == op->type) {
                         switch (op->src[0]->type) {
                             case GGML_TYPE_F32:
-                                spacemit_kernels::rvv::forward_get_rows<int32_t>(params, op);
+                                spacemit_kernels::rvv::forward_get_rows<int32_t>(ctx, op);
                                 return true;
                             case GGML_TYPE_F16:
-                                spacemit_kernels::rvv::forward_get_rows<int16_t>(params, op);
+                                spacemit_kernels::rvv::forward_get_rows<int16_t>(ctx, op);
                                 return true;
                             default:
                                 break;
                         }
                     }
 
-                    ggml_compute_forward_get_rows(params, op);
+                    return false;
                 }
                 return true;
             case GGML_OP_CONCAT:
@@ -1190,17 +1156,17 @@ class tensor_traits_common : public tensor_traits_base {
                     if (dim == 0 && op->type == op->src[0]->type) {
                         switch (op->src[0]->type) {
                             case GGML_TYPE_F32:
-                                spacemit_kernels::rvv::forward_concat<int32_t>(params, op);
+                                spacemit_kernels::rvv::forward_concat<int32_t>(ctx, op);
                                 return true;
                             case GGML_TYPE_F16:
-                                spacemit_kernels::rvv::forward_concat<int16_t>(params, op);
+                                spacemit_kernels::rvv::forward_concat<int16_t>(ctx, op);
                                 return true;
                             default:
                                 break;
                         }
                     }
 
-                    ggml_compute_forward_concat(params, op);
+                    return false;
                 }
                 return true;
             // TODO For GGML_OP_GATED_DELTA_NET
@@ -1212,7 +1178,7 @@ class tensor_traits_common : public tensor_traits_base {
         return false;
     }
 
-    void forward_flash_attn_ext_f16(const ggml_compute_params * params, ggml_tensor * dst) {
+    bool forward_flash_attn_ext_f16(ggml::spacemit::context & ctx, ggml_tensor * dst) const {
         const ggml_tensor * q = dst->src[0];
         const ggml_tensor * k = dst->src[1];
         const ggml_tensor * v = dst->src[2];
@@ -1235,19 +1201,18 @@ class tensor_traits_common : public tensor_traits_base {
         const bool supported_vlen  = (__riscv_vlenb() == 128);
 
         if (!(supported_prec && supported_types && supported_shape && supported_vlen)) {
-            ggml_compute_forward_flash_attn_ext(params, dst);
-            return;
+            return false;
         }
 
         // total rows in q
         const int64_t nr = neq1 * neq2 * neq3;
 
         // rows per thread
-        const int ith = params->ith;
-        const int nth = params->nth;
+        const int ith = ctx.ith;
+        const int nth = ctx.nth;
 
         static constexpr int64_t Q_TILE_SZ = ggml_fa_tile_config::Q;
-        const bool               use_tiled = !params->use_ref && (neq1 >= Q_TILE_SZ);
+        const bool               use_tiled = neq1 >= Q_TILE_SZ;
 
         // 4x chunks per thread
         // int     nth_scaled = nth * 4;
@@ -1259,15 +1224,6 @@ class tensor_traits_common : public tensor_traits_base {
         // }
 
         int64_t nchunk = nth;
-
-        if (ith == 0 && params->threadpool) {
-            // Every thread starts at ith, so the first unprocessed chunk is nth.  This save a bit of coordination right at the start.
-            ggml_threadpool_chunk_set(params->threadpool, nth);
-        }
-
-        if (params->threadpool) {
-            ggml_barrier(params->threadpool);
-        }
 
         // The number of elements in each chunk
         const int64_t dr = (nr + nchunk - 1) / nchunk;
@@ -1281,23 +1237,19 @@ class tensor_traits_common : public tensor_traits_base {
 
             if (use_tiled) {
                 spacemit_kernels::rvv::forward_flash_attn_ext_f16_tiled_vlen1024_vf16(
-                    params, dst, ir0, ir1, ggml::cpu::riscv64_spacemit::tls_context.tcm_buffer,
-                    ggml::cpu::riscv64_spacemit::tls_context.tcm_buffer_size);
+                    ctx, dst, ir0, ir1);
             } else {
                 spacemit_kernels::rvv::forward_flash_attn_ext_f16_one_chunk_vlen1024_vf16(
-                    params, dst, ir0, ir1, ggml::cpu::riscv64_spacemit::tls_context.tcm_buffer,
-                    ggml::cpu::riscv64_spacemit::tls_context.tcm_buffer_size);
+                    ctx, dst, ir0, ir1);
             }
 
-            if (params->threadpool) {
-                current_chunk = ggml_threadpool_chunk_add(params->threadpool, 1);
-            } else {
-                current_chunk += 1;
-            }
+            current_chunk += nth;
         }
+
+        return true;
     }
 
-    int repack(ggml_tensor * t, const void * data, size_t data_size) override {
+    int repack(ggml_tensor * t, const void * data, size_t data_size) const override {
         memcpy(t->data, data, data_size);
         return 0;
     }
@@ -1326,8 +1278,7 @@ static const tensor_traits_common               rvv_impl;
 
 }  // namespace ggml::cpu::riscv64_spacemit
 
-__attribute__((visibility("default")))
-const ggml::cpu::tensor_traits * ggml_riscv64_spacemit_get_optimal_repack_type(const ggml_tensor * cur) {
+const ggml::spacemit::tensor_traits_base * ggml_spacemit_get_optimal_repack_type(const ggml_tensor * cur) {
     switch (cur->type) {
         case GGML_TYPE_Q2_K:
             {
@@ -1465,120 +1416,7 @@ const ggml::cpu::tensor_traits * ggml_riscv64_spacemit_get_optimal_repack_type(c
     return nullptr;
 }
 
-static enum ggml_status ggml_backend_riscv64_spacemit_buffer_init_tensor(ggml_backend_buffer_t buffer,
-                                                                         ggml_tensor *         tensor) {
-    tensor->extra =
-        (void *) const_cast<ggml::cpu::tensor_traits *>(ggml_riscv64_spacemit_get_optimal_repack_type(tensor));
-
-    GGML_UNUSED(buffer);
-
-    return GGML_STATUS_SUCCESS;
-}
-
-static void ggml_backend_riscv64_spacemit_buffer_free_buffer(ggml_backend_buffer_t buffer) {
-    GGML_ASSERT(buffer);
-
-    void * base = buffer->context;
-    if (base == nullptr) {
-        return;
-    }
-
-    ggml::cpu::riscv64_spacemit::spine_mem_pool_free(base);
-}
-
-static void * ggml_backend_riscv64_spacemit_buffer_get_base(ggml_backend_buffer_t buffer) {
-    GGML_ASSERT(buffer);
-
-    void * base = buffer->context;
-    GGML_ASSERT(base != nullptr);
-    return base;
-}
-
-static void ggml_backend_riscv64_spacemit_buffer_memset_tensor(ggml_backend_buffer_t buffer,
-                                                               ggml_tensor *         tensor,
-                                                               uint8_t               value,
-                                                               size_t                offset,
-                                                               size_t                size) {
-    GGML_ASSERT(tensor);
-    memset((char *) tensor->data + offset, value, size);
-
-    GGML_UNUSED(buffer);
-}
-
-static void ggml_backend_riscv64_spacemit_buffer_clear(ggml_backend_buffer_t buffer, uint8_t value) {
-    GGML_ASSERT(buffer);
-
-    void * base = buffer->context;
-    GGML_ASSERT(base != nullptr);
-    memset(base, value, buffer->size);
-}
-
-static void ggml_backend_riscv64_spacemit_buffer_set_tensor(ggml_backend_buffer_t buffer,
-                                                            ggml_tensor *         tensor,
-                                                            const void *          data,
-                                                            size_t                offset,
-                                                            size_t                size) {
-    GGML_ASSERT(offset == 0);
-    GGML_ASSERT(size == ggml_nbytes(tensor));
-
-    auto traits = (ggml::cpu::riscv64_spacemit::tensor_traits_base *) tensor->extra;
-    if (traits) {
-        auto OK = traits->repack(tensor, data, size);
-        GGML_ASSERT(OK == 0);
-    } else {
-        memcpy(tensor->data, data, size);
-    }
-
-    GGML_UNUSED(buffer);
-}
-
-static void ggml_backend_riscv64_spacemit_buffer_get_tensor(ggml_backend_buffer_t buffer,
-                                                             const ggml_tensor *   tensor,
-                                                             void *                data,
-                                                             size_t                offset,
-                                                             size_t                size) {
-    memcpy(data, (const char *) tensor->data + offset, size);
-
-    GGML_UNUSED(buffer);
-}
-
-static const ggml_backend_buffer_i ggml_backend_riscv64_spacemit_buffer_i = {
-    /* .free_buffer     = */ ggml_backend_riscv64_spacemit_buffer_free_buffer,
-    /* .get_base        = */ ggml_backend_riscv64_spacemit_buffer_get_base,
-    /* .init_tensor     = */ ggml_backend_riscv64_spacemit_buffer_init_tensor,
-    /* .memset_tensor   = */ ggml_backend_riscv64_spacemit_buffer_memset_tensor,
-    /* .set_tensor      = */ ggml_backend_riscv64_spacemit_buffer_set_tensor,
-    /* .get_tensor      = */ ggml_backend_riscv64_spacemit_buffer_get_tensor,
-    /* .set_tensor_2d   = */ nullptr,
-    /* .get_tensor_2d   = */ nullptr,
-    /* .cpy_tensor      = */ nullptr,
-    /* .clear           = */ ggml_backend_riscv64_spacemit_buffer_clear,
-    /* .reset           = */ nullptr,
-};
-
-static const char * ggml_backend_cpu_riscv64_spacemit_buffer_type_get_name(ggml_backend_buffer_type_t buft) {
-    return "CPU_RISCV64_SPACEMIT";
-
-    GGML_UNUSED(buft);
-}
-
-static ggml_backend_buffer_t ggml_backend_cpu_riscv64_spacemit_buffer_type_alloc_buffer(ggml_backend_buffer_type_t buft,
-                                                                                        size_t size) {
-    void * base = ggml::cpu::riscv64_spacemit::spine_mem_pool_alloc(size, 64);
-    if (base == nullptr) {
-        return nullptr;
-    }
-
-    return ggml_backend_buffer_init(buft, ggml_backend_riscv64_spacemit_buffer_i, base, size);
-}
-
-static size_t ggml_backend_cpu_riscv64_spacemit_buffer_type_get_alignment(ggml_backend_buffer_type_t buft) {
-    return 64;
-
-    GGML_UNUSED(buft);
-}
-
-static size_t ggml_backend_cpu_riscv64_spacemit_nbytes(ggml_backend_buffer_type_t buft, const ggml_tensor * tensor) {
+size_t ggml_spacemit_nbytes(ggml_backend_buffer_type_t buft, const ggml_tensor * tensor) {
     for (int i = 0; i < GGML_MAX_DIMS; ++i) {
         if (tensor->ne[i] <= 0) {
             return 0;
@@ -1659,103 +1497,121 @@ static size_t ggml_backend_cpu_riscv64_spacemit_nbytes(ggml_backend_buffer_type_
     return nbytes;
 }
 
-namespace ggml::cpu::riscv64_spacemit {
-
-// Check if a buffer type is a spacemit buffer type (either CPU extra or SPACEMIT device).
-static bool ggml_buft_is_spacemit(ggml_backend_buffer_type_t buft) {
-    if (!buft || !buft->iface.get_name) return false;
-    const char * name = buft->iface.get_name(buft);
-    if (!name) return false;
-    return strcmp(name, "CPU_RISCV64_SPACEMIT") == 0 || strcmp(name, "SPACEMIT") == 0;
-}
-
-class extra_buffer_type : public ggml::cpu::extra_buffer_type {
-  public:
-    bool supports_op(ggml_backend_dev_t, const ggml_tensor * op) override {
-        switch (op->op) {
-            case GGML_OP_MUL_MAT:
-                if (op->src[0]->buffer && (ggml_n_dims(op->src[0]) == 2) &&
-                    ggml_buft_is_spacemit(op->src[0]->buffer->buft) &&
-                    ggml_riscv64_spacemit_get_optimal_repack_type(op->src[0])) {
-                    if (op->src[1]->buffer && !ggml_backend_buft_is_host(op->src[1]->buffer->buft)) {
-                        return false;
-                    }
-                    if (op->src[1]->type == GGML_TYPE_F32) {
-                        return true;
-                    }
-                }
-                break;
-            case GGML_OP_MUL_MAT_ID:
-                if (op->src[0]->buffer && (ggml_n_dims(op->src[0]) == 3) &&
-                    ggml_buft_is_spacemit(op->src[0]->buffer->buft) &&
-                    ggml_riscv64_spacemit_get_optimal_repack_type(op->src[0])) {
-                    if (op->src[1]->buffer && !ggml_backend_buft_is_host(op->src[1]->buffer->buft)) {
-                        return false;
-                    }
-                    if (op->src[1]->type == GGML_TYPE_F32) {
-                        return true;
-                    }
-                }
-                break;
-            default:
-                // GGML_ABORT("fatal error");
-                break;
-        }
-        return false;
-    }
-
-    ggml::cpu::tensor_traits * get_tensor_traits(const ggml_tensor * op) override {
-        switch (op->op) {
-            case GGML_OP_MUL_MAT:
-            case GGML_OP_MUL_MAT_ID:
-                if (op->src[0]->buffer && ggml_buft_is_spacemit(op->src[0]->buffer->buft)) {
-                    return (ggml::cpu::tensor_traits *) op->src[0]->extra;
-                }
-                break;
-            case GGML_OP_NORM:
-            case GGML_OP_RMS_NORM:
-            case GGML_OP_ADD:
-            case GGML_OP_SUB:
-            case GGML_OP_MUL:
-            case GGML_OP_DIV:
-            case GGML_OP_FLASH_ATTN_EXT:
-            case GGML_OP_CONT:
-            case GGML_OP_CPY:
-            case GGML_OP_REPEAT:
-            case GGML_OP_SUM_ROWS:
-            case GGML_OP_GET_ROWS:
-            case GGML_OP_CONCAT:
-                // case GGML_OP_GATED_DELTA_NET:
-                return (ggml::cpu::tensor_traits *) (&ggml::cpu::riscv64_spacemit::rvv_impl);
-            case GGML_OP_UNARY:
-                if (ggml_get_unary_op(op) == GGML_UNARY_OP_TANH && op->src[0]->type == GGML_TYPE_F32 &&
-                    ggml_is_contiguous(op->src[0])) {
-                    return (ggml::cpu::tensor_traits *) (&ggml::cpu::riscv64_spacemit::rvv_impl);
-                }
-                if (ggml_get_unary_op(op) == GGML_UNARY_OP_GELU && op->src[0]->type == GGML_TYPE_F32 &&
-                    ggml_is_contiguous(op->src[0])) {
-                    return (ggml::cpu::tensor_traits *) (&ggml::cpu::riscv64_spacemit::rvv_impl);
-                }
-                break;
-            case GGML_OP_GLU:
-                if (ggml_get_glu_op(op) == GGML_GLU_OP_GEGLU && op->src[0]->type == GGML_TYPE_F32) {
-                    return (ggml::cpu::tensor_traits *) (&ggml::cpu::riscv64_spacemit::rvv_impl);
-                }
-                break;
-            default:
-                // GGML_ABORT("fatal error");
-                break;
-        }
-
+const ggml::spacemit::tensor_traits_base * ggml_spacemit_get_tensor_traits(const ggml_tensor * op) {
+    if (op == nullptr) {
         return nullptr;
     }
-};
 
-}  // namespace ggml::cpu::riscv64_spacemit
+    const auto * common = &ggml::cpu::riscv64_spacemit::rvv_impl;
+    switch (op->op) {
+        case GGML_OP_MUL_MAT:
+            if (op->src[0] && op->src[1] && ggml_n_dims(op->src[0]) == 2 &&
+                op->src[1]->type == GGML_TYPE_F32) {
+                const auto * traits = static_cast<const ggml::spacemit::tensor_traits_base *>(op->src[0]->extra);
+                return traits ? traits : ggml_spacemit_get_optimal_repack_type(op->src[0]);
+            }
+            break;
+        case GGML_OP_MUL_MAT_ID:
+            if (op->src[0] && op->src[1] && ggml_n_dims(op->src[0]) == 3 &&
+                op->src[1]->type == GGML_TYPE_F32) {
+                const auto * traits = static_cast<const ggml::spacemit::tensor_traits_base *>(op->src[0]->extra);
+                return traits ? traits : ggml_spacemit_get_optimal_repack_type(op->src[0]);
+            }
+            break;
+        case GGML_OP_NORM:
+        case GGML_OP_RMS_NORM:
+            if (op->src[0] && op->src[0]->type == GGML_TYPE_F32) {
+                return common;
+            }
+            break;
+        case GGML_OP_ADD:
+        case GGML_OP_SUB:
+        case GGML_OP_MUL:
+        case GGML_OP_DIV:
+            if (op->src[0] && op->src[1] &&
+                (op->src[0]->type == GGML_TYPE_F32 || op->src[0]->type == GGML_TYPE_F16) &&
+                op->src[1]->type == op->src[0]->type && op->type == op->src[0]->type &&
+                op->src[0]->nb[0] == ggml_type_size(op->src[0]->type) &&
+                op->src[1]->nb[0] == ggml_type_size(op->src[1]->type) &&
+                op->nb[0] == ggml_type_size(op->type) && ggml_can_repeat(op->src[1], op->src[0]) &&
+                ggml_are_same_shape(op->src[0], op)) {
+                return common;
+            }
+            break;
+        case GGML_OP_FLASH_ATTN_EXT:
+            if (op->src[0] && op->src[1] && op->src[2] &&
+                (op->op_params[3] == GGML_PREC_F32 || op->op_params[3] == GGML_PREC_DEFAULT) &&
+                op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F16 &&
+                op->src[2]->type == GGML_TYPE_F16 && op->src[1]->ne[0] > 0 && op->src[1]->ne[0] <= 128 &&
+                op->src[2]->ne[0] > 0 && op->src[2]->ne[0] <= 128 && __riscv_vlenb() == 128) {
+                return common;
+            }
+            break;
+        case GGML_OP_CONT:
+            if (op->src[0] && op->type == op->src[0]->type && op->nb[0] != op->src[0]->nb[0] &&
+                op->nb[0] == op->src[0]->nb[1] &&
+                op->ne[3] * op->ne[2] * op->nb[2] == op->src[0]->ne[3] * op->src[0]->ne[2] * op->src[0]->nb[2]) {
+                return common;
+            }
+            break;
+        case GGML_OP_CPY:
+            if (op->src[0] && op->type == op->src[0]->type && op->nb[0] == op->src[0]->nb[1] &&
+                op->src[0]->nb[0] != op->src[0]->nb[1] && ggml_nelements(op->src[0]) == ggml_nelements(op)) {
+                return common;
+            }
+            break;
+        case GGML_OP_REPEAT:
+            if (op->src[0] && (op->src[0]->type == GGML_TYPE_F32 || op->src[0]->type == GGML_TYPE_F16)) {
+                const bool rows_equal = ggml_nrows(op->src[0]) == ggml_nrows(op);
+                const bool n0_matches = op->src[0]->ne[0] == 1 || op->src[0]->ne[0] == op->ne[0];
+                if ((rows_equal && n0_matches) ||
+                    (op->src[0]->ne[1] == 1 && op->src[0]->ne[0] == op->ne[0])) {
+                    return common;
+                }
+            }
+            break;
+        case GGML_OP_SUM_ROWS:
+            if (op->src[0] && op->src[0]->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32) {
+                return common;
+            }
+            break;
+        case GGML_OP_GET_ROWS:
+            if (op->src[0] && op->src[1] && op->src[0]->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32 &&
+                op->src[1]->type == GGML_TYPE_I32 && op->ne[0] == op->src[0]->ne[0] &&
+                op->src[0]->ne[2] == op->src[1]->ne[1] && op->src[0]->nb[0] == sizeof(float) &&
+                ggml_nrows(op) == ggml_nelements(op->src[1])) {
+                return common;
+            }
+            break;
+        case GGML_OP_CONCAT:
+            if (op->src[0] && op->src[1] && ggml_get_op_params_i32(op, 0) == 0 &&
+                op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32 &&
+                op->type == GGML_TYPE_F32 && op->nb[0] == sizeof(float) &&
+                op->nb[1] == sizeof(float) * (op->src[0]->ne[0] + op->src[1]->ne[0])) {
+                return common;
+            }
+            break;
+        case GGML_OP_UNARY:
+            if (op->src[0] && op->src[0]->type == GGML_TYPE_F32 && ggml_is_contiguous(op->src[0]) &&
+                (ggml_get_unary_op(op) == GGML_UNARY_OP_TANH ||
+                 ggml_get_unary_op(op) == GGML_UNARY_OP_GELU)) {
+                return common;
+            }
+            break;
+        case GGML_OP_GLU:
+            if (op->src[0] && op->src[0]->type == GGML_TYPE_F32 && ggml_get_glu_op(op) == GGML_GLU_OP_GEGLU) {
+                return common;
+            }
+            break;
+        default:
+            break;
+    }
 
-__attribute__((visibility("default")))
+    return nullptr;
+}
+
 int ggml_riscv64_spacemit_repack_tensor(ggml_tensor * tensor, const void * data, size_t size) {
-    auto traits = (ggml::cpu::riscv64_spacemit::tensor_traits_base *) tensor->extra;
+    auto traits = (ggml::spacemit::tensor_traits_base *) tensor->extra;
     if (traits) {
         return traits->repack(tensor, data, size);
     }
@@ -1763,57 +1619,12 @@ int ggml_riscv64_spacemit_repack_tensor(ggml_tensor * tensor, const void * data,
     return 0;
 }
 
-__attribute__((visibility("default")))
-void ggml_spacemit_set_tcm_buffer(void * ptr, size_t size) {
-    ggml::cpu::riscv64_spacemit::tls_context.tcm_buffer      = ptr;
-    ggml::cpu::riscv64_spacemit::tls_context.tcm_buffer_size = size;
+bool ggml_spacemit_get_work_size(int n_threads, const ggml_tensor * op, size_t * size) {
+    const auto * traits = ggml_spacemit_get_tensor_traits(op);
+    return traits != nullptr && traits->work_size(n_threads, op, *size);
 }
 
-__attribute__((visibility("default")))
-void ggml_spacemit_get_tcm_buffer(void ** ptr, size_t * size) {
-    *ptr  = ggml::cpu::riscv64_spacemit::tls_context.tcm_buffer;
-    *size = ggml::cpu::riscv64_spacemit::tls_context.tcm_buffer_size;
-}
-
-__attribute__((visibility("default")))
-void ggml_spacemit_set_spert_ctx(void * ctx) {
-    ggml::cpu::riscv64_spacemit::tls_context.spert_ctx = ctx;
-}
-
-__attribute__((visibility("default")))
-void * ggml_spacemit_create_extra_buffer_type() {
-    return new ggml::cpu::riscv64_spacemit::extra_buffer_type();
-}
-
-__attribute__((visibility("default")))
-bool ggml_spacemit_compute_forward(struct ggml_compute_params * params, struct ggml_tensor * op) {
-    // Get the SPACEMIT extra_buffer_type singleton from the SPACEMIT buffer type.
-    // We use a static local instance to avoid depending on buft lookup at runtime.
-    static ggml::cpu::riscv64_spacemit::extra_buffer_type ebt;
-    auto traits = ebt.get_tensor_traits(op);
-    if (traits && traits->compute_forward(params, op)) {
-        return true;
-    }
-    return false;
-}
-
-__attribute__((visibility("default")))
-ggml_backend_buffer_type_t ggml_backend_cpu_riscv64_spacemit_buffer_type(void) {
-    static ggml_backend_buffer_type ggml_backend_cpu_buffer_type_riscv64_spacemit = {
-  /* .iface    = */
-        {
-         /* .get_name         = */ ggml_backend_cpu_riscv64_spacemit_buffer_type_get_name,
-         /* .alloc_buffer     = */ ggml_backend_cpu_riscv64_spacemit_buffer_type_alloc_buffer,
-         /* .get_alignment    = */ ggml_backend_cpu_riscv64_spacemit_buffer_type_get_alignment,
-         /* .get_max_size     = */ nullptr,
-         /* .get_alloc_size   = */ ggml_backend_cpu_riscv64_spacemit_nbytes,
-         /* .is_host          = */ nullptr,
-         },
- /* .device  = */
-        ggml_backend_reg_dev_get(ggml_backend_cpu_reg(), 0),
- /* .context = */
-        new ggml::cpu::riscv64_spacemit::extra_buffer_type(),
-    };
-
-    return &ggml_backend_cpu_buffer_type_riscv64_spacemit;
+bool ggml_spacemit_compute_forward(ggml::spacemit::context & ctx, ggml_tensor * op) {
+    const auto * traits = ggml_spacemit_get_tensor_traits(op);
+    return traits != nullptr && traits->compute_forward(ctx, op);
 }

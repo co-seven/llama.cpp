@@ -1,6 +1,6 @@
 #pragma once
 
-#include "ggml-cpu-impl.h"
+#include "spacemit-context.h"
 
 #include <cassert>
 #include <cstddef>
@@ -44,44 +44,40 @@ void memcpy1d(void * dst, const void * src, int64_t size);
 
 void memcpy2d(void * dst, int64_t dst_stride, const void * src, int64_t src_stride, int64_t tile_rows, int64_t size);
 
-void forward_flash_attn_ext_f16_one_chunk_vlen1024_vf16(const ggml_compute_params * params,
-                                                        ggml_tensor *               dst,
-                                                        int                         ir0,
-                                                        int                         ir1,
-                                                        void *                      tcm_buffer,
-                                                        size_t                      tcm_buffer_size);
+void forward_flash_attn_ext_f16_one_chunk_vlen1024_vf16(ggml::spacemit::context & ctx,
+                                                        ggml_tensor *             dst,
+                                                        int                       ir0,
+                                                        int                       ir1);
 
-void forward_flash_attn_ext_f16_tiled_vlen1024_vf16(const ggml_compute_params * params,
-                                                    ggml_tensor *               dst,
-                                                    int                         ir0,
-                                                    int                         ir1,
-                                                    void *                      tcm_buffer,
-                                                    size_t                      tcm_buffer_size);
+void forward_flash_attn_ext_f16_tiled_vlen1024_vf16(ggml::spacemit::context & ctx,
+                                                    ggml_tensor *             dst,
+                                                    int                       ir0,
+                                                    int                       ir1);
 
-void forward_rms_norm_f32(ggml_compute_params * params, ggml_tensor * op);
+void forward_rms_norm_f32(ggml::spacemit::context & ctx, ggml_tensor * op);
 
-void forward_norm_f32(ggml_compute_params * params, ggml_tensor * op);
+void forward_norm_f32(ggml::spacemit::context & ctx, ggml_tensor * op);
 
-void forward_cont_with_permute(ggml_compute_params * params, ggml_tensor * op);
+void forward_cont_with_permute(ggml::spacemit::context & ctx, ggml_tensor * op);
 
-void forward_cpy_with_permute(ggml_compute_params * params, ggml_tensor * op);
+void forward_cpy_with_permute(ggml::spacemit::context & ctx, ggml_tensor * op);
 
-template <typename T> void forward_get_rows(ggml_compute_params * params, ggml_tensor * op);
+template <typename T> void forward_get_rows(ggml::spacemit::context & ctx, ggml_tensor * op);
 
-template <typename T> void forward_concat(ggml_compute_params * params, ggml_tensor * op);
+template <typename T> void forward_concat(ggml::spacemit::context & ctx, ggml_tensor * op);
 
-template <ggml_op op_type, typename T> void forward_binary(ggml_compute_params * params, ggml_tensor * op);
+template <ggml_op op_type, typename T> void forward_binary(ggml::spacemit::context & ctx, ggml_tensor * op);
 
-void forward_unary_tanh_f32(ggml_compute_params * params, ggml_tensor * op);
-void forward_unary_gelu_f32(ggml_compute_params * params, ggml_tensor * op);
+void forward_unary_tanh_f32(ggml::spacemit::context & ctx, ggml_tensor * op);
+void forward_unary_gelu_f32(ggml::spacemit::context & ctx, ggml_tensor * op);
 
-void forward_glu_geglu_f32(ggml_compute_params * params, ggml_tensor * op);
+void forward_glu_geglu_f32(ggml::spacemit::context & ctx, ggml_tensor * op);
 
-template <typename T> void forward_sum_rows(const ggml_compute_params * params, ggml_tensor * op);
+template <typename T> void forward_sum_rows(ggml::spacemit::context & ctx, ggml_tensor * op);
 
-template <typename T> void forward_repeat_nrows(ggml_compute_params * params, ggml_tensor * op);
+template <typename T> void forward_repeat_nrows(ggml::spacemit::context & ctx, ggml_tensor * op);
 
-template <typename T> void forward_repeat_dim1(ggml_compute_params * params, ggml_tensor * op);
+template <typename T> void forward_repeat_dim1(ggml::spacemit::context & ctx, ggml_tensor * op);
 
 void quantize_a_row_i8(size_t blk_len, const float * a_ptr, size_t count_k, uint8_t * quant_a_ptr);
 

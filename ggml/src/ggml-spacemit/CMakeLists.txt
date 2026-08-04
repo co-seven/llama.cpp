@@ -11,20 +11,11 @@ set(SPINE_RUNTIME_BUILD_TESTS OFF CACHE BOOL "" FORCE)
 set(SPINE_RUNTIME_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
 add_subdirectory(${SPINE_RUNTIME_DIR} ${CMAKE_BINARY_DIR}/spine-runtime-build)
 
-# When GGML_SPACEMIT is ON, disable GGML_CPU_RISCV64_SPACEMIT so ggml-cpu
-# does not compile its own copy of spacemit sources. Instead, ggml-spacemit
-# provides the kernel implementations and exports the functions that
-# ggml-cpu.c needs (thread affinity, TCM management).
+# The standalone backend owns the SpacemiT kernels and dispatch path.
 if(GGML_SPACEMIT AND GGML_CPU_RISCV64_SPACEMIT)
     message(STATUS "GGML_SPACEMIT is ON -> disabling GGML_CPU_RISCV64_SPACEMIT")
     set(GGML_CPU_RISCV64_SPACEMIT OFF CACHE BOOL "" FORCE)
 endif()
-
-# Always define GGML_USE_CPU_RISCV64_SPACEMIT on ggml-cpu so that
-# ggml_graph_compute uses the spacemit thread launch path
-# (set_numa_thread_affinity, tcm_mem_wait_all, etc.).
-# These functions are provided by ggml-spacemit (ime.cpp).
-target_compile_definitions(ggml-cpu PRIVATE GGML_USE_CPU_RISCV64_SPACEMIT)
 
 # Detect IME support (inline version of FindSMTIME.cmake)
 if(CMAKE_SYSTEM_PROCESSOR MATCHES "riscv")
@@ -53,9 +44,8 @@ if(CMAKE_SYSTEM_PROCESSOR MATCHES "riscv")
     message("RISCV64_SPACEMIT_IME_SPEC: ${RISCV64_SPACEMIT_IME_SPEC}")
 endif()
 
-# NOTE: ime_env.cpp is intentionally excluded. global_spine_env_info is
-# provided by ggml-spacemit.cpp, initialized from spert::backend_info()
-# and GGML_SPACEMIT_WORKERS env var.
+# global_spine_env_info is provided by ggml-spacemit.cpp and initialized
+# from spert::backend_info() and GGML_SPACEMIT_WORKERS.
 ggml_add_backend_library(${TARGET_NAME}
     ggml-spacemit.cpp
     ime.cpp
@@ -63,6 +53,8 @@ ggml_add_backend_library(${TARGET_NAME}
     ime2_kernels.cpp
     rvv_kernels.cpp
     repack.cpp
+    spacemit-context.h
+    spacemit-env.h
     spine_mem_pool.cpp
     ../../include/ggml-spacemit.h)
 
@@ -74,14 +66,15 @@ target_include_directories(${TARGET_NAME} PRIVATE
     ${SPINE_RUNTIME_DIR}/include)
 
 target_compile_definitions(${TARGET_NAME} PRIVATE
-    GGML_USE_CPU_RISCV64_SPACEMIT
     ${RISCV64_SPACEMIT_IME_SPEC}
 )
 
 # Pass the full march string to both targets
 if(CMAKE_SYSTEM_PROCESSOR MATCHES "riscv")
     set(SPACEMIT_MARCH "-march=rv64gcv_zfh_zvfh_zba_zbb_zbs_zicbop_zihintpause_zawrs_zicond_zvbb")
-    if(RISCV64_SPACEMIT_IME_SPEC MATCHES "IME")
+    if(RISCV64_SPACEMIT_IME_SPEC MATCHES "IME" AND
+       ((CMAKE_CXX_COMPILER_ID STREQUAL "GNU" AND CMAKE_CXX_COMPILER_VERSION VERSION_GREATER_EQUAL 15) OR
+        CMAKE_CXX_COMPILER_ID MATCHES "Clang"))
         set(SPACEMIT_MARCH "-march=rv64gcv_zfh_zvfh_zba_zbb_zbs_zicbop_zihintpause_zawrs_zicond_zvbb_xsmtvdotii")
     endif()
     target_compile_options(spert PRIVATE -march=rv64gcv_zfh_zvfh_zba_zbb_zbs_zicbop_zihintpause_zawrs_zicond_zvbb)

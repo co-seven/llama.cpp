@@ -2,7 +2,6 @@
 
 #include "common.h"
 #include "ggml.h"
-#include "ops.h"
 #include "string.h"
 
 #include <algorithm>
@@ -1118,12 +1117,10 @@ void memcpy2d(void * dst, int64_t dst_stride, const void * src, int64_t src_stri
     }
 }
 
-void forward_flash_attn_ext_f16_one_chunk_vlen1024_vf16(const ggml_compute_params * params,
-                                                        ggml_tensor *               dst,
-                                                        int                         ir0,
-                                                        int                         ir1,
-                                                        void *                      tcm_buffer,
-                                                        size_t                      tcm_buffer_size) {
+void forward_flash_attn_ext_f16_one_chunk_vlen1024_vf16(ggml::spacemit::context & ctx,
+                                                        ggml_tensor *             dst,
+                                                        int                       ir0,
+                                                        int                       ir1) {
     const ggml_tensor * q     = dst->src[0];
     const ggml_tensor * k     = dst->src[1];
     const ggml_tensor * v     = dst->src[2];
@@ -1170,7 +1167,9 @@ void forward_flash_attn_ext_f16_one_chunk_vlen1024_vf16(const ggml_compute_param
 
     const int KV_row_size = DK * sizeof(_Float16) + DV * sizeof(_Float16);
 
-    int ith     = params->ith;
+    void * tcm_buffer = ctx.shared.data;
+    size_t tcm_buffer_size = ctx.shared.size;
+    int ith     = ctx.ith;
     int ir_step = 1;
     for (int ir = ir0; ir < ir1; ir += ir_step) {
         // q indices
@@ -1302,12 +1301,10 @@ void forward_flash_attn_ext_f16_one_chunk_vlen1024_vf16(const ggml_compute_param
     }
 }
 
-void forward_flash_attn_ext_f16_tiled_vlen1024_vf16(const ggml_compute_params * params,
-                                                    ggml_tensor *               dst,
-                                                    int                         ir0,
-                                                    int                         ir1,
-                                                    void *                      tcm_buffer,
-                                                    size_t                      tcm_buffer_size) {
+void forward_flash_attn_ext_f16_tiled_vlen1024_vf16(ggml::spacemit::context & ctx,
+                                                    ggml_tensor *             dst,
+                                                    int                       ir0,
+                                                    int                       ir1) {
     const ggml_tensor * q     = dst->src[0];
     const ggml_tensor * k     = dst->src[1];
     const ggml_tensor * v     = dst->src[2];
@@ -1374,7 +1371,7 @@ void forward_flash_attn_ext_f16_tiled_vlen1024_vf16(const ggml_compute_params * 
     const float m0 = powf(2.0f, -(max_bias) / n_head_log2);
     const float m1 = powf(2.0f, -(max_bias / 2.0f) / n_head_log2);
 
-    int ith = params->ith;
+    int ith = ctx.ith;
 
     static constexpr int Q_TILE_SZ  = ggml_fa_tile_config::Q;
     static constexpr int KV_TILE_SZ = ggml_fa_tile_config::KV;
@@ -1386,15 +1383,16 @@ void forward_flash_attn_ext_f16_tiled_vlen1024_vf16(const ggml_compute_params * 
     // VKQ32:   Q_TILE_SZ * DV
     // V32:     KV_TILE_SZ * DV
     // K_f32:   DK * KV_TILE_SZ (transposed K tile)
-    float *      base = (float *) params->wdata + ith * (Q_TILE_SZ * DK + 2 * Q_TILE_SZ * KV_TILE_SZ + Q_TILE_SZ * DV +
-                                                    KV_TILE_SZ * DV + KV_TILE_SZ * DK + CACHE_LINE_SIZE_F32);
+    float * base = (float *) ctx.workspace +
+                   ith * (Q_TILE_SZ * DK + 2 * Q_TILE_SZ * KV_TILE_SZ + Q_TILE_SZ * DV + KV_TILE_SZ * DV +
+                          KV_TILE_SZ * DK + ggml::spacemit::cache_line_size_f32);
     const size_t base_size =
         (Q_TILE_SZ * DK + 2 * Q_TILE_SZ * KV_TILE_SZ + Q_TILE_SZ * DV + KV_TILE_SZ * DV + KV_TILE_SZ * DK) *
             sizeof(float) +
-        CACHE_LINE_SIZE_F32;
+        ggml::spacemit::cache_line_size_f32 * sizeof(float);
 
-    if (base_size <= tcm_buffer_size && tcm_buffer != nullptr) {
-        base = (float *) tcm_buffer;
+    if (base_size <= ctx.shared.size && ctx.shared.data != nullptr) {
+        base = (float *) ctx.shared.data;
     }
 
     float   S_M_Buf[Q_TILE_SZ * 2];  // buffer to hold S, M, bias for one tile to reduce register pressure in main loop
@@ -1627,14 +1625,14 @@ void forward_flash_attn_ext_f16_tiled_vlen1024_vf16(const ggml_compute_params * 
     }
 }
 
-void forward_rms_norm_f32(ggml_compute_params * params, ggml_tensor * op) {
+void forward_rms_norm_f32(ggml::spacemit::context & ctx, ggml_tensor * op) {
     const ggml_tensor * src0 = op->src[0];
     ggml_tensor *       dst  = op;
     GGML_ASSERT(ggml_are_same_shape(src0, dst));
     GGML_ASSERT(src0->nb[0] == sizeof(float));
 
-    int ith = params->ith;
-    int nth = params->nth;
+    int ith = ctx.ith;
+    int nth = ctx.nth;
 
     GGML_TENSOR_UNARY_OP_LOCALS
 
@@ -2489,11 +2487,11 @@ void quantize_a_4row_i8k(size_t blk_len, const float * a_ptr, size_t count_k, ui
     }
 }
 
-void forward_cpy_with_permute(ggml_compute_params * params, ggml_tensor * op) {
+void forward_cpy_with_permute(ggml::spacemit::context & ctx, ggml_tensor * op) {
     const ggml_tensor * src0 = op->src[0];
     ggml_tensor *       dst  = op;
-    const int           ith  = params->ith;
-    const int           nth  = params->nth;
+    const int           ith  = ctx.ith;
+    const int           nth  = ctx.nth;
 
     // [batch, m, n] -> [batch, n, m]
     int64_t batch = src0->ne[2] * src0->ne[3];
@@ -2508,11 +2506,11 @@ void forward_cpy_with_permute(ggml_compute_params * params, ggml_tensor * op) {
     permute_transpose_impl(src0, dst, batch, m, n, batch_stride, m_src_stride, n_src_stride, n_dst_stride, ith, nth);
 }
 
-void forward_cont_with_permute(ggml_compute_params * params, ggml_tensor * op) {
+void forward_cont_with_permute(ggml::spacemit::context & ctx, ggml_tensor * op) {
     const ggml_tensor * src0 = op->src[0];
     ggml_tensor *       dst  = op;
-    const int           ith  = params->ith;
-    const int           nth  = params->nth;
+    const int           ith  = ctx.ith;
+    const int           nth  = ctx.nth;
 
     // [batch, m, n] -> [batch, n, m]
     int64_t batch = dst->ne[2] * dst->ne[3];
@@ -2527,14 +2525,14 @@ void forward_cont_with_permute(ggml_compute_params * params, ggml_tensor * op) {
     permute_transpose_impl(src0, dst, batch, m, n, batch_stride, m_src_stride, n_src_stride, n_dst_stride, ith, nth);
 }
 
-void forward_norm_f32(ggml_compute_params * params, ggml_tensor * op) {
+void forward_norm_f32(ggml::spacemit::context & ctx, ggml_tensor * op) {
     const ggml_tensor * src0 = op->src[0];
     ggml_tensor *       dst  = op;
     GGML_ASSERT(ggml_are_same_shape(src0, dst));
     GGML_ASSERT(src0->nb[0] == sizeof(float));
 
-    int ith = params->ith;
-    int nth = params->nth;
+    int ith = ctx.ith;
+    int nth = ctx.nth;
 
     GGML_TENSOR_UNARY_OP_LOCALS
 
@@ -2619,7 +2617,7 @@ void forward_norm_f32(ggml_compute_params * params, ggml_tensor * op) {
     }
 }
 
-template <ggml_op op_type, typename T> void forward_binary(ggml_compute_params * params, ggml_tensor * op) {
+template <ggml_op op_type, typename T> void forward_binary(ggml::spacemit::context & ctx, ggml_tensor * op) {
     const ggml_tensor * src0 = op->src[0];
     const ggml_tensor * src1 = op->src[1];
     ggml_tensor *       dst  = op;
@@ -2628,15 +2626,18 @@ template <ggml_op op_type, typename T> void forward_binary(ggml_compute_params *
     auto src0_rows = ggml_nrows(src0);
     auto src1_rows = ggml_nrows(src1);
 
-    int ith = params->ith;
-    int nth = params->nth;
+    int ith = ctx.ith;
+    int nth = ctx.nth;
 
     GGML_TENSOR_BINARY_OP_LOCALS
 
     GGML_ASSERT(nb0 == sizeof(T));
     GGML_ASSERT(nb00 == sizeof(T));
 
-    const auto [ir0, ir1] = get_thread_range(params, src0);
+    const int64_t nr  = ggml_nrows(src0);
+    const int64_t dr  = (nr + nth - 1) / nth;
+    const int64_t ir0 = dr * ith;
+    const int64_t ir1 = MIN(ir0 + dr, nr);
 
     auto compute_func_vv = [&](int64_t blk_len, int64_t r, T * src0_ptr, T * src1_ptr, T * dst_ptr) {
         int64_t idx = 0;
@@ -2837,12 +2838,12 @@ template <ggml_op op_type, typename T> void forward_binary(ggml_compute_params *
     }
 }
 
-template <typename T> void forward_sum_rows(const ggml_compute_params * params, ggml_tensor * op) {
+template <typename T> void forward_sum_rows(ggml::spacemit::context & ctx, ggml_tensor * op) {
     const ggml_tensor * src0 = op->src[0];
     ggml_tensor *       dst  = op;
 
-    const int ith = params->ith;
-    const int nth = params->nth;
+    const int ith = ctx.ith;
+    const int nth = ctx.nth;
 
     GGML_TENSOR_UNARY_OP_LOCALS
 
@@ -2919,12 +2920,12 @@ template <typename T> void forward_sum_rows(const ggml_compute_params * params, 
     }
 }
 
-template <typename T> void forward_repeat_nrows(ggml_compute_params * params, ggml_tensor * op) {
+template <typename T> void forward_repeat_nrows(ggml::spacemit::context & ctx, ggml_tensor * op) {
     const ggml_tensor * src0 = op->src[0];
     ggml_tensor *       dst  = op;
 
-    const int ith = params->ith;
-    const int nth = params->nth;
+    const int ith = ctx.ith;
+    const int nth = ctx.nth;
 
     int64_t nrows            = ggml_nrows(src0);
     int64_t nrows_per_thread = (nrows + nth - 1) / nth;
@@ -2988,12 +2989,12 @@ template <typename T> void forward_repeat_nrows(ggml_compute_params * params, gg
     }
 }
 
-template <typename T> void forward_repeat_dim1(ggml_compute_params * params, ggml_tensor * op) {
+template <typename T> void forward_repeat_dim1(ggml::spacemit::context & ctx, ggml_tensor * op) {
     const ggml_tensor * src0 = op->src[0];
     ggml_tensor *       dst  = op;
 
-    const int ith = params->ith;
-    const int nth = params->nth;
+    const int ith = ctx.ith;
+    const int nth = ctx.nth;
 
     const int64_t ne0 = dst->ne[0];
     const int64_t ne1 = dst->ne[1];
@@ -3038,7 +3039,7 @@ template <typename T> void forward_repeat_dim1(ggml_compute_params * params, ggm
     }
 }
 
-template <typename T> void forward_get_rows(ggml_compute_params * params, ggml_tensor * op) {
+template <typename T> void forward_get_rows(ggml::spacemit::context & ctx, ggml_tensor * op) {
     const ggml_tensor * src0 = op->src[0];
     const ggml_tensor * src1 = op->src[1];
     ggml_tensor *       dst  = op;
@@ -3053,8 +3054,8 @@ template <typename T> void forward_get_rows(ggml_compute_params * params, ggml_t
     assert(nb00 == sizeof(float));
     assert(ggml_nrows(op) == nr);
 
-    const int ith = params->ith;
-    const int nth = params->nth;
+    const int ith = ctx.ith;
+    const int nth = ctx.nth;
 
     int rows_nth = nth;
     int cols_nth = 1;
@@ -3092,7 +3093,7 @@ template <typename T> void forward_get_rows(ggml_compute_params * params, ggml_t
     }
 }
 
-template <typename T> void forward_concat(ggml_compute_params * params, ggml_tensor * op) {
+template <typename T> void forward_concat(ggml::spacemit::context & ctx, ggml_tensor * op) {
     const ggml_tensor * src0 = op->src[0];
     const ggml_tensor * src1 = op->src[1];
     ggml_tensor *       dst  = op;
@@ -3108,8 +3109,8 @@ template <typename T> void forward_concat(ggml_compute_params * params, ggml_ten
     const int64_t nr = ggml_nrows(dst);
     const int64_t nc = ne0;
 
-    const int ith = params->ith;
-    const int nth = params->nth;
+    const int ith = ctx.ith;
+    const int nth = ctx.nth;
 
     int rows_nth = nth;
     int cols_nth = 1;
@@ -3156,7 +3157,7 @@ template <typename T> void forward_concat(ggml_compute_params * params, ggml_ten
     }
 }
 
-void forward_unary_tanh_f32(ggml_compute_params * params, ggml_tensor * op) {
+void forward_unary_tanh_f32(ggml::spacemit::context & ctx, ggml_tensor * op) {
     const ggml_tensor * src0 = op->src[0];
     ggml_tensor *       dst  = op;
 
@@ -3164,8 +3165,8 @@ void forward_unary_tanh_f32(ggml_compute_params * params, ggml_tensor * op) {
     GGML_ASSERT(src0->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32);
 
     const int64_t ne  = ggml_nelements(src0);
-    const int64_t ith = params->ith;
-    const int64_t nth = params->nth;
+    const int64_t ith = ctx.ith;
+    const int64_t nth = ctx.nth;
 
     const int64_t dr = (ne + nth - 1) / nth;
     const int64_t i0 = dr * ith;
@@ -3175,13 +3176,6 @@ void forward_unary_tanh_f32(ggml_compute_params * params, ggml_tensor * op) {
     float *       dst_ptr = (float *) dst->data + i0;
 
     int64_t remaining = i1 - i0;
-
-    if (params->use_ref) {
-        for (int64_t k = 0; k < remaining; ++k) {
-            dst_ptr[k] = tanhf(src_ptr[k]);
-        }
-        return;
-    }
 
     while (remaining > 0) {
         const size_t vl = __riscv_vsetvl_e32m2(remaining);
@@ -3194,7 +3188,7 @@ void forward_unary_tanh_f32(ggml_compute_params * params, ggml_tensor * op) {
     }
 }
 
-void forward_unary_gelu_f32(ggml_compute_params * params, ggml_tensor * op) {
+void forward_unary_gelu_f32(ggml::spacemit::context & ctx, ggml_tensor * op) {
     const ggml_tensor * src0 = op->src[0];
     ggml_tensor *       dst  = op;
 
@@ -3202,8 +3196,8 @@ void forward_unary_gelu_f32(ggml_compute_params * params, ggml_tensor * op) {
     GGML_ASSERT(src0->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32);
 
     const int64_t ne  = ggml_nelements(src0);
-    const int64_t ith = params->ith;
-    const int64_t nth = params->nth;
+    const int64_t ith = ctx.ith;
+    const int64_t nth = ctx.nth;
 
     const int64_t dr = (ne + nth - 1) / nth;
     const int64_t i0 = dr * ith;
@@ -3214,15 +3208,6 @@ void forward_unary_gelu_f32(ggml_compute_params * params, ggml_tensor * op) {
 
     static constexpr float GELU_ALPHA = 0.7978845608f;
     static constexpr float GELU_BETA  = 0.044715f;
-
-    if (params->use_ref) {
-        for (int64_t i = i0; i < i1; ++i) {
-            const float x     = src_ptr[i];
-            const float inner = GELU_ALPHA * x * (1.0f + GELU_BETA * x * x);
-            dst_ptr[i]        = 0.5f * x * (1.0f + tanhf(inner));
-        }
-        return;
-    }
 
     int64_t i = i0;
     while (i < i1) {
@@ -3240,7 +3225,7 @@ void forward_unary_gelu_f32(ggml_compute_params * params, ggml_tensor * op) {
     }
 }
 
-void forward_glu_geglu_f32(ggml_compute_params * params, ggml_tensor * op) {
+void forward_glu_geglu_f32(ggml::spacemit::context & ctx, ggml_tensor * op) {
     const ggml_tensor * src0 = op->src[0];
     const ggml_tensor * src1 = op->src[1];
 
@@ -3249,8 +3234,8 @@ void forward_glu_geglu_f32(ggml_compute_params * params, ggml_tensor * op) {
     const int64_t nc    = src1 ? src0->ne[0] : src0->ne[0] / 2;
     const int64_t nr    = ggml_nrows(src0);
     const int64_t total = nr * nc;
-    const int64_t ith   = params->ith;
-    const int64_t nth   = params->nth;
+    const int64_t ith   = ctx.ith;
+    const int64_t nth   = ctx.nth;
 
     const int64_t dr = (total + nth - 1) / nth;
     const int64_t e0 = dr * ith;
@@ -3281,16 +3266,6 @@ void forward_glu_geglu_f32(ggml_compute_params * params, ggml_tensor * op) {
         const float * gp = g_row + c;
         float *       yp = y_row + c;
 
-        if (params->use_ref) {
-            for (int64_t i = 0; i < run; ++i) {
-                const float xv    = xp[i];
-                const float inner = GELU_ALPHA * xv * (1.0f + GELU_BETA * xv * xv);
-                yp[i]             = 0.5f * xv * (1.0f + tanhf(inner)) * gp[i];
-            }
-            e += run;
-            continue;
-        }
-
         int64_t remaining = run;
         while (remaining > 0) {
             const size_t vl = __riscv_vsetvl_e32m2(remaining);
@@ -3317,23 +3292,23 @@ void forward_glu_geglu_f32(ggml_compute_params * params, ggml_tensor * op) {
     }
 }
 
-template void forward_binary<GGML_OP_ADD, float>(ggml_compute_params * params, ggml_tensor * op);
-template void forward_binary<GGML_OP_SUB, float>(ggml_compute_params * params, ggml_tensor * op);
-template void forward_binary<GGML_OP_MUL, float>(ggml_compute_params * params, ggml_tensor * op);
-template void forward_binary<GGML_OP_DIV, float>(ggml_compute_params * params, ggml_tensor * op);
-template void forward_binary<GGML_OP_ADD, _Float16>(ggml_compute_params * params, ggml_tensor * op);
-template void forward_binary<GGML_OP_SUB, _Float16>(ggml_compute_params * params, ggml_tensor * op);
-template void forward_binary<GGML_OP_MUL, _Float16>(ggml_compute_params * params, ggml_tensor * op);
-template void forward_binary<GGML_OP_DIV, _Float16>(ggml_compute_params * params, ggml_tensor * op);
-template void forward_sum_rows<float>(const ggml_compute_params * params, ggml_tensor * op);
-template void forward_sum_rows<_Float16>(const ggml_compute_params * params, ggml_tensor * op);
-template void forward_repeat_nrows<int32_t>(ggml_compute_params * params, ggml_tensor * op);
-template void forward_repeat_nrows<int16_t>(ggml_compute_params * params, ggml_tensor * op);
-template void forward_repeat_dim1<int32_t>(ggml_compute_params * params, ggml_tensor * op);
-template void forward_repeat_dim1<int16_t>(ggml_compute_params * params, ggml_tensor * op);
-template void forward_get_rows<int32_t>(ggml_compute_params * params, ggml_tensor * op);
-template void forward_get_rows<int16_t>(ggml_compute_params * params, ggml_tensor * op);
-template void forward_concat<int32_t>(ggml_compute_params * params, ggml_tensor * op);
-template void forward_concat<int16_t>(ggml_compute_params * params, ggml_tensor * op);
+template void forward_binary<GGML_OP_ADD, float>(ggml::spacemit::context & ctx, ggml_tensor * op);
+template void forward_binary<GGML_OP_SUB, float>(ggml::spacemit::context & ctx, ggml_tensor * op);
+template void forward_binary<GGML_OP_MUL, float>(ggml::spacemit::context & ctx, ggml_tensor * op);
+template void forward_binary<GGML_OP_DIV, float>(ggml::spacemit::context & ctx, ggml_tensor * op);
+template void forward_binary<GGML_OP_ADD, _Float16>(ggml::spacemit::context & ctx, ggml_tensor * op);
+template void forward_binary<GGML_OP_SUB, _Float16>(ggml::spacemit::context & ctx, ggml_tensor * op);
+template void forward_binary<GGML_OP_MUL, _Float16>(ggml::spacemit::context & ctx, ggml_tensor * op);
+template void forward_binary<GGML_OP_DIV, _Float16>(ggml::spacemit::context & ctx, ggml_tensor * op);
+template void forward_sum_rows<float>(ggml::spacemit::context & ctx, ggml_tensor * op);
+template void forward_sum_rows<_Float16>(ggml::spacemit::context & ctx, ggml_tensor * op);
+template void forward_repeat_nrows<int32_t>(ggml::spacemit::context & ctx, ggml_tensor * op);
+template void forward_repeat_nrows<int16_t>(ggml::spacemit::context & ctx, ggml_tensor * op);
+template void forward_repeat_dim1<int32_t>(ggml::spacemit::context & ctx, ggml_tensor * op);
+template void forward_repeat_dim1<int16_t>(ggml::spacemit::context & ctx, ggml_tensor * op);
+template void forward_get_rows<int32_t>(ggml::spacemit::context & ctx, ggml_tensor * op);
+template void forward_get_rows<int16_t>(ggml::spacemit::context & ctx, ggml_tensor * op);
+template void forward_concat<int32_t>(ggml::spacemit::context & ctx, ggml_tensor * op);
+template void forward_concat<int16_t>(ggml::spacemit::context & ctx, ggml_tensor * op);
 
 }  // namespace spacemit_kernels::rvv

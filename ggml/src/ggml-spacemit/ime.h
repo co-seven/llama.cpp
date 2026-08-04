@@ -1,25 +1,11 @@
 #pragma once
 
 #include "ggml-alloc.h"
+#include "spacemit-context.h"
 
-#ifdef __cplusplus
-extern "C" {
-#endif
-
-ggml_backend_buffer_type_t ggml_backend_cpu_riscv64_spacemit_buffer_type(void);
-
-void ggml_backend_cpu_riscv64_spacemit_set_numa_thread_affinity(int thread_n);
-
-void ggml_backend_cpu_riscv64_spacemit_clear_numa_thread_affinity_threaded(int thread_n);
-
-void ggml_backend_cpu_riscv64_spacemit_tcm_mem_wait_all(int n_threads);
-
-void ggml_backend_cpu_riscv64_spacemit_tcm_mem_release_all(int n_threads);
-
-void * ggml_backend_cpu_riscv64_spacemit_alloc_shared(size_t size, size_t alignment);
-
-void ggml_backend_cpu_riscv64_spacemit_free_shared(void * ptr);
-
-#ifdef __cplusplus
-}
-#endif
+const ggml::spacemit::tensor_traits_base * ggml_spacemit_get_optimal_repack_type(const ggml_tensor * cur);
+const ggml::spacemit::tensor_traits_base * ggml_spacemit_get_tensor_traits(const ggml_tensor * op);
+bool ggml_spacemit_get_work_size(int n_threads, const ggml_tensor * op, size_t * size);
+bool ggml_spacemit_compute_forward(ggml::spacemit::context & ctx, ggml_tensor * op);
+int ggml_riscv64_spacemit_repack_tensor(ggml_tensor * tensor, const void * data, size_t size);
+size_t ggml_spacemit_nbytes(ggml_backend_buffer_type_t buft, const ggml_tensor * tensor);

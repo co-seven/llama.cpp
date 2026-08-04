@@ -7,6 +7,7 @@
 
 #include <algorithm>
 #include <mutex>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -19,30 +20,15 @@
 #include "spacemit-session.h"
 #include "spacemit-kernels.h"
 #include "spacemit-opnode.h"
+#include "spacemit-context.h"
 
-#include "ime_env.h"
+#include "ime.h"
 #include "repack.h"
+#include "spacemit-env.h"
 #include "spine_mem_pool.h"
 #include "rvv_kernels.h"
 
-#include "ggml-cpu-impl.h"
-#include "traits.h"
 #include "ggml-cpu.h"
-
-// Defined in ime.cpp
-const ggml::cpu::tensor_traits * ggml_riscv64_spacemit_get_optimal_repack_type(const ggml_tensor * cur);
-int ggml_riscv64_spacemit_repack_tensor(ggml_tensor * tensor, const void * data, size_t size);
-extern "C" ggml_backend_buffer_type_t ggml_backend_cpu_riscv64_spacemit_buffer_type(void);
-
-void * ggml_spacemit_create_extra_buffer_type();
-
-// Op dispatch: use SPACEMIT's own extra_buffer_type. No ggml-cpu fallback.
-bool ggml_spacemit_compute_forward(struct ggml_compute_params * params, struct ggml_tensor * op);
-
-// TCM buffer accessors (defined in ime.cpp, operate on thread-local tls_context)
-void ggml_spacemit_set_tcm_buffer(void * ptr, size_t size);
-void ggml_spacemit_get_tcm_buffer(void ** ptr, size_t * size);
-void ggml_spacemit_set_spert_ctx(void * ctx);
 
 // spine-runtime C++ API (hard dependency)
 #include <spert.hpp>
@@ -50,12 +36,8 @@ void ggml_spacemit_set_spert_ctx(void * ctx);
 
 using namespace ggml::cpu::riscv64_spacemit;
 
-//** global_spine_env_info replacement (replaces ime_env.cpp)
-//
-// ime_env.cpp is excluded from the ggml-spacemit build. We provide
-// global_spine_env_info here, initialized from spert::backend_info()
-// and the GGML_SPACEMIT_WORKERS environment variable instead of
-// /proc/cpuinfo parsing.
+// global_spine_env_info is initialized from spert::backend_info() and
+// GGML_SPACEMIT_WORKERS instead of parsing /proc/cpuinfo.
 
 namespace ggml::cpu::riscv64_spacemit {
 
@@ -89,8 +71,6 @@ spine_env_info::spine_env_info() {
         num_cores = (int) info.num_cores;
         if (num_cores <= 0) num_cores = 1;
     }
-    num_perfer_cores = num_cores;
-
     mem_backend = spine_mem_pool_backend::transparent_hugepage;
     const char * mem_backend_str = getenv("SPACEMIT_MEM_BACKEND");
     if (mem_backend_str) {
@@ -103,44 +83,20 @@ spine_env_info::spine_env_info() {
         }
     }
 
-    // TCM detection: disabled in spert backend mode (no perfer_core_ids)
-    // TCM requires /proc/cpuinfo-based core enumeration which is not available
-    // when using spert::backend_info() for hardware detection.
-    use_tcm = false;
-
     // Allocate init_barrier (needed by ime.cpp kernel barriers)
-    const size_t init_barrier_size = sizeof(spine_barrier_t) * spine_init_barrier_count;
-    init_barrier =
-        static_cast<spine_barrier_t *>(spine_mem_pool_shared_mem_alloc(init_barrier_size, alignof(spine_barrier_t)));
-    if (init_barrier != nullptr) {
-        init_barrier_is_shared_mem = true;
-    } else {
-        init_barrier = new spine_barrier_t[spine_init_barrier_count];
-    }
+    init_barrier = new spine_barrier_t[spine_init_barrier_count];
     spine_barrier_init(init_barrier, spine_init_barrier_count, 2);
 
-    GGML_LOG_INFO("ggml-spacemit: num_cores=%d, arch_id=0x%x, vlen=%zu, shared_mem=%zu, use_ime1=%d, use_ime2=%d, use_tcm=%d\n",
-                  num_cores, (unsigned) arch, info.vlen, info.shared_mem_size, use_ime1, use_ime2, use_tcm);
+    GGML_LOG_INFO("ggml-spacemit: num_cores=%d, arch_id=0x%x, vlen=%zu, shared_mem=%zu, use_ime1=%d, use_ime2=%d\n",
+                  num_cores, (unsigned) arch, info.vlen, info.shared_mem_size, use_ime1, use_ime2);
 }
 
 spine_env_info::~spine_env_info() {
-    if (init_barrier_is_shared_mem) {
-        spine_mem_pool_shared_mem_free(init_barrier);
-    } else {
-        delete[] init_barrier;
-    }
-    init_barrier               = nullptr;
-    init_barrier_is_shared_mem = false;
+    delete[] init_barrier;
+    init_barrier = nullptr;
 }
 
 spine_env_info global_spine_env_info;
-
-bool spine_core_info::get_spine_core_info(std::vector<spine_core_info> & result) {
-    // No longer parses /proc/cpuinfo. Returns empty — callers in ime.cpp
-    // handle the empty case by using global_spine_env_info fields directly.
-    result.clear();
-    return true;
-}
 
 }  // namespace ggml::cpu::riscv64_spacemit
 
@@ -325,7 +281,7 @@ static void * ggml_backend_spacemit_buffer_get_base(ggml_backend_buffer_t buffer
 static enum ggml_status ggml_backend_spacemit_buffer_init_tensor(ggml_backend_buffer_t buffer,
                                                                    ggml_tensor *         tensor) {
     tensor->extra =
-        (void *) const_cast<ggml::cpu::tensor_traits *>(ggml_riscv64_spacemit_get_optimal_repack_type(tensor));
+        (void *) const_cast<ggml::spacemit::tensor_traits_base *>(ggml_spacemit_get_optimal_repack_type(tensor));
 
     GGML_UNUSED(buffer);
 
@@ -416,13 +372,7 @@ static size_t ggml_backend_spacemit_buffer_type_get_max_size(ggml_backend_buffer
 }
 
 static size_t ggml_backend_spacemit_buffer_type_get_alloc_size(ggml_backend_buffer_type_t buft, const ggml_tensor * tensor) {
-    // Delegate to the CPU spacemit buffer type which computes repacked size
-    auto cpu_buft = ggml_backend_cpu_riscv64_spacemit_buffer_type();
-    if (cpu_buft && cpu_buft->iface.get_alloc_size) {
-        return cpu_buft->iface.get_alloc_size(cpu_buft, tensor);
-    }
-    return ggml_nbytes(tensor);
-    GGML_UNUSED(buft);
+    return ggml_spacemit_nbytes(buft, tensor);
 }
 
 static bool ggml_backend_spacemit_buffer_type_is_host(ggml_backend_buffer_type_t buft) {
@@ -443,7 +393,7 @@ static ggml_backend_buffer_type_t ggml_backend_spacemit_buffer_type(ggml_backend
     static struct ggml_backend_buffer_type buft_s = {
         /* .iface   = */ ggml_backend_spacemit_buffer_type_interface,
         /* .device  = */ nullptr,
-        /* .context = */ ggml_spacemit_create_extra_buffer_type(),
+        /* .context = */ nullptr,
     };
     if (buft_s.device == nullptr) {
         buft_s.device = dev;
@@ -473,13 +423,24 @@ static ggml_status ggml_backend_spacemit_graph_compute(ggml_backend_t backend, g
     SPACEMIT_VERBOSE("ggml-spacemit: %s graph-compute n_nodes %d\n", sess->c_name(), graph->n_nodes);
 
     int n_threads = sess->num_cores > 0 ? sess->num_cores : 1;
+    size_t workspace_size = 0;
+    for (int i = 0; i < graph->n_nodes; ++i) {
+        ggml_tensor * node = graph->nodes[i];
+        if (!op_is_compute(node)) {
+            continue;
+        }
 
-    struct ggml_cplan cplan = ggml_graph_plan(graph, n_threads, NULL);
+        size_t node_workspace_size = 0;
+        if (ggml_spacemit_get_work_size(n_threads, node, &node_workspace_size)) {
+            workspace_size = std::max(workspace_size, node_workspace_size);
+        }
+    }
 
-    if (cplan.work_size > 0) {
-        cplan.work_data = (uint8_t *) malloc(cplan.work_size);
-        if (cplan.work_data == nullptr) {
-            GGML_LOG_ERROR("ggml-spacemit: failed to allocate work buffer (%zu bytes)\n", cplan.work_size);
+    uint8_t * workspace = nullptr;
+    if (workspace_size > 0) {
+        workspace = (uint8_t *) malloc(workspace_size);
+        if (workspace == nullptr) {
+            GGML_LOG_ERROR("ggml-spacemit: failed to allocate work buffer (%zu bytes)\n", workspace_size);
             return GGML_STATUS_ALLOC_FAILED;
         }
     }
@@ -487,73 +448,58 @@ static ggml_status ggml_backend_spacemit_graph_compute(ggml_backend_t backend, g
     spert::Stream stream(sess->num_cores);
     if (!stream.valid()) {
         GGML_LOG_ERROR("ggml-spacemit: failed to create spert stream\n");
-        free(cplan.work_data);
+        free(workspace);
         return GGML_STATUS_FAILED;
     }
 
-    ggml_tensor ** nodes = graph->nodes;
-    int            n_nodes = graph->n_nodes;
-    size_t         wsize  = cplan.work_size;
-    uint8_t *      wdata  = cplan.work_data;
+    ggml_tensor ** nodes   = graph->nodes;
+    int             n_nodes = graph->n_nodes;
 
     auto fut = stream.launch(
         spert::Grid{(uint32_t)n_threads},
-        [nodes, n_nodes, wsize, wdata, shared_mem_size = spert::backend_info().shared_mem_size](spert::Context * ctx) {
-            uint32_t ith = ctx->program_id(0);
-            uint32_t nth = ctx->grid_dim(0);
-
-            // Allocate TCM from spert shared memory for this CC core.
-            // forward_mul_mat in ime.cpp reads tls_context.tcm_buffer.
-            if (shared_mem_size > 0) {
-                auto sb = ctx->alloc_shared(shared_mem_size);
-                if (sb) {
-                    ggml_spacemit_set_tcm_buffer(sb.data, sb.size);
-                }
+        [nodes, n_nodes, workspace_size, workspace,
+         shared_mem_size = spert::backend_info().shared_mem_size](spert::Context * runtime) {
+            auto shared = shared_mem_size > 0 ? runtime->alloc_shared(shared_mem_size) : spert::SharedBufferView{};
+            if (shared_mem_size > 0 && !shared) {
+                throw std::runtime_error("ggml-spacemit: failed to allocate shared memory");
             }
 
-            // Store spert ctx for in-kernel ctx->sync() calls
-            ggml_spacemit_set_spert_ctx(ctx);
-
-            ggml_compute_params params;
-            params.ith        = (int)ith;
-            params.nth        = (int)nth;
-            params.wsize      = wsize;
-            params.wdata      = wdata;
-            params.threadpool = nullptr;
-            params.use_ref    = false;
+            ggml::spacemit::context ctx{
+                *runtime,
+                runtime->program_id(0),
+                runtime->grid_dim(0),
+                workspace,
+                workspace_size,
+                shared,
+            };
 
             for (int i = 0; i < n_nodes; i++) {
                 ggml_tensor * node = nodes[i];
 
-                if (ggml_op_is_empty(node->op) || ggml_is_empty(node)) {
-                    continue;
-                }
-                if ((node->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
+                if (!op_is_compute(node)) {
                     continue;
                 }
 
-                ggml_spacemit_compute_forward(&params, node);
-
-                if (i + 1 < n_nodes) {
-                    ctx->sync();
+                if (!ggml_spacemit_compute_forward(ctx, node)) {
+                    throw std::runtime_error(std::string("ggml-spacemit: failed to dispatch op ") +
+                                             ggml_op_desc(node) + " (" + ggml_type_name(node->type) + ")");
                 }
+
+                ctx.sync();
             }
 
-            // Release TCM allocation
-            void * tcm_ptr = nullptr;
-            size_t tcm_sz = 0;
-            ggml_spacemit_get_tcm_buffer(&tcm_ptr, &tcm_sz);
-            if (tcm_ptr) {
-                spert::SharedBufferView sb{tcm_ptr, tcm_sz};
-                ctx->free_shared(sb);
-                ggml_spacemit_set_tcm_buffer(nullptr, 0);
+            if (shared) {
+                runtime->free_shared(shared);
             }
         }
     );
 
-    fut.sync();
+    const spert::Status status = fut.sync();
 
-    free(cplan.work_data);
+    free(workspace);
+    if (status != spert::Status::Ok) {
+        return GGML_STATUS_FAILED;
+    }
     return GGML_STATUS_SUCCESS;
 }
 
@@ -669,8 +615,6 @@ static bool ggml_backend_spacemit_device_supports_op(ggml_backend_dev_t dev, con
         return false;
     }
 
-    // Claim all ops that the spacemit kernels can handle.
-    // tensor_traits->compute_forward will dispatch to IME1/IME2/RVV kernels.
     bool supp = false;
     switch (op->op) {
         case GGML_OP_NONE:
@@ -682,24 +626,15 @@ static bool ggml_backend_spacemit_device_supports_op(ggml_backend_dev_t dev, con
             break;
 
         case GGML_OP_MUL_MAT:
-            supp = ggml_is_quantized(op->src[0]->type) ||
-                   op->src[0]->type == GGML_TYPE_F16 ||
-                   op->src[0]->type == GGML_TYPE_F32;
-            break;
-
         case GGML_OP_MUL_MAT_ID:
-            supp = ggml_is_quantized(op->src[0]->type);
-            break;
-
         case GGML_OP_RMS_NORM:
         case GGML_OP_NORM:
         case GGML_OP_ADD:
         case GGML_OP_SUB:
         case GGML_OP_MUL:
         case GGML_OP_DIV:
-        case GGML_OP_ROPE:
-        case GGML_OP_SOFT_MAX:
         case GGML_OP_UNARY:
+        case GGML_OP_GLU:
         case GGML_OP_GET_ROWS:
         case GGML_OP_CONCAT:
         case GGML_OP_CPY:
@@ -707,7 +642,7 @@ static bool ggml_backend_spacemit_device_supports_op(ggml_backend_dev_t dev, con
         case GGML_OP_REPEAT:
         case GGML_OP_SUM_ROWS:
         case GGML_OP_FLASH_ATTN_EXT:
-            supp = true;
+            supp = ggml_spacemit_get_tensor_traits(op) != nullptr;
             break;
 
         default:
