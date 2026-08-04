@@ -388,7 +388,9 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS> class tensor_
             }
         }
 
-        ggml_barrier(params->threadpool);
+        if (params->threadpool) {
+            ggml_barrier(params->threadpool);
+        }
 
         const int64_t gemm_m_stride     = gemm_n / gemm_m > 64 ? gemm_m : 16;
         const int64_t gemm_m_blocked    = spacemit_kernels::div_round_up(gemm_m, gemm_m_stride);
@@ -737,7 +739,9 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS> class tensor_
         GGML_ASSERT(barrier_idx < spine_init_barrier_count);
         spine_barrier_t * cur_barrier = &global_spine_env_info.init_barrier[barrier_idx];
 
-        ggml_barrier(params->threadpool);
+        if (params->threadpool) {
+            ggml_barrier(params->threadpool);
+        }
 
         const size_t row_stride_b      = b_k_blks * get_repacked_block_type_size<BLOC_TYPE, INTER_SIZE, NB_COLS>();
         const size_t expert_b_stride   = ne01 * row_stride_b;
@@ -1250,12 +1254,14 @@ class tensor_traits_common : public tensor_traits_base {
 
         int64_t nchunk = nth;
 
-        if (ith == 0) {
+        if (ith == 0 && params->threadpool) {
             // Every thread starts at ith, so the first unprocessed chunk is nth.  This save a bit of coordination right at the start.
             ggml_threadpool_chunk_set(params->threadpool, nth);
         }
 
-        ggml_barrier(params->threadpool);
+        if (params->threadpool) {
+            ggml_barrier(params->threadpool);
+        }
 
         // The number of elements in each chunk
         const int64_t dr = (nr + nchunk - 1) / nchunk;
@@ -1277,7 +1283,11 @@ class tensor_traits_common : public tensor_traits_base {
                     ggml::cpu::riscv64_spacemit::tls_context.tcm_buffer_size);
             }
 
-            current_chunk = ggml_threadpool_chunk_add(params->threadpool, 1);
+            if (params->threadpool) {
+                current_chunk = ggml_threadpool_chunk_add(params->threadpool, 1);
+            } else {
+                current_chunk += 1;
+            }
         }
     }
 

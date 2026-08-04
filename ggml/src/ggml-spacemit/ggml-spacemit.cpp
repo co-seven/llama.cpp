@@ -449,10 +449,6 @@ static ggml_status ggml_backend_spacemit_graph_compute(ggml_backend_t backend, g
 
     SPACEMIT_VERBOSE("ggml-spacemit: %s graph-compute n_nodes %d\n", sess->c_name(), graph->n_nodes);
 
-    // Use the standard ggml_graph_compute pipeline with a CPU threadpool.
-    // The spacemit IME/RVV kernels (via tensor_traits->compute_forward) are
-    // invoked for each op, using ith/nth for data parallelism and
-    // spine_barrier_wait for inter-thread synchronization.
     int n_threads = sess->num_cores > 0 ? sess->num_cores : 1;
 
     struct ggml_cplan cplan = ggml_graph_plan(graph, n_threads, NULL);
@@ -466,21 +462,113 @@ static ggml_status ggml_backend_spacemit_graph_compute(ggml_backend_t backend, g
     }
 
 #if SPACEMIT_HAS_SPERT
-    // Acquire CC cores for the duration of graph compute.
-    // The Stream is RAII; cores are released when graph_compute returns.
     spert::Stream stream(sess->num_cores);
     if (!stream.valid()) {
         GGML_LOG_ERROR("ggml-spacemit: failed to create spert stream\n");
         free(cplan.work_data);
         return GGML_STATUS_FAILED;
     }
-#endif
 
-    enum ggml_status status = ggml_graph_compute(graph, &cplan);
+    ggml_tensor ** nodes = graph->nodes;
+    int            n_nodes = graph->n_nodes;
+    size_t         wsize  = cplan.work_size;
+    uint8_t *      wdata  = cplan.work_data;
+
+    auto fut = stream.launch(
+        spert::Grid{(uint32_t)n_threads},
+        [nodes, n_nodes, wsize, wdata](spert::Context * ctx) {
+            uint32_t ith = ctx->program_id(0);
+            uint32_t nth = ctx->grid_dim(0);
+
+            ggml_compute_params params;
+            params.ith        = (int)ith;
+            params.nth        = (int)nth;
+            params.wsize      = wsize;
+            params.wdata      = wdata;
+            params.threadpool = nullptr;
+            params.use_ref    = false;
+
+            for (int i = 0; i < n_nodes; i++) {
+                ggml_tensor * node = nodes[i];
+
+                if (ggml_op_is_empty(node->op) || ggml_is_empty(node)) {
+                    continue;
+                }
+                if ((node->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
+                    continue;
+                }
+
+                if (!ggml_cpu_extra_compute_forward(&params, node)) {
+                    switch (node->op) {
+                        case GGML_OP_RMS_NORM:
+                            ggml_compute_forward_rms_norm(&params, node);
+                            break;
+                        case GGML_OP_NORM:
+                            ggml_compute_forward_norm(&params, node);
+                            break;
+                        case GGML_OP_ADD:
+                            ggml_compute_forward_add(&params, node);
+                            break;
+                        case GGML_OP_SUB:
+                            ggml_compute_forward_sub(&params, node);
+                            break;
+                        case GGML_OP_MUL:
+                            ggml_compute_forward_mul(&params, node);
+                            break;
+                        case GGML_OP_DIV:
+                            ggml_compute_forward_div(&params, node);
+                            break;
+                        case GGML_OP_ROPE:
+                            ggml_compute_forward_rope(&params, node);
+                            break;
+                        case GGML_OP_SOFT_MAX:
+                            ggml_compute_forward_soft_max(&params, node);
+                            break;
+                        case GGML_OP_UNARY:
+                            ggml_compute_forward_unary(&params, node);
+                            break;
+                        case GGML_OP_CONCAT:
+                            ggml_compute_forward_concat(&params, node);
+                            break;
+                        case GGML_OP_GET_ROWS:
+                            ggml_compute_forward_get_rows(&params, node);
+                            break;
+                        case GGML_OP_CPY:
+                            ggml_compute_forward_cpy(&params, node);
+                            break;
+                        case GGML_OP_CONT:
+                            ggml_compute_forward_cont(&params, node);
+                            break;
+                        case GGML_OP_REPEAT:
+                            ggml_compute_forward_repeat(&params, node);
+                            break;
+                        case GGML_OP_SUM_ROWS:
+                            ggml_compute_forward_sum_rows(&params, node);
+                            break;
+                        case GGML_OP_FLASH_ATTN_EXT:
+                            ggml_compute_forward_flash_attn_ext(&params, node);
+                            break;
+                        default:
+                            break;
+                    }
+                }
+
+                if (i + 1 < n_nodes) {
+                    ctx->sync();
+                }
+            }
+        }
+    );
+
+    fut.sync();
 
     free(cplan.work_data);
-
+    return GGML_STATUS_SUCCESS;
+#else
+    enum ggml_status status = ggml_graph_compute(graph, &cplan);
+    free(cplan.work_data);
     return status;
+#endif
 }
 
 static void ggml_backend_spacemit_synchronize(ggml_backend_t backend) {
@@ -611,12 +699,21 @@ static bool ggml_backend_spacemit_device_supports_op(ggml_backend_dev_t dev, con
             break;
 
         case GGML_OP_RMS_NORM:
+        case GGML_OP_NORM:
         case GGML_OP_ADD:
+        case GGML_OP_SUB:
+        case GGML_OP_MUL:
+        case GGML_OP_DIV:
         case GGML_OP_ROPE:
         case GGML_OP_SOFT_MAX:
         case GGML_OP_UNARY:
         case GGML_OP_GET_ROWS:
         case GGML_OP_CONCAT:
+        case GGML_OP_CPY:
+        case GGML_OP_CONT:
+        case GGML_OP_REPEAT:
+        case GGML_OP_SUM_ROWS:
+        case GGML_OP_FLASH_ATTN_EXT:
             supp = true;
             break;
 
