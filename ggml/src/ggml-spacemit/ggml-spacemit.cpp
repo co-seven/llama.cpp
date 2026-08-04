@@ -30,6 +30,12 @@
 #include "ops.h"
 #include "binary-ops.h"
 #include "traits.h"
+#include "ggml-cpu.h"
+
+// Defined in ime.cpp
+const ggml::cpu::tensor_traits * ggml_riscv64_spacemit_get_optimal_repack_type(const ggml_tensor * cur);
+int ggml_riscv64_spacemit_repack_tensor(ggml_tensor * tensor, const void * data, size_t size);
+extern "C" ggml_backend_buffer_type_t ggml_backend_cpu_riscv64_spacemit_buffer_type(void);
 
 // spine-runtime C++ API (hard dependency)
 #include <spert.hpp>
@@ -90,16 +96,10 @@ spine_env_info::spine_env_info() {
         }
     }
 
-    // TCM detection (optional, same as ime_env.cpp but simplified)
-    const char * disable_tcm = getenv("SPACEMIT_DISABLE_TCM");
-    bool user_disable_tcm = disable_tcm && strcmp(disable_tcm, "0") != 0;
-    if (!user_disable_tcm) {
-        spine_mem_pool_tcm_info tcm_info;
-        if (spine_mem_pool_tcm_init(&tcm_info)) {
-            use_tcm      = tcm_info.available;
-            tcm_blk_size = tcm_info.blk_size;
-        }
-    }
+    // TCM detection: disabled in spert backend mode (no perfer_core_ids)
+    // TCM requires /proc/cpuinfo-based core enumeration which is not available
+    // when using spert::backend_info() for hardware detection.
+    use_tcm = false;
 
     // Allocate init_barrier (needed by ime.cpp kernel barriers)
     const size_t init_barrier_size = sizeof(spine_barrier_t) * spine_init_barrier_count;
@@ -317,8 +317,8 @@ static void * ggml_backend_spacemit_buffer_get_base(ggml_backend_buffer_t buffer
 
 static enum ggml_status ggml_backend_spacemit_buffer_init_tensor(ggml_backend_buffer_t buffer,
                                                                    ggml_tensor *         tensor) {
-    tensor->extra = nullptr;
-    // TODO: set tensor->extra to optimal repack type when repack is integrated
+    tensor->extra =
+        (void *) const_cast<ggml::cpu::tensor_traits *>(ggml_riscv64_spacemit_get_optimal_repack_type(tensor));
 
     GGML_UNUSED(buffer);
 
@@ -352,9 +352,8 @@ static void ggml_backend_spacemit_buffer_set_tensor(ggml_backend_buffer_t buffer
     GGML_ASSERT(offset == 0);
     GGML_ASSERT(size == ggml_nbytes(tensor));
 
-    // TODO: invoke repack when tensor->extra is set to a repack traits
-
-    memcpy(tensor->data, data, size);
+    auto ok = ggml_riscv64_spacemit_repack_tensor(tensor, data, size);
+    GGML_ASSERT(ok == 0);
 
     GGML_UNUSED(buffer);
 }
@@ -420,16 +419,17 @@ static ggml_backend_buffer_type_i ggml_backend_spacemit_buffer_type_interface = 
 };
 
 static ggml_backend_buffer_type_t ggml_backend_spacemit_buffer_type(ggml_backend_dev_t dev) {
-    static ggml_backend_buffer_type buft = {
-        /* .iface   = */ ggml_backend_spacemit_buffer_type_interface,
-        /* .device  = */ dev,
-        /* .context = */ nullptr,
-    };
-    return &buft;
+    // Use the same buffer type as ggml-cpu/spacemit so that
+    // extra_buffer_type::get_tensor_traits() can match src[0]->buffer->buft.
+    auto buft = ggml_backend_cpu_riscv64_spacemit_buffer_type();
+    if (buft->device == nullptr) {
+        buft->device = dev;
+    }
+    return buft;
 }
 
 static bool ggml_backend_buffer_is_spacemit(const struct ggml_backend_buffer * b) {
-    return b && b->buft && b->buft->iface.get_alignment == ggml_backend_spacemit_buffer_type_get_alignment;
+    return b && b->buft == ggml_backend_cpu_riscv64_spacemit_buffer_type();
 }
 
 //** backend interface
@@ -449,155 +449,38 @@ static ggml_status ggml_backend_spacemit_graph_compute(ggml_backend_t backend, g
 
     SPACEMIT_VERBOSE("ggml-spacemit: %s graph-compute n_nodes %d\n", sess->c_name(), graph->n_nodes);
 
-    const std::vector<spacemit_opnode> * nodes_ptr = nullptr;
-    std::vector<spacemit_opnode> computed_nodes;
+    // Use the standard ggml_graph_compute pipeline with a CPU threadpool.
+    // The spacemit IME/RVV kernels (via tensor_traits->compute_forward) are
+    // invoked for each op, using ith/nth for data parallelism and
+    // spine_barrier_wait for inter-thread synchronization.
+    int n_threads = sess->num_cores > 0 ? sess->num_cores : 1;
 
-    // check for cache hit
-    bool cache_hit = (graph->uid != 0 && sess->cached_graph.uid == graph->uid);
-    if (cache_hit) {
-        nodes_ptr = &sess->cached_graph.nodes;
-    } else {
-        computed_nodes.reserve(graph->n_nodes);
+    struct ggml_cplan cplan = ggml_graph_plan(graph, n_threads, NULL);
 
-        // fuse and finalize
-        for (int i = 0; i < graph->n_nodes; ++i) {
-            ggml_tensor * n = graph->nodes[i];
-            if (!op_is_compute(n)) {
-                continue;
-            }
-
-            if (try_fuse_node(graph, i, computed_nodes)) {
-                continue;
-            }
-
-            spacemit_opnode node(n, {}, SPACEMIT_OP_INVALID);
-            node.opcode = op_remap_to_spacemit(n);
-            computed_nodes.push_back(std::move(node));
-        }
-
-        if (graph->uid != 0) {
-            sess->cached_graph.uid = graph->uid;
-            sess->cached_graph.nodes = std::move(computed_nodes);
-            nodes_ptr = &sess->cached_graph.nodes;
-        } else {
-            nodes_ptr = &computed_nodes;
+    if (cplan.work_size > 0) {
+        cplan.work_data = (uint8_t *) malloc(cplan.work_size);
+        if (cplan.work_data == nullptr) {
+            GGML_LOG_ERROR("ggml-spacemit: failed to allocate work buffer (%zu bytes)\n", cplan.work_size);
+            return GGML_STATUS_ALLOC_FAILED;
         }
     }
 
 #if SPACEMIT_HAS_SPERT
-    // spert::Stream is created per graph_compute and RAII destructs at scope exit.
-    // It acquires CC cores on construction and releases them on destruction.
-    uint32_t num_cores = sess->num_cores > 0 ? sess->num_cores : 1;
-    spert::Stream stream(num_cores);
+    // Acquire CC cores for the duration of graph compute.
+    // The Stream is RAII; cores are released when graph_compute returns.
+    spert::Stream stream(sess->num_cores);
     if (!stream.valid()) {
         GGML_LOG_ERROR("ggml-spacemit: failed to create spert stream\n");
+        free(cplan.work_data);
         return GGML_STATUS_FAILED;
     }
-
-    // If no compute nodes, skip launch
-    if (nodes_ptr->empty()) {
-        return GGML_STATUS_SUCCESS;
-    }
-
-    // Copy node pointers into a flat array for the CC cores to iterate.
-    // The lambda captures raw pointers to ggml_tensor, which are in shared memory.
-    std::vector<ggml_tensor *> node_ptrs;
-    node_ptrs.reserve(nodes_ptr->size());
-    for (const auto & node : *nodes_ptr) {
-        node_ptrs.push_back(node.node);
-    }
-    size_t num_nodes = node_ptrs.size();
-    ggml_tensor ** nodes_arr = node_ptrs.data();
-
-    // Launch the entire graph as a single SPMD kernel.
-    // Each CC core (identified by program_id) processes every op in the graph,
-    // using ith/nth for data parallelism within each op.
-    // A grid barrier (ctx->sync()) between ops ensures all cores finish one op
-    // before moving to the next, preserving graph dependencies.
-    auto fut = stream.launch(
-        spert::Grid{num_cores},
-        [nodes_arr, num_nodes](spert::Context * ctx) {
-            uint32_t ith = ctx->program_id(0);
-            uint32_t nth = ctx->grid_dim(0);
-
-            ggml_compute_params params;
-            params.ith = (int)ith;
-            params.nth = (int)nth;
-            params.wsize = 0;
-            params.wdata = nullptr;
-            params.threadpool = nullptr;
-            params.use_ref = false;
-
-            for (size_t i = 0; i < num_nodes; i++) {
-                ggml_tensor * op = nodes_arr[i];
-
-                // dispatch based on the original ggml op, not the fused opcode
-                switch (op->op) {
-                    case GGML_OP_NONE:
-                    case GGML_OP_RESHAPE:
-                    case GGML_OP_VIEW:
-                    case GGML_OP_PERMUTE:
-                    case GGML_OP_TRANSPOSE:
-                        break;
-
-                    case GGML_OP_MUL_MAT:
-                    case GGML_OP_MUL_MAT_ID: {
-                        // use the spacemit IME kernels via tensor traits
-                        auto * traits = (ggml::cpu::tensor_traits *) op->src[0]->extra;
-                        if (traits && traits->compute_forward(&params, op)) {
-                            break;
-                        }
-                        // fallback to generic
-                        ggml_compute_forward_mul_mat(&params, op);
-                        break;
-                    }
-
-                    case GGML_OP_RMS_NORM:
-                        if (op->src[0]->type == GGML_TYPE_F32) {
-                            spacemit_kernels::rvv::forward_rms_norm_f32(&params, op);
-                        } else {
-                            ggml_compute_forward_rms_norm(&params, op);
-                        }
-                        break;
-
-                    case GGML_OP_ADD:
-                        if (op->src[0]->type == GGML_TYPE_F32) {
-                            spacemit_kernels::rvv::forward_binary<GGML_OP_ADD, float>(&params, op);
-                        } else {
-                            ggml_compute_forward_add(&params, op);
-                        }
-                        break;
-
-                    case GGML_OP_UNARY:
-                        ggml_compute_forward_unary(&params, op);
-                        break;
-
-                    case GGML_OP_ROPE:
-                        ggml_compute_forward_rope(&params, op);
-                        break;
-
-                    case GGML_OP_SOFT_MAX:
-                        ggml_compute_forward_soft_max(&params, op);
-                        break;
-
-                    default:
-                        break;
-                }
-
-                // grid barrier: all cores finish this op before the next one
-                ctx->sync();
-            }
-        }
-    );
-
-    fut.sync();
-
-    // Stream destructs here, releasing CC cores (RAII)
-    return GGML_STATUS_SUCCESS;
-#else
-    GGML_UNUSED(nodes_ptr);
-    return GGML_STATUS_FAILED;
 #endif
+
+    enum ggml_status status = ggml_graph_compute(graph, &cplan);
+
+    free(cplan.work_data);
+
+    return status;
 }
 
 static void ggml_backend_spacemit_synchronize(ggml_backend_t backend) {
@@ -705,9 +588,8 @@ static bool ggml_backend_spacemit_device_supports_op(ggml_backend_dev_t dev, con
         return false;
     }
 
-    // Phase 2: claim compute ops for SPMD dispatch via spert::Stream::launch.
-    // Each graph_compute creates a Stream, launches the entire graph as one
-    // SPMD kernel, and syncs. CC cores use ith/nth for intra-op parallelism.
+    // Claim all ops that the spacemit kernels can handle.
+    // tensor_traits->compute_forward will dispatch to IME1/IME2/RVV kernels.
     bool supp = false;
     switch (op->op) {
         case GGML_OP_NONE:
@@ -715,6 +597,26 @@ static bool ggml_backend_spacemit_device_supports_op(ggml_backend_dev_t dev, con
         case GGML_OP_VIEW:
         case GGML_OP_PERMUTE:
         case GGML_OP_TRANSPOSE:
+            supp = true;
+            break;
+
+        case GGML_OP_MUL_MAT:
+            supp = ggml_is_quantized(op->src[0]->type) ||
+                   op->src[0]->type == GGML_TYPE_F16 ||
+                   op->src[0]->type == GGML_TYPE_F32;
+            break;
+
+        case GGML_OP_MUL_MAT_ID:
+            supp = ggml_is_quantized(op->src[0]->type);
+            break;
+
+        case GGML_OP_RMS_NORM:
+        case GGML_OP_ADD:
+        case GGML_OP_ROPE:
+        case GGML_OP_SOFT_MAX:
+        case GGML_OP_UNARY:
+        case GGML_OP_GET_ROWS:
+        case GGML_OP_CONCAT:
             supp = true;
             break;
 
@@ -730,7 +632,7 @@ static bool ggml_backend_spacemit_device_supports_op(ggml_backend_dev_t dev, con
 }
 
 static bool ggml_backend_spacemit_device_supports_buft(ggml_backend_dev_t dev, ggml_backend_buffer_type_t buft) {
-    return buft->iface.get_alignment == ggml_backend_spacemit_buffer_type_get_alignment;
+    return buft == ggml_backend_cpu_riscv64_spacemit_buffer_type();
     GGML_UNUSED(dev);
 }
 

@@ -1310,7 +1310,8 @@ static const tensor_traits_common               rvv_impl;
 
 }  // namespace ggml::cpu::riscv64_spacemit
 
-static const ggml::cpu::tensor_traits * ggml_riscv64_spacemit_get_optimal_repack_type(const ggml_tensor * cur) {
+__attribute__((visibility("default")))
+const ggml::cpu::tensor_traits * ggml_riscv64_spacemit_get_optimal_repack_type(const ggml_tensor * cur) {
     switch (cur->type) {
         case GGML_TYPE_Q2_K:
             {
@@ -1504,11 +1505,23 @@ static void ggml_backend_riscv64_spacemit_buffer_set_tensor(ggml_backend_buffer_
     GGML_ASSERT(offset == 0);
     GGML_ASSERT(size == ggml_nbytes(tensor));
 
-    auto tensor_traits = (ggml::cpu::riscv64_spacemit::tensor_traits_base *) tensor->extra;
-    if (tensor_traits) {
-        auto OK = tensor_traits->repack(tensor, data, size);
+    auto traits = (ggml::cpu::riscv64_spacemit::tensor_traits_base *) tensor->extra;
+    if (traits) {
+        auto OK = traits->repack(tensor, data, size);
         GGML_ASSERT(OK == 0);
+    } else {
+        memcpy(tensor->data, data, size);
     }
+
+    GGML_UNUSED(buffer);
+}
+
+static void ggml_backend_riscv64_spacemit_buffer_get_tensor(ggml_backend_buffer_t buffer,
+                                                             const ggml_tensor *   tensor,
+                                                             void *                data,
+                                                             size_t                offset,
+                                                             size_t                size) {
+    memcpy(data, (const char *) tensor->data + offset, size);
 
     GGML_UNUSED(buffer);
 }
@@ -1519,7 +1532,7 @@ static const ggml_backend_buffer_i ggml_backend_riscv64_spacemit_buffer_i = {
     /* .init_tensor     = */ ggml_backend_riscv64_spacemit_buffer_init_tensor,
     /* .memset_tensor   = */ ggml_backend_riscv64_spacemit_buffer_memset_tensor,
     /* .set_tensor      = */ ggml_backend_riscv64_spacemit_buffer_set_tensor,
-    /* .get_tensor      = */ nullptr,
+    /* .get_tensor      = */ ggml_backend_riscv64_spacemit_buffer_get_tensor,
     /* .set_tensor_2d   = */ nullptr,
     /* .get_tensor_2d   = */ nullptr,
     /* .cpy_tensor      = */ nullptr,
@@ -1715,6 +1728,17 @@ class extra_buffer_type : ggml::cpu::extra_buffer_type {
 
 }  // namespace ggml::cpu::riscv64_spacemit
 
+__attribute__((visibility("default")))
+int ggml_riscv64_spacemit_repack_tensor(ggml_tensor * tensor, const void * data, size_t size) {
+    auto traits = (ggml::cpu::riscv64_spacemit::tensor_traits_base *) tensor->extra;
+    if (traits) {
+        return traits->repack(tensor, data, size);
+    }
+    memcpy(tensor->data, data, size);
+    return 0;
+}
+
+__attribute__((visibility("default")))
 ggml_backend_buffer_type_t ggml_backend_cpu_riscv64_spacemit_buffer_type(void) {
     static ggml_backend_buffer_type ggml_backend_cpu_buffer_type_riscv64_spacemit = {
   /* .iface    = */
@@ -1788,12 +1812,16 @@ void ggml_backend_cpu_riscv64_spacemit_set_numa_thread_affinity(int thread_n) {
 
     if (ggml::cpu::riscv64_spacemit::global_spine_env_info.use_tcm &&
         ggml::cpu::riscv64_spacemit::tls_context.cpu_id == -1) {
-        CPU_ZERO(&(ggml::cpu::riscv64_spacemit::tls_context.cpuset));
-        pthread_t    main_thread     = pthread_self();
         const auto & perfer_core_ids = ggml::cpu::riscv64_spacemit::global_spine_env_info.perfer_core_ids;
+        if (perfer_core_ids.empty()) {
+            // No core affinity info available (spert backend mode). Skip TCM setup.
+            return;
+        }
         if (thread_n < 0 || static_cast<size_t>(thread_n) >= perfer_core_ids.size()) {
             GGML_ABORT("thread_n %d exceeds perfer_core_ids size %zu\n", thread_n, perfer_core_ids.size());
         }
+        CPU_ZERO(&(ggml::cpu::riscv64_spacemit::tls_context.cpuset));
+        pthread_t    main_thread     = pthread_self();
         auto perfer_cpu_id = perfer_core_ids[static_cast<size_t>(thread_n)];
         CPU_SET(perfer_cpu_id, &(ggml::cpu::riscv64_spacemit::tls_context.cpuset));
         int s =

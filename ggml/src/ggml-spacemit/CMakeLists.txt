@@ -11,12 +11,20 @@ set(SPINE_RUNTIME_BUILD_TESTS OFF CACHE BOOL "" FORCE)
 set(SPINE_RUNTIME_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
 add_subdirectory(${SPINE_RUNTIME_DIR} ${CMAKE_BINARY_DIR}/spine-runtime-build)
 
-# ggml-spacemit and ggml-cpu/spacemit are mutually exclusive.
-# When GGML_SPACEMIT is ON, force GGML_CPU_RISCV64_SPACEMIT OFF.
+# When GGML_SPACEMIT is ON, disable GGML_CPU_RISCV64_SPACEMIT so ggml-cpu
+# does not compile its own copy of spacemit sources. Instead, ggml-spacemit
+# provides the kernel implementations and exports the functions that
+# ggml-cpu.c needs (thread affinity, TCM management).
 if(GGML_SPACEMIT AND GGML_CPU_RISCV64_SPACEMIT)
     message(STATUS "GGML_SPACEMIT is ON -> disabling GGML_CPU_RISCV64_SPACEMIT")
     set(GGML_CPU_RISCV64_SPACEMIT OFF CACHE BOOL "" FORCE)
 endif()
+
+# Always define GGML_USE_CPU_RISCV64_SPACEMIT on ggml-cpu so that
+# ggml_graph_compute uses the spacemit thread launch path
+# (set_numa_thread_affinity, tcm_mem_wait_all, etc.).
+# These functions are provided by ggml-spacemit (ime.cpp).
+target_compile_definitions(ggml-cpu PRIVATE GGML_USE_CPU_RISCV64_SPACEMIT)
 
 # Detect IME support (inline version of FindSMTIME.cmake)
 if(CMAKE_SYSTEM_PROCESSOR MATCHES "riscv")
