@@ -16,6 +16,7 @@
 #include "spine_mem_pool.h"
 #include "traits.h"
 #include "vec.h"
+#include <spert.hpp>
 
 #include <fcntl.h>
 #include <sys/mman.h>
@@ -77,6 +78,7 @@ struct TLSContext {
     cpu_set_t cpuset;
     void *    tcm_buffer{ nullptr };
     size_t    tcm_buffer_size{ 0 };
+    void *    spert_ctx{ nullptr };  // spert::Context* for ctx->sync() calls
 };
 
 thread_local TLSContext tls_context;
@@ -390,6 +392,8 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS> class tensor_
 
         if (params->threadpool) {
             ggml_barrier(params->threadpool);
+        } else if (ggml::cpu::riscv64_spacemit::tls_context.spert_ctx) {
+            ((spert::Context *) ggml::cpu::riscv64_spacemit::tls_context.spert_ctx)->sync();
         }
 
         const int64_t gemm_m_stride     = gemm_n / gemm_m > 64 ? gemm_m : 16;
@@ -741,6 +745,8 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS> class tensor_
 
         if (params->threadpool) {
             ggml_barrier(params->threadpool);
+        } else if (ggml::cpu::riscv64_spacemit::tls_context.spert_ctx) {
+            ((spert::Context *) ggml::cpu::riscv64_spacemit::tls_context.spert_ctx)->sync();
         }
 
         const size_t row_stride_b      = b_k_blks * get_repacked_block_type_size<BLOC_TYPE, INTER_SIZE, NB_COLS>();
@@ -1746,6 +1752,23 @@ int ggml_riscv64_spacemit_repack_tensor(ggml_tensor * tensor, const void * data,
     }
     memcpy(tensor->data, data, size);
     return 0;
+}
+
+__attribute__((visibility("default")))
+void ggml_spacemit_set_tcm_buffer(void * ptr, size_t size) {
+    ggml::cpu::riscv64_spacemit::tls_context.tcm_buffer      = ptr;
+    ggml::cpu::riscv64_spacemit::tls_context.tcm_buffer_size = size;
+}
+
+__attribute__((visibility("default")))
+void ggml_spacemit_get_tcm_buffer(void ** ptr, size_t * size) {
+    *ptr  = ggml::cpu::riscv64_spacemit::tls_context.tcm_buffer;
+    *size = ggml::cpu::riscv64_spacemit::tls_context.tcm_buffer_size;
+}
+
+__attribute__((visibility("default")))
+void ggml_spacemit_set_spert_ctx(void * ctx) {
+    ggml::cpu::riscv64_spacemit::tls_context.spert_ctx = ctx;
 }
 
 __attribute__((visibility("default")))

@@ -37,6 +37,11 @@ const ggml::cpu::tensor_traits * ggml_riscv64_spacemit_get_optimal_repack_type(c
 int ggml_riscv64_spacemit_repack_tensor(ggml_tensor * tensor, const void * data, size_t size);
 extern "C" ggml_backend_buffer_type_t ggml_backend_cpu_riscv64_spacemit_buffer_type(void);
 
+// TCM buffer accessors (defined in ime.cpp, operate on thread-local tls_context)
+void ggml_spacemit_set_tcm_buffer(void * ptr, size_t size);
+void ggml_spacemit_get_tcm_buffer(void ** ptr, size_t * size);
+void ggml_spacemit_set_spert_ctx(void * ctx);
+
 // spine-runtime C++ API (hard dependency)
 #include <spert.hpp>
 #define SPACEMIT_HAS_SPERT 1
@@ -112,8 +117,8 @@ spine_env_info::spine_env_info() {
     }
     spine_barrier_init(init_barrier, spine_init_barrier_count, 2);
 
-    GGML_LOG_INFO("ggml-spacemit: num_cores=%d, arch_id=0x%x, vlen=%zu, use_ime1=%d, use_ime2=%d, use_tcm=%d\n",
-                  num_cores, (unsigned) arch, info.vlen, use_ime1, use_ime2, use_tcm);
+    GGML_LOG_INFO("ggml-spacemit: num_cores=%d, arch_id=0x%x, vlen=%zu, shared_mem=%zu, use_ime1=%d, use_ime2=%d, use_tcm=%d\n",
+                  num_cores, (unsigned) arch, info.vlen, info.shared_mem_size, use_ime1, use_ime2, use_tcm);
 }
 
 spine_env_info::~spine_env_info() {
@@ -476,9 +481,21 @@ static ggml_status ggml_backend_spacemit_graph_compute(ggml_backend_t backend, g
 
     auto fut = stream.launch(
         spert::Grid{(uint32_t)n_threads},
-        [nodes, n_nodes, wsize, wdata](spert::Context * ctx) {
+        [nodes, n_nodes, wsize, wdata, shared_mem_size = spert::backend_info().shared_mem_size](spert::Context * ctx) {
             uint32_t ith = ctx->program_id(0);
             uint32_t nth = ctx->grid_dim(0);
+
+            // Allocate TCM from spert shared memory for this CC core.
+            // forward_mul_mat in ime.cpp reads tls_context.tcm_buffer.
+            if (shared_mem_size > 0) {
+                auto sb = ctx->alloc_shared(shared_mem_size);
+                if (sb) {
+                    ggml_spacemit_set_tcm_buffer(sb.data, sb.size);
+                }
+            }
+
+            // Store spert ctx for in-kernel ctx->sync() calls
+            ggml_spacemit_set_spert_ctx(ctx);
 
             ggml_compute_params params;
             params.ith        = (int)ith;
@@ -557,6 +574,16 @@ static ggml_status ggml_backend_spacemit_graph_compute(ggml_backend_t backend, g
                     ctx->sync();
                 }
             }
+
+            // Release TCM allocation
+            void * tcm_ptr = nullptr;
+            size_t tcm_sz = 0;
+            ggml_spacemit_get_tcm_buffer(&tcm_ptr, &tcm_sz);
+            if (tcm_ptr) {
+                spert::SharedBufferView sb{tcm_ptr, tcm_sz};
+                ctx->free_shared(sb);
+                ggml_spacemit_set_tcm_buffer(nullptr, 0);
+            }
         }
     );
 
@@ -633,8 +660,15 @@ static const char * ggml_backend_spacemit_device_get_description(ggml_backend_de
 }
 
 static void ggml_backend_spacemit_device_get_memory(ggml_backend_dev_t dev, size_t * free, size_t * total) {
-    *free  = 0;
-    *total = 0;
+    // SPACEMIT backend shares host memory (weights are in DRAM accessible by CC cores).
+    // Report available system memory so the scheduler assigns tensors to us.
+    size_t vfree = 0, vtotal = 0;
+    ggml_backend_dev_t cpu_dev = ggml_backend_reg_dev_get(ggml_backend_cpu_reg(), 0);
+    if (cpu_dev && cpu_dev->iface.get_memory) {
+        cpu_dev->iface.get_memory(cpu_dev, &vfree, &vtotal);
+    }
+    *free  = vfree;
+    *total = vtotal;
     GGML_UNUSED(dev);
 }
 
