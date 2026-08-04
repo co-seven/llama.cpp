@@ -484,7 +484,6 @@ static ggml_status ggml_backend_spacemit_graph_compute(ggml_backend_t backend, g
         }
     }
 
-#if SPACEMIT_HAS_SPERT
     spert::Stream stream(sess->num_cores);
     if (!stream.valid()) {
         GGML_LOG_ERROR("ggml-spacemit: failed to create spert stream\n");
@@ -556,11 +555,6 @@ static ggml_status ggml_backend_spacemit_graph_compute(ggml_backend_t backend, g
 
     free(cplan.work_data);
     return GGML_STATUS_SUCCESS;
-#else
-    enum ggml_status status = ggml_graph_compute(graph, &cplan);
-    free(cplan.work_data);
-    return status;
-#endif
 }
 
 static void ggml_backend_spacemit_synchronize(ggml_backend_t backend) {
