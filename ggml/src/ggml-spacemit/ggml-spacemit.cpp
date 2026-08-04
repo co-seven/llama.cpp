@@ -37,6 +37,106 @@
 
 using namespace ggml::cpu::riscv64_spacemit;
 
+//** global_spine_env_info replacement (replaces ime_env.cpp)
+//
+// ime_env.cpp is excluded from the ggml-spacemit build. We provide
+// global_spine_env_info here, initialized from spert::backend_info()
+// and the GGML_SPACEMIT_WORKERS environment variable instead of
+// /proc/cpuinfo parsing.
+
+namespace ggml::cpu::riscv64_spacemit {
+
+spine_env_info::spine_env_info() {
+    // Query spine-runtime for hardware info
+    spert::BackendInfo info = spert::backend_info();
+
+    // Determine IME support from the CC core architecture id
+    uint16_t arch = (uint16_t) info.core_arch_id;
+
+    // Map spert core_arch_id to spine_core_arch_id
+    // A100 = 0xA064, A200 = 0xA0C8, X100 = 0x5064
+    if ((arch >> 12) == 0xA) {
+        perfer_core_arch_id = spine_core_arch_id{ arch };
+    } else if ((arch >> 12) == 0x5) {
+        perfer_core_arch_id = spine_core_arch_id{ arch };
+    } else {
+        perfer_core_arch_id = spine_core_arch_id{ arch };
+    }
+
+    use_ime1 = perfer_core_arch_id == spine_core_arch_id::core_arch_a60 ||
+               perfer_core_arch_id == spine_core_arch_id::core_arch_x100;
+    use_ime2 = perfer_core_arch_id == spine_core_arch_id::core_arch_a100;
+
+    // num_cores from env, fallback to spert backend_info
+    const char * workers_str = getenv("GGML_SPACEMIT_WORKERS");
+    if (workers_str) {
+        num_cores = atoi(workers_str);
+        if (num_cores <= 0) num_cores = 1;
+    } else {
+        num_cores = (int) info.num_cores;
+        if (num_cores <= 0) num_cores = 1;
+    }
+    num_perfer_cores = num_cores;
+
+    mem_backend = spine_mem_pool_backend::transparent_hugepage;
+    const char * mem_backend_str = getenv("SPACEMIT_MEM_BACKEND");
+    if (mem_backend_str) {
+        if (strcmp(mem_backend_str, "hugepage") == 0) {
+            mem_backend = spine_mem_pool_backend::transparent_hugepage;
+        } else if (strcmp(mem_backend_str, "posix") == 0) {
+            mem_backend = spine_mem_pool_backend::posix_memalign;
+        } else if (strcmp(mem_backend_str, "hugetlb") == 0) {
+            mem_backend = spine_mem_pool_backend::hugetlb_1g;
+        }
+    }
+
+    // TCM detection (optional, same as ime_env.cpp but simplified)
+    const char * disable_tcm = getenv("SPACEMIT_DISABLE_TCM");
+    bool user_disable_tcm = disable_tcm && strcmp(disable_tcm, "0") != 0;
+    if (!user_disable_tcm) {
+        spine_mem_pool_tcm_info tcm_info;
+        if (spine_mem_pool_tcm_init(&tcm_info)) {
+            use_tcm      = tcm_info.available;
+            tcm_blk_size = tcm_info.blk_size;
+        }
+    }
+
+    // Allocate init_barrier (needed by ime.cpp kernel barriers)
+    const size_t init_barrier_size = sizeof(spine_barrier_t) * spine_init_barrier_count;
+    init_barrier =
+        static_cast<spine_barrier_t *>(spine_mem_pool_shared_mem_alloc(init_barrier_size, alignof(spine_barrier_t)));
+    if (init_barrier != nullptr) {
+        init_barrier_is_shared_mem = true;
+    } else {
+        init_barrier = new spine_barrier_t[spine_init_barrier_count];
+    }
+    spine_barrier_init(init_barrier, spine_init_barrier_count, 2);
+
+    GGML_LOG_INFO("ggml-spacemit: num_cores=%d, arch_id=0x%x, vlen=%zu, use_ime1=%d, use_ime2=%d, use_tcm=%d\n",
+                  num_cores, (unsigned) arch, info.vlen, use_ime1, use_ime2, use_tcm);
+}
+
+spine_env_info::~spine_env_info() {
+    if (init_barrier_is_shared_mem) {
+        spine_mem_pool_shared_mem_free(init_barrier);
+    } else {
+        delete[] init_barrier;
+    }
+    init_barrier               = nullptr;
+    init_barrier_is_shared_mem = false;
+}
+
+spine_env_info global_spine_env_info;
+
+bool spine_core_info::get_spine_core_info(std::vector<spine_core_info> & result) {
+    // No longer parses /proc/cpuinfo. Returns empty — callers in ime.cpp
+    // handle the empty case by using global_spine_env_info fields directly.
+    result.clear();
+    return true;
+}
+
+}  // namespace ggml::cpu::riscv64_spacemit
+
 //** static config
 
 static int  opt_verbose = 0;
@@ -672,9 +772,11 @@ ggml_spacemit_registry::ggml_spacemit_registry(ggml_backend_reg_t reg) {
 
         auto * sess = new spacemit_session();
 
-        // populate session from spine env info
+        // populate session from spert backend_info and env
+        spert::BackendInfo info = spert::backend_info();
         sess->num_cores = global_spine_env_info.num_cores;
         sess->arch_id   = static_cast<int64_t>(global_spine_env_info.perfer_core_arch_id);
+        sess->vlen      = (int64_t) info.vlen;
         sess->use_ime1  = global_spine_env_info.use_ime1;
         sess->use_ime2  = global_spine_env_info.use_ime2;
 

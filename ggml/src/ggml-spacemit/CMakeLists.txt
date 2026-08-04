@@ -11,6 +11,13 @@ set(SPINE_RUNTIME_BUILD_TESTS OFF CACHE BOOL "" FORCE)
 set(SPINE_RUNTIME_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
 add_subdirectory(${SPINE_RUNTIME_DIR} ${CMAKE_BINARY_DIR}/spine-runtime-build)
 
+# ggml-spacemit and ggml-cpu/spacemit are mutually exclusive.
+# When GGML_SPACEMIT is ON, force GGML_CPU_RISCV64_SPACEMIT OFF.
+if(GGML_SPACEMIT AND GGML_CPU_RISCV64_SPACEMIT)
+    message(STATUS "GGML_SPACEMIT is ON -> disabling GGML_CPU_RISCV64_SPACEMIT")
+    set(GGML_CPU_RISCV64_SPACEMIT OFF CACHE BOOL "" FORCE)
+endif()
+
 # Detect IME support (inline version of FindSMTIME.cmake)
 if(CMAKE_SYSTEM_PROCESSOR MATCHES "riscv")
     include(CheckCSourceCompiles)
@@ -38,12 +45,14 @@ if(CMAKE_SYSTEM_PROCESSOR MATCHES "riscv")
     message("RISCV64_SPACEMIT_IME_SPEC: ${RISCV64_SPACEMIT_IME_SPEC}")
 endif()
 
+# NOTE: ime_env.cpp is intentionally excluded. global_spine_env_info is
+# provided by ggml-spacemit.cpp, initialized from spert::backend_info()
+# and GGML_SPACEMIT_WORKERS env var.
 ggml_add_backend_library(${TARGET_NAME}
     ggml-spacemit.cpp
     ime.cpp
     ime1_kernels.cpp
     ime2_kernels.cpp
-    ime_env.cpp
     rvv_kernels.cpp
     repack.cpp
     spine_mem_pool.cpp
