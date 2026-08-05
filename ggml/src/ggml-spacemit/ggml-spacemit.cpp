@@ -416,28 +416,20 @@ static bool ggml_backend_buffer_is_spacemit(const struct ggml_backend_buffer * b
 
 //** backend interface
 
-// Persistent stream cleanup
-spacemit_session::~spacemit_session() {
-    if (stream_ptr) {
-        delete (spert::Stream *) stream_ptr;
-        stream_ptr = nullptr;
-    }
-}
-
 static const char * ggml_backend_spacemit_name(ggml_backend_t backend) {
     auto sess = static_cast<spacemit_session *>(backend->context);
     return sess->c_name();
 }
 
 static void ggml_backend_spacemit_free(ggml_backend_t backend) {
-    // The device registry owns the shared session and persistent stream.
+    // The device registry owns the shared session.
     delete backend;
 }
 
 static ggml_status ggml_backend_spacemit_graph_compute(ggml_backend_t backend, ggml_cgraph * graph) {
     auto sess = static_cast<spacemit_session *>(backend->context);
-    // All backend handles for this device share one hardware stream. Serialize
-    // creation and use to establish happens-before and avoid concurrent launch.
+    // Serialize hardware use across backend handles. The Stream itself remains
+    // graph-scoped so idle contexts do not retain CC hardware resources.
     std::lock_guard<std::mutex> stream_lock(sess->stream_mutex);
 
     SPACEMIT_VERBOSE("ggml-spacemit: %s graph-compute n_nodes %d\n", sess->c_name(), graph->n_nodes);
@@ -465,18 +457,12 @@ static ggml_status ggml_backend_spacemit_graph_compute(ggml_backend_t backend, g
         }
     }
 
-    // Reuse persistent spert::Stream across graph_compute calls.
-    if (sess->stream_ptr == nullptr) {
-        sess->stream_ptr = new spert::Stream(sess->num_cores);
-        if (!((spert::Stream *)sess->stream_ptr)->valid()) {
-            GGML_LOG_ERROR("ggml-spacemit: failed to create spert stream\n");
-            delete (spert::Stream *)sess->stream_ptr;
-            sess->stream_ptr = nullptr;
-            free(workspace);
-            return GGML_STATUS_FAILED;
-        }
+    spert::Stream stream(sess->num_cores);
+    if (!stream.valid()) {
+        GGML_LOG_ERROR("ggml-spacemit: failed to create spert stream\n");
+        free(workspace);
+        return GGML_STATUS_FAILED;
     }
-    auto & stream = *(spert::Stream *)sess->stream_ptr;
 
     ggml_tensor ** nodes   = graph->nodes;
     int             n_nodes = graph->n_nodes;

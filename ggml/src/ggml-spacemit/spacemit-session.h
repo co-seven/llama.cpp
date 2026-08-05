@@ -19,8 +19,7 @@ struct spacemit_session {
 
     std::string name = "SPACEMIT0";
 
-    // Persistent spert stream (created on first graph_compute, reused after).
-    void * stream_ptr = nullptr;  // spert::Stream*
+    // Serialize graph_compute calls because the hardware stream is exclusive.
     std::mutex stream_mutex;
 
     struct {
@@ -29,8 +28,6 @@ struct spacemit_session {
     } cached_graph;
 
     spacemit_session() = default;
-
-    ~spacemit_session();
 
     const char * c_name() const { return name.c_str(); }
 };
