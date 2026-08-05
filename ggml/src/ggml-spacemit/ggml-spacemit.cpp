@@ -48,15 +48,8 @@ spine_env_info::spine_env_info() {
     // Determine IME support from the CC core architecture id
     uint16_t arch = (uint16_t) info.core_arch_id;
 
-    // Map spert core_arch_id to spine_core_arch_id
     // A100 = 0xA064, A200 = 0xA0C8, X100 = 0x5064
-    if ((arch >> 12) == 0xA) {
-        perfer_core_arch_id = spine_core_arch_id{ arch };
-    } else if ((arch >> 12) == 0x5) {
-        perfer_core_arch_id = spine_core_arch_id{ arch };
-    } else {
-        perfer_core_arch_id = spine_core_arch_id{ arch };
-    }
+    perfer_core_arch_id = spine_core_arch_id{ arch };
 
     use_ime1 = perfer_core_arch_id == spine_core_arch_id::core_arch_a60 ||
                perfer_core_arch_id == spine_core_arch_id::core_arch_x100;
@@ -103,11 +96,7 @@ spine_env_info global_spine_env_info;
 
 //** static config
 
-static int  opt_verbose = 0;
 static int  opt_fusion  = 1;
-
-#define SPACEMIT_VERBOSE(...) \
-    if (opt_verbose) GGML_LOG_DEBUG(__VA_ARGS__)
 
 //** helpers
 
@@ -416,6 +405,10 @@ static bool ggml_backend_buffer_is_spacemit(const struct ggml_backend_buffer * b
 
 //** backend interface
 
+spacemit_session::~spacemit_session() {
+    free(workspace);
+}
+
 static const char * ggml_backend_spacemit_name(ggml_backend_t backend) {
     auto sess = static_cast<spacemit_session *>(backend->context);
     return sess->c_name();
@@ -432,7 +425,7 @@ static ggml_status ggml_backend_spacemit_graph_compute(ggml_backend_t backend, g
     // graph-scoped so idle contexts do not retain CC hardware resources.
     std::lock_guard<std::mutex> stream_lock(sess->stream_mutex);
 
-    SPACEMIT_VERBOSE("ggml-spacemit: %s graph-compute n_nodes %d\n", sess->c_name(), graph->n_nodes);
+    GGML_LOG_DEBUG("ggml-spacemit: %s graph-compute n_nodes %d\n", sess->c_name(), graph->n_nodes);
 
     int n_threads = sess->num_cores > 0 ? sess->num_cores : 1;
     size_t workspace_size = 0;
@@ -448,42 +441,39 @@ static ggml_status ggml_backend_spacemit_graph_compute(ggml_backend_t backend, g
         }
     }
 
-    uint8_t * workspace = nullptr;
-    if (workspace_size > 0) {
-        workspace = (uint8_t *) malloc(workspace_size);
-        if (workspace == nullptr) {
+    if (sess->workspace_size < workspace_size) {
+        void * new_workspace = realloc(sess->workspace, workspace_size);
+        if (new_workspace == nullptr) {
             GGML_LOG_ERROR("ggml-spacemit: failed to allocate work buffer (%zu bytes)\n", workspace_size);
             return GGML_STATUS_ALLOC_FAILED;
         }
+        sess->workspace      = new_workspace;
+        sess->workspace_size = workspace_size;
     }
+    auto * workspace = static_cast<uint8_t *>(sess->workspace);
 
     spert::Stream stream(sess->num_cores);
     if (!stream.valid()) {
         GGML_LOG_ERROR("ggml-spacemit: failed to create spert stream\n");
-        free(workspace);
         return GGML_STATUS_FAILED;
     }
 
     ggml_tensor ** nodes   = graph->nodes;
     int             n_nodes = graph->n_nodes;
 
+    auto * contexts = sess->contexts.data();
     auto fut = stream.launch(
         spert::Grid{(uint32_t)n_threads},
-        [nodes, n_nodes, workspace_size, workspace,
+        [nodes, n_nodes, workspace_size = sess->workspace_size, workspace, contexts,
          shared_mem_size = spert::backend_info().shared_mem_size](spert::Context * runtime) {
             auto shared = shared_mem_size > 0 ? runtime->alloc_shared(shared_mem_size) : spert::SharedBufferView{};
             if (shared_mem_size > 0 && !shared) {
                 throw std::runtime_error("ggml-spacemit: failed to allocate shared memory");
             }
 
-            ggml::spacemit::context ctx{
-                *runtime,
-                runtime->program_id(0),
-                runtime->grid_dim(0),
-                workspace,
-                workspace_size,
-                shared,
-            };
+            const uint32_t ith = runtime->program_id(0);
+            auto & ctx = contexts[ith];
+            ctx.reset(*runtime, ith, runtime->grid_dim(0), workspace, workspace_size, shared);
 
             for (int i = 0; i < n_nodes; i++) {
                 ggml_tensor * node = nodes[i];
@@ -506,12 +496,12 @@ static ggml_status ggml_backend_spacemit_graph_compute(ggml_backend_t backend, g
             if (shared) {
                 runtime->free_shared(shared);
             }
+            ctx.clear();
         }
     );
 
     const spert::Status status = fut.sync();
 
-    free(workspace);
     if (status != spert::Status::Ok) {
         return GGML_STATUS_FAILED;
     }
@@ -519,7 +509,6 @@ static ggml_status ggml_backend_spacemit_graph_compute(ggml_backend_t backend, g
 }
 
 static void ggml_backend_spacemit_synchronize(ggml_backend_t backend) {
-    SPACEMIT_VERBOSE("ggml-spacemit: synchronize\n");
     // graph_compute waits on its launch future before returning, so there is
     // no outstanding asynchronous work to synchronize here.
     GGML_UNUSED(backend);
@@ -666,8 +655,6 @@ static bool ggml_backend_spacemit_device_supports_op(ggml_backend_dev_t dev, con
             break;
     }
 
-    SPACEMIT_VERBOSE("ggml-spacemit: supports_op %s -> %d\n", ggml_op_desc(op), (int) supp);
-
     return supp;
 
     GGML_UNUSED(dev);
@@ -723,6 +710,7 @@ ggml_spacemit_registry::ggml_spacemit_registry(ggml_backend_reg_t reg) {
         sess->vlen      = (int64_t) info.vlen;
         sess->use_ime1  = global_spine_env_info.use_ime1;
         sess->use_ime2  = global_spine_env_info.use_ime2;
+        sess->contexts.resize(sess->num_cores);
 
         sess->name = "SPACEMIT" + std::to_string(i);
 
@@ -764,11 +752,9 @@ static void * ggml_backend_spacemit_get_proc_address(ggml_backend_reg_t reg, con
 }
 
 static void ggml_spacemit_init(ggml_backend_reg * reg) {
-    const char * str_verbose = getenv("GGML_SPACEMIT_VERBOSE");
     const char * str_fusion  = getenv("GGML_SPACEMIT_FUSION");
 
-    opt_verbose = str_verbose ? atoi(str_verbose) : 0;
-    opt_fusion  = str_fusion  ? atoi(str_fusion)  : opt_fusion;
+    opt_fusion  = str_fusion ? atoi(str_fusion)  : opt_fusion;
 
     reg->context = new ggml_spacemit_registry(reg);
 }

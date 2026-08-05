@@ -2,6 +2,7 @@
 #define SPACEMIT_SESSION_H
 
 #include "spacemit-opnode.h"
+#include "spacemit-context.h"
 
 #include <cstdint>
 #include <memory>
@@ -22,12 +23,17 @@ struct spacemit_session {
     // Serialize graph_compute calls because the hardware stream is exclusive.
     std::mutex stream_mutex;
 
+    void * workspace = nullptr;
+    size_t workspace_size = 0;
+    std::vector<ggml::spacemit::context> contexts;
+
     struct {
         uint64_t uid = 0;
         std::vector<spacemit_opnode> nodes;
     } cached_graph;
 
     spacemit_session() = default;
+    ~spacemit_session();
 
     const char * c_name() const { return name.c_str(); }
 };

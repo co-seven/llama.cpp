@@ -12,14 +12,33 @@ namespace ggml::spacemit {
 inline constexpr size_t cache_line_size_f32 = 64 / sizeof(float);
 
 struct context {
-    spert::Context &        runtime;
-    uint32_t                ith;
-    uint32_t                nth;
-    void *                  workspace;
-    size_t                  workspace_size;
-    spert::SharedBufferView shared;
+    spert::Context *        runtime       = nullptr;
+    uint32_t                ith           = 0;
+    uint32_t                nth           = 0;
+    void *                  workspace     = nullptr;
+    size_t                  workspace_size = 0;
+    spert::SharedBufferView shared        = {};
 
-    void sync() { runtime.sync(); }
+    void reset(spert::Context & runtime_in, uint32_t ith_in, uint32_t nth_in,
+               void * workspace_in, size_t workspace_size_in, spert::SharedBufferView shared_in) {
+        runtime        = &runtime_in;
+        ith            = ith_in;
+        nth            = nth_in;
+        workspace      = workspace_in;
+        workspace_size = workspace_size_in;
+        shared         = shared_in;
+    }
+
+    void clear() {
+        runtime        = nullptr;
+        ith            = 0;
+        nth            = 0;
+        workspace      = nullptr;
+        workspace_size = 0;
+        shared         = {};
+    }
+
+    void sync() { runtime->sync(); }
 };
 
 class tensor_traits_base {
