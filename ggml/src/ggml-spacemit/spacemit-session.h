@@ -5,6 +5,7 @@
 
 #include <cstdint>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <vector>
 
@@ -20,6 +21,7 @@ struct spacemit_session {
 
     // Persistent spert stream (created on first graph_compute, reused after).
     void * stream_ptr = nullptr;  // spert::Stream*
+    std::mutex stream_mutex;
 
     struct {
         uint64_t uid = 0;

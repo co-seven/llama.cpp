@@ -430,12 +430,15 @@ static const char * ggml_backend_spacemit_name(ggml_backend_t backend) {
 }
 
 static void ggml_backend_spacemit_free(ggml_backend_t backend) {
-    // sessions are allocated and freed as part of the registry
+    // The device registry owns the shared session and persistent stream.
     delete backend;
 }
 
 static ggml_status ggml_backend_spacemit_graph_compute(ggml_backend_t backend, ggml_cgraph * graph) {
     auto sess = static_cast<spacemit_session *>(backend->context);
+    // All backend handles for this device share one hardware stream. Serialize
+    // creation and use to establish happens-before and avoid concurrent launch.
+    std::lock_guard<std::mutex> stream_lock(sess->stream_mutex);
 
     SPACEMIT_VERBOSE("ggml-spacemit: %s graph-compute n_nodes %d\n", sess->c_name(), graph->n_nodes);
 
@@ -531,8 +534,8 @@ static ggml_status ggml_backend_spacemit_graph_compute(ggml_backend_t backend, g
 
 static void ggml_backend_spacemit_synchronize(ggml_backend_t backend) {
     SPACEMIT_VERBOSE("ggml-spacemit: synchronize\n");
-    // spert::Stream is scoped to graph_compute, so there is nothing to sync here.
-    // When async dispatch is added, a persistent stream or fence will be needed.
+    // graph_compute waits on its launch future before returning, so there is
+    // no outstanding asynchronous work to synchronize here.
     GGML_UNUSED(backend);
 }
 
