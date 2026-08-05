@@ -71,6 +71,7 @@ spine_env_info::spine_env_info() {
         num_cores = (int) info.num_cores;
         if (num_cores <= 0) num_cores = 1;
     }
+    vlen = info.vlen;
     mem_backend = spine_mem_pool_backend::transparent_hugepage;
     const char * mem_backend_str = getenv("SPACEMIT_MEM_BACKEND");
     if (mem_backend_str) {
@@ -312,11 +313,19 @@ static void ggml_backend_spacemit_buffer_set_tensor(ggml_backend_buffer_t buffer
                                                       const void *          data,
                                                       size_t                offset,
                                                       size_t                size) {
-    GGML_ASSERT(offset == 0);
-    GGML_ASSERT(size == ggml_nbytes(tensor));
+    GGML_ASSERT(offset + size <= ggml_nbytes(tensor));
 
-    auto ok = ggml_riscv64_spacemit_repack_tensor(tensor, data, size);
-    GGML_ASSERT(ok == 0);
+    // Quantized tensors with tensor traits are physically repacked, so they
+    // must be uploaded atomically. Plain tensors preserve the ggml layout and
+    // support the partial writes used by test-backend-ops and graph inputs.
+    if (tensor->extra) {
+        GGML_ASSERT(offset == 0);
+        GGML_ASSERT(size == ggml_nbytes(tensor));
+        auto ok = ggml_riscv64_spacemit_repack_tensor(tensor, data, size);
+        GGML_ASSERT(ok == 0);
+    } else {
+        memcpy((char *) tensor->data + offset, data, size);
+    }
 
     GGML_UNUSED(buffer);
 }
@@ -407,6 +416,14 @@ static bool ggml_backend_buffer_is_spacemit(const struct ggml_backend_buffer * b
 
 //** backend interface
 
+// Persistent stream cleanup
+spacemit_session::~spacemit_session() {
+    if (stream_ptr) {
+        delete (spert::Stream *) stream_ptr;
+        stream_ptr = nullptr;
+    }
+}
+
 static const char * ggml_backend_spacemit_name(ggml_backend_t backend) {
     auto sess = static_cast<spacemit_session *>(backend->context);
     return sess->c_name();
@@ -445,12 +462,18 @@ static ggml_status ggml_backend_spacemit_graph_compute(ggml_backend_t backend, g
         }
     }
 
-    spert::Stream stream(sess->num_cores);
-    if (!stream.valid()) {
-        GGML_LOG_ERROR("ggml-spacemit: failed to create spert stream\n");
-        free(workspace);
-        return GGML_STATUS_FAILED;
+    // Reuse persistent spert::Stream across graph_compute calls.
+    if (sess->stream_ptr == nullptr) {
+        sess->stream_ptr = new spert::Stream(sess->num_cores);
+        if (!((spert::Stream *)sess->stream_ptr)->valid()) {
+            GGML_LOG_ERROR("ggml-spacemit: failed to create spert stream\n");
+            delete (spert::Stream *)sess->stream_ptr;
+            sess->stream_ptr = nullptr;
+            free(workspace);
+            return GGML_STATUS_FAILED;
+        }
     }
+    auto & stream = *(spert::Stream *)sess->stream_ptr;
 
     ggml_tensor ** nodes   = graph->nodes;
     int             n_nodes = graph->n_nodes;
@@ -485,6 +508,9 @@ static ggml_status ggml_backend_spacemit_graph_compute(ggml_backend_t backend, g
                                              ggml_op_desc(node) + " (" + ggml_type_name(node->type) + ")");
                 }
 
+                // Every core must finish the current node before any core starts
+                // the next one. A bounded pointer look-ahead is not sufficient:
+                // dependencies can be farther away or hidden behind aliases/views.
                 ctx.sync();
             }
 
@@ -633,11 +659,13 @@ static bool ggml_backend_spacemit_device_supports_op(ggml_backend_dev_t dev, con
         case GGML_OP_SUB:
         case GGML_OP_MUL:
         case GGML_OP_DIV:
+        case GGML_OP_ROPE:
         case GGML_OP_UNARY:
         case GGML_OP_GLU:
         case GGML_OP_GET_ROWS:
         case GGML_OP_CONCAT:
         case GGML_OP_CPY:
+        case GGML_OP_SET_ROWS:
         case GGML_OP_CONT:
         case GGML_OP_REPEAT:
         case GGML_OP_SUM_ROWS:

@@ -22,6 +22,7 @@ enum class spine_core_arch_id : uint16_t {
 
 struct spine_env_info {
     int                    num_cores{ 0 };
+    size_t                 vlen{ 0 };
     spine_core_arch_id     perfer_core_arch_id{ spine_core_arch_id::core_arch_none };
     bool                   use_ime2{ false };
     bool                   use_ime1{ false };

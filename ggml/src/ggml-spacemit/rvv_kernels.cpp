@@ -3292,6 +3292,182 @@ void forward_glu_geglu_f32(ggml::spacemit::context & ctx, ggml_tensor * op) {
     }
 }
 
+template <typename T>
+static void forward_rope_impl(ggml::spacemit::context & ctx, ggml_tensor * op) {
+    const ggml_tensor * src0 = op->src[0];
+    const ggml_tensor * src1 = op->src[1];
+
+    const int n_dims = ggml_get_op_params_i32(op, 1);
+    const int mode   = ggml_get_op_params_i32(op, 2);
+    float freq_base;
+    float freq_scale;
+    float attn_factor;
+    memcpy(&freq_base,   op->op_params + 5, sizeof(float));
+    memcpy(&freq_scale,  op->op_params + 6, sizeof(float));
+    memcpy(&attn_factor, op->op_params + 8, sizeof(float));
+
+    const int64_t nr  = ggml_nrows(op);
+    const int64_t dr  = (nr + ctx.nth - 1) / ctx.nth;
+    const int64_t ir0 = dr * ctx.ith;
+    const int64_t ir1 = MIN(ir0 + dr, nr);
+    const int32_t * pos = (const int32_t *) src1->data;
+    const float theta_scale = powf(freq_base, -2.0f / n_dims);
+
+    float cache[512];
+    int64_t last_i2 = -1;
+    for (int64_t ir = ir0; ir < ir1; ++ir) {
+        const int64_t i3 = ir / (op->ne[2] * op->ne[1]);
+        const int64_t i2 = (ir / op->ne[1]) % op->ne[2];
+        const int64_t i1 = ir % op->ne[1];
+        if (i2 != last_i2) {
+            float theta = pos[i2] * freq_scale;
+            for (int i0 = 0; i0 < n_dims; i0 += 2) {
+                cache[i0 + 0] = cosf(theta) * attn_factor;
+                cache[i0 + 1] = sinf(theta) * attn_factor;
+                theta *= theta_scale;
+            }
+            last_i2 = i2;
+        }
+
+        const T * src = (const T *) ((const char *) src0->data + i3 * src0->nb[3] + i2 * src0->nb[2] + i1 * src0->nb[1]);
+        T * dst = (T *) ((char *) op->data + i3 * op->nb[3] + i2 * op->nb[2] + i1 * op->nb[1]);
+        if (mode == GGML_ROPE_TYPE_NEOX) {
+            const int offset = n_dims / 2;
+            for (int i0 = 0; i0 < n_dims; i0 += 2) {
+                const int ic = i0 / 2;
+                const float x0 = src[ic];
+                const float x1 = src[ic + offset];
+                dst[ic]          = (T) (x0 * cache[i0] - x1 * cache[i0 + 1]);
+                dst[ic + offset] = (T) (x0 * cache[i0 + 1] + x1 * cache[i0]);
+            }
+        } else {
+            for (int i0 = 0; i0 < n_dims; i0 += 2) {
+                const float x0 = src[i0];
+                const float x1 = src[i0 + 1];
+                dst[i0]     = (T) (x0 * cache[i0] - x1 * cache[i0 + 1]);
+                dst[i0 + 1] = (T) (x0 * cache[i0 + 1] + x1 * cache[i0]);
+            }
+        }
+        for (int64_t i0 = n_dims; i0 < op->ne[0]; ++i0) {
+            dst[i0] = src[i0];
+        }
+    }
+}
+
+void forward_rope(ggml::spacemit::context & ctx, ggml_tensor * op) {
+    if (op->src[0]->type == GGML_TYPE_F32) {
+        forward_rope_impl<float>(ctx, op);
+    } else {
+        forward_rope_impl<_Float16>(ctx, op);
+    }
+}
+
+void forward_set_rows(ggml::spacemit::context & ctx, ggml_tensor * op) {
+    const ggml_tensor * src0 = op->src[0];
+    const ggml_tensor * src1 = op->src[1];
+    ggml_tensor *       dst  = op;
+
+    const int64_t nc  = src0->ne[0];
+    const int64_t nr  = src0->ne[1];
+    const int64_t dc  = (nc + ctx.nth - 1) / ctx.nth;
+    const int64_t c0  = dc * ctx.ith;
+    const int64_t c1  = MIN(c0 + dc, nc);
+
+    // Every core owns a disjoint column range but visits source rows in the
+    // same order. If indices repeat, this preserves SET_ROWS' last-row-wins
+    // semantics without cross-core write races.
+    for (int64_t i03 = 0; i03 < src0->ne[3]; ++i03) {
+        for (int64_t i02 = 0; i02 < src0->ne[2]; ++i02) {
+            const int64_t i11 = i02 % src1->ne[1];
+            const int64_t i12 = i03 % src1->ne[2];
+            for (int64_t i = 0; i < nr; ++i) {
+                const int64_t idx = src1->type == GGML_TYPE_I64
+                        ? *(const int64_t *) ((const char *) src1->data + i * src1->nb[0] + i11 * src1->nb[1] + i12 * src1->nb[2])
+                        : *(const int32_t *) ((const char *) src1->data + i * src1->nb[0] + i11 * src1->nb[1] + i12 * src1->nb[2]);
+                GGML_ASSERT(idx >= 0 && idx < dst->ne[1]);
+
+                const char * src = (const char *) src0->data + i * src0->nb[1] + i02 * src0->nb[2] + i03 * src0->nb[3];
+                char * out = (char *) dst->data + idx * dst->nb[1] + i02 * dst->nb[2] + i03 * dst->nb[3];
+
+                int64_t c = c0;
+                while (c < c1) {
+                    if (src0->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F16) {
+                        const size_t vl = __riscv_vsetvl_e32m4(c1 - c);
+                        const vfloat32m4_t v32 = __riscv_vle32_v_f32m4((const float *) src + c, vl);
+                        __riscv_vse16_v_f16m2((_Float16 *) out + c, __riscv_vfncvt_f_f_w_f16m2(v32, vl), vl);
+                        c += vl;
+                    } else if (src0->type == GGML_TYPE_F16 && dst->type == GGML_TYPE_F32) {
+                        const size_t vl = __riscv_vsetvl_e16m2(c1 - c);
+                        const vfloat16m2_t v16 = __riscv_vle16_v_f16m2((const _Float16 *) src + c, vl);
+                        __riscv_vse32_v_f32m4((float *) out + c, __riscv_vfwcvt_f_f_v_f32m4(v16, vl), vl);
+                        c += vl;
+                    } else if (src0->type == GGML_TYPE_F32) {
+                        const size_t vl = __riscv_vsetvl_e32m4(c1 - c);
+                        __riscv_vse32_v_f32m4((float *) out + c, __riscv_vle32_v_f32m4((const float *) src + c, vl), vl);
+                        c += vl;
+                    } else {
+                        const size_t vl = __riscv_vsetvl_e16m2(c1 - c);
+                        __riscv_vse16_v_f16m2((_Float16 *) out + c,
+                                              __riscv_vle16_v_f16m2((const _Float16 *) src + c, vl), vl);
+                        c += vl;
+                    }
+                }
+            }
+        }
+    }
+}
+
+void forward_glu_swiglu_f32(ggml::spacemit::context & ctx, ggml_tensor * op) {
+    const ggml_tensor * src0 = op->src[0];
+    const ggml_tensor * src1 = op->src[1];
+
+    GGML_ASSERT(src0->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32);
+
+    const int64_t nc      = src1 ? src0->ne[0] : src0->ne[0] / 2;
+    const int64_t nr      = ggml_nrows(src0);
+    const int64_t total   = nr * nc;
+    const int64_t dr      = (total + ctx.nth - 1) / ctx.nth;
+    const int64_t e0      = dr * ctx.ith;
+    const int64_t e1      = MIN(e0 + dr, total);
+    const int32_t swapped = ggml_get_op_params_i32(op, 1);
+
+    int64_t e = e0;
+    while (e < e1) {
+        const int64_t r   = e / nc;
+        const int64_t c   = e % nc;
+        const int64_t run = MIN(nc - c, e1 - e);
+
+        const float * x_row = (const float *) ((const char *) src0->data + r * src0->nb[1]);
+        const float * g_row;
+        if (src1) {
+            g_row = (const float *) ((const char *) src1->data + r * src1->nb[1]);
+        } else {
+            x_row += swapped ? nc : 0;
+            g_row = (const float *) ((const char *) src0->data + r * src0->nb[1]) + (swapped ? 0 : nc);
+        }
+        float * y_row = (float *) ((char *) op->data + r * op->nb[1]);
+
+        const float * xp = x_row + c;
+        const float * gp = g_row + c;
+        float *       yp = y_row + c;
+        int64_t remaining = run;
+        while (remaining > 0) {
+            const size_t vl = __riscv_vsetvl_e32m2(remaining);
+            const vfloat32m2_t x = __riscv_vle32_v_f32m2(xp, vl);
+            const vfloat32m2_t g = __riscv_vle32_v_f32m2(gp, vl);
+            const vfloat32m2_t exp_neg_x = rvv_expf_approx_f32m2(__riscv_vfneg_v_f32m2(x, vl), vl);
+            const vfloat32m2_t silu = __riscv_vfdiv_vv_f32m2(
+                    x, __riscv_vfadd_vf_f32m2(exp_neg_x, 1.0f, vl), vl);
+            __riscv_vse32_v_f32m2(yp, __riscv_vfmul_vv_f32m2(silu, g, vl), vl);
+            xp += vl;
+            gp += vl;
+            yp += vl;
+            remaining -= vl;
+        }
+        e += run;
+    }
+}
+
 template void forward_binary<GGML_OP_ADD, float>(ggml::spacemit::context & ctx, ggml_tensor * op);
 template void forward_binary<GGML_OP_SUB, float>(ggml::spacemit::context & ctx, ggml_tensor * op);
 template void forward_binary<GGML_OP_MUL, float>(ggml::spacemit::context & ctx, ggml_tensor * op);

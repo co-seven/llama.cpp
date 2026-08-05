@@ -1060,13 +1060,24 @@ class tensor_traits_common : public ggml::spacemit::tensor_traits_base {
                         return false;
                 }
             case GGML_OP_GLU:
-                if (ggml_get_glu_op(op) == GGML_GLU_OP_GEGLU && op->src[0]->type == GGML_TYPE_F32) {
-                    spacemit_kernels::rvv::forward_glu_geglu_f32(ctx, op);
-                    return true;
+                if (op->src[0]->type == GGML_TYPE_F32) {
+                    switch (ggml_get_glu_op(op)) {
+                        case GGML_GLU_OP_GEGLU:
+                            spacemit_kernels::rvv::forward_glu_geglu_f32(ctx, op);
+                            return true;
+                        case GGML_GLU_OP_SWIGLU:
+                            spacemit_kernels::rvv::forward_glu_swiglu_f32(ctx, op);
+                            return true;
+                        default:
+                            break;
+                    }
                 }
                 return false;
             case GGML_OP_FLASH_ATTN_EXT:
                 return forward_flash_attn_ext_f16(ctx, op);
+            case GGML_OP_ROPE:
+                spacemit_kernels::rvv::forward_rope(ctx, op);
+                return true;
             case GGML_OP_CONT:
                 {
                     const ggml_tensor * src0 = op->src[0];
@@ -1089,6 +1100,9 @@ class tensor_traits_common : public ggml::spacemit::tensor_traits_base {
                         return false;
                     }
                 }
+            case GGML_OP_SET_ROWS:
+                spacemit_kernels::rvv::forward_set_rows(ctx, op);
+                return true;
             case GGML_OP_REPEAT:
                 {
                     const bool rows_equal         = ggml_nrows(op->src[0]) == ggml_nrows(op);
@@ -1543,8 +1557,28 @@ const ggml::spacemit::tensor_traits_base * ggml_spacemit_get_tensor_traits(const
                 (op->op_params[3] == GGML_PREC_F32 || op->op_params[3] == GGML_PREC_DEFAULT) &&
                 op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F16 &&
                 op->src[2]->type == GGML_TYPE_F16 && op->src[1]->ne[0] > 0 && op->src[1]->ne[0] <= 128 &&
-                op->src[2]->ne[0] > 0 && op->src[2]->ne[0] <= 128 && __riscv_vlenb() == 128) {
+                op->src[2]->ne[0] > 0 && op->src[2]->ne[0] <= 128 &&
+                ggml::cpu::riscv64_spacemit::global_spine_env_info.vlen == 128) {
                 return common;
+            }
+            break;
+        case GGML_OP_ROPE:
+            if (op->src[0] && op->src[1]) {
+                float freq_base;
+                float ext_factor;
+                memcpy(&freq_base,  op->op_params + 5, sizeof(float));
+                memcpy(&ext_factor, op->op_params + 7, sizeof(float));
+                const int n_dims = ggml_get_op_params_i32(op, 1);
+                const int mode   = ggml_get_op_params_i32(op, 2);
+                if ((op->src[0]->type == GGML_TYPE_F32 || op->src[0]->type == GGML_TYPE_F16) &&
+                    op->type == op->src[0]->type && op->src[1]->type == GGML_TYPE_I32 && op->src[2] == nullptr &&
+                    op->src[0]->nb[0] == ggml_type_size(op->src[0]->type) && op->nb[0] == ggml_type_size(op->type) &&
+                    op->src[1]->nb[0] == sizeof(int32_t) && ggml_are_same_shape(op, op->src[0]) &&
+                    ggml_nelements(op->src[1]) >= op->ne[2] && freq_base > 0.0f &&
+                    n_dims > 0 && n_dims <= op->ne[0] && n_dims <= 512 && n_dims % 2 == 0 && ext_factor == 0.0f &&
+                    (mode == GGML_ROPE_TYPE_NORMAL || mode == GGML_ROPE_TYPE_NEOX)) {
+                    return common;
+                }
             }
             break;
         case GGML_OP_CONT:
@@ -1557,6 +1591,20 @@ const ggml::spacemit::tensor_traits_base * ggml_spacemit_get_tensor_traits(const
         case GGML_OP_CPY:
             if (op->src[0] && op->type == op->src[0]->type && op->nb[0] == op->src[0]->nb[1] &&
                 op->src[0]->nb[0] != op->src[0]->nb[1] && ggml_nelements(op->src[0]) == ggml_nelements(op)) {
+                return common;
+            }
+            break;
+        case GGML_OP_SET_ROWS:
+            if (op->src[0] && op->src[1] && op->src[2] &&
+                (op->src[0]->type == GGML_TYPE_F32 || op->src[0]->type == GGML_TYPE_F16) &&
+                (op->src[1]->type == GGML_TYPE_I32 || op->src[1]->type == GGML_TYPE_I64) &&
+                (op->type == GGML_TYPE_F32 || op->type == GGML_TYPE_F16) && op->src[2]->type == op->type &&
+                ggml_are_same_shape(op, op->src[2]) && op->src[0]->ne[1] == op->src[1]->ne[0] &&
+                op->src[0]->nb[0] == ggml_type_size(op->src[0]->type) &&
+                op->src[2]->nb[0] == ggml_type_size(op->src[2]->type) && op->nb[0] == ggml_type_size(op->type) &&
+                op->src[1]->nb[0] == ggml_type_size(op->src[1]->type) && op->ne[0] == op->src[0]->ne[0] &&
+                op->ne[2] == op->src[0]->ne[2] && op->ne[3] == op->src[0]->ne[3] &&
+                op->src[0]->ne[2] % op->src[1]->ne[1] == 0 && op->src[0]->ne[3] % op->src[1]->ne[2] == 0) {
                 return common;
             }
             break;
@@ -1599,8 +1647,22 @@ const ggml::spacemit::tensor_traits_base * ggml_spacemit_get_tensor_traits(const
             }
             break;
         case GGML_OP_GLU:
-            if (op->src[0] && op->src[0]->type == GGML_TYPE_F32 && ggml_get_glu_op(op) == GGML_GLU_OP_GEGLU) {
-                return common;
+            if (op->src[0] && op->src[0]->type == GGML_TYPE_F32) {
+                if (ggml_get_glu_op(op) == GGML_GLU_OP_GEGLU) {
+                    return common;
+                }
+                if (ggml_get_glu_op(op) == GGML_GLU_OP_SWIGLU && ggml_is_contiguous_1(op->src[0]) &&
+                    op->type == GGML_TYPE_F32 && op->nb[0] == sizeof(float)) {
+                    const int32_t swapped = ggml_get_op_params_i32(op, 1);
+                    if (op->src[1]) {
+                        if (swapped == 0 && op->src[1]->type == GGML_TYPE_F32 && ggml_is_contiguous_1(op->src[1]) &&
+                            ggml_are_same_shape(op->src[0], op->src[1]) && ggml_are_same_shape(op, op->src[0])) {
+                            return common;
+                        }
+                    } else if (op->ne[0] == op->src[0]->ne[0] / 2 && ggml_nrows(op) == ggml_nrows(op->src[0])) {
+                        return common;
+                    }
+                }
             }
             break;
         default:
