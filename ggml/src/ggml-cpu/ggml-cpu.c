@@ -15,6 +15,10 @@
 #include "ggml.h"
 #include "common.h"
 
+#ifdef GGML_USE_CPU_RISCV64_SPACEMIT
+#include "spacemit/spacemit_spert_adapter.h"
+#endif
+
 #if defined(_MSC_VER) || defined(__MINGW32__)
 #include <malloc.h> // using malloc.h with MSC/MINGW
 #elif !defined(__FreeBSD__) && !defined(__NetBSD__) && !defined(__OpenBSD__)
@@ -576,6 +580,11 @@ struct ggml_state {
 static struct ggml_state g_state = {0};
 
 void ggml_barrier(struct ggml_threadpool * tp) {
+#ifdef GGML_USE_CPU_RISCV64_SPACEMIT
+    // Spert path: redirect to ctx->sync() via thread-local context
+    spacemit_spert_grid_sync();
+    return;
+#else
     int n_threads = atomic_load_explicit(&tp->n_graph, memory_order_relaxed) & GGML_THREADPOOL_N_THREADS_MASK;
     if (n_threads == 1) {
         return;
@@ -610,6 +619,7 @@ void ggml_barrier(struct ggml_threadpool * tp) {
     #else
     atomic_thread_fence(memory_order_seq_cst);
     #endif
+#endif
 #endif
 }
 
@@ -2713,16 +2723,17 @@ void ggml_threadpool_free(struct ggml_threadpool* threadpool) {
     ggml_mutex_unlock(&threadpool->mutex);
 
 #ifdef GGML_USE_CPU_RISCV64_SPACEMIT
-    const int first_worker = 0;
+    // Spert whole-graph path never creates worker pthreads (see ggml_threadpool_new_impl),
+    // so there is nothing to join here. workers[j].thrd are all zero-initialized; joining
+    // them would segfault in pthread_join.
+    UNUSED(workers);
 #else
-    const int first_worker = 1;
-#endif
-
-    for (int j = first_worker; j < n_threads; j++) {
+    for (int j = 1; j < n_threads; j++) {
         int32_t rc = ggml_thread_join(workers[j].thrd, NULL);
         GGML_ASSERT(rc == GGML_EXIT_SUCCESS || rc == GGML_EXIT_ABORTED);
         UNUSED(rc);
     }
+#endif
 
     ggml_mutex_destroy(&threadpool->mutex);
     ggml_cond_destroy(&threadpool->cond);
@@ -3051,6 +3062,62 @@ static int ggml_cpu_try_fuse_ops(
     return 0;
 }
 
+#ifdef GGML_USE_CPU_RISCV64_SPACEMIT
+// Shared context for spert whole-graph path. All AI-core tiles reference the SAME instance,
+// so tp (and its current_chunk atomic) is shared across tiles for dynamic load balancing.
+// Barriers are intercepted at ggml_barrier() and redirected to spert ctx->sync(), so the
+// threadpool's barrier fields are never used here.
+struct ggml_spert_context {
+    struct ggml_cgraph *   cgraph;
+    struct ggml_cplan  *   cplan;
+    struct ggml_threadpool tp;  // shared across all tiles; only current_chunk is used
+};
+
+// Graph traversal callback for spert whole-graph kernel.
+// Runs inside each AI core tile, called from adapter after setting t_spert_ctx.
+static void ggml_graph_compute_spert_kernel(int ith, int nth, void * user_data) {
+    struct ggml_spert_context * sctx = (struct ggml_spert_context *) user_data;
+
+    const struct ggml_cgraph * cgraph = sctx->cgraph;
+    const struct ggml_cplan  * cplan  = sctx->cplan;
+
+    struct ggml_compute_params params = {
+        /*.ith        =*/ ith,
+        /*.nth        =*/ nth,
+        /*.wsize      =*/ cplan->work_size,
+        /*.wdata      =*/ cplan->work_data,
+        /*.threadpool =*/ &sctx->tp,  // shared: gives ops access to current_chunk
+        /*.use_ref    =*/ cplan->use_ref,
+    };
+    
+    // Traverse the entire graph (same logic as ggml_graph_compute_thread)
+    for (int node_n = 0; node_n < cgraph->n_nodes; node_n++) {
+        struct ggml_tensor * node = cgraph->nodes[node_n];
+        
+        if (ggml_op_is_empty(node->op)) {
+            continue;
+        }
+        
+        if ((node->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
+            continue;
+        }
+        
+        // Execute the operator (all ops go through here, including IME-accelerated ones)
+        const int n_fused = ggml_cpu_try_fuse_ops(cgraph, node_n, &params, cplan);
+        if (n_fused > 0) {
+            node_n += n_fused;
+        } else {
+            ggml_compute_forward(&params, node);
+        }
+        
+        // Sync after each node (replaces ggml_barrier in original threadpool path)
+        if (node_n + 1 < cgraph->n_nodes) {
+            spacemit_spert_grid_sync();
+        }
+    }
+}
+#endif
+
 static thread_ret_t ggml_graph_compute_thread(void * data) {
     struct ggml_compute_state * state = (struct ggml_compute_state *) data;
     struct ggml_threadpool    * tp    = state->threadpool;
@@ -3058,11 +3125,7 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
     const struct ggml_cgraph * cgraph = tp->cgraph;
     const struct ggml_cplan  * cplan  = tp->cplan;
 
-#ifdef GGML_USE_CPU_RISCV64_SPACEMIT
-    ggml_backend_cpu_riscv64_spacemit_set_numa_thread_affinity(state->ith);
-#else
     set_numa_thread_affinity(state->ith);
-#endif
 
     struct ggml_compute_params params = {
         /*.ith        =*/ state->ith,
@@ -3118,10 +3181,6 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
 #endif
 
     ggml_barrier(state->threadpool);
-
-#ifdef GGML_USE_CPU_RISCV64_SPACEMIT
-    ggml_backend_cpu_riscv64_spacemit_clear_numa_thread_affinity_threaded(state->ith);
-#endif
 
     return 0;
 }
@@ -3251,36 +3310,7 @@ static thread_ret_t ggml_graph_compute_secondary_thread(void* data) {
     return (thread_ret_t) 0;
 }
 
-#ifdef GGML_USE_CPU_RISCV64_SPACEMIT
-static void ggml_graph_compute_wait_for_workers(struct ggml_threadpool * threadpool, int n_threads) {
-    // Spacemit keeps the ggml caller as a control thread: publish the graph here, then wait for all workers.
-    ggml_mutex_lock(&threadpool->mutex);
-
-    int n_graph = atomic_load_explicit(&threadpool->n_graph, memory_order_relaxed) >> GGML_THREADPOOL_N_THREADS_BITS;
-    n_graph = ((n_graph + 1) << GGML_THREADPOOL_N_THREADS_BITS) | (n_threads & GGML_THREADPOOL_N_THREADS_MASK);
-
-    GGML_PRINT_DEBUG("compute-kickoff: n_threads %d n_graph %d\n", n_threads, n_graph);
-
-    atomic_store_explicit(&threadpool->n_graph_done, 0, memory_order_relaxed);
-
-    // Indicate the graph is ready to be processed.
-    // We need the full seq-cst fence here because of the polling threads (used in thread_sync).
-    atomic_store_explicit(&threadpool->n_graph, n_graph, memory_order_seq_cst);
-
-    if (threadpool->pause) {
-       // resume does cond broadcast
-       ggml_threadpool_resume_locked(threadpool);
-    } else {
-       ggml_cond_broadcast(&threadpool->cond);
-    }
-
-    ggml_mutex_unlock(&threadpool->mutex);
-
-    while (atomic_load_explicit(&threadpool->n_graph_done, memory_order_acquire) < n_threads) {
-        ggml_thread_cpu_relax();
-    }
-}
-#else
+#ifndef GGML_USE_CPU_RISCV64_SPACEMIT
 
 // Start processing new graph
 static void ggml_graph_compute_kickoff(struct ggml_threadpool * threadpool, int n_threads)
@@ -3375,13 +3405,11 @@ static struct ggml_threadpool * ggml_threadpool_new_impl(
     int32_t cpumask_iter = 0;
 
 #ifdef GGML_USE_CPU_RISCV64_SPACEMIT
-    // Spacemit uses a control caller for TCM wait/release, so worker0 is a real worker thread too.
-    for (int j = 0; j < tpp->n_threads; j++) {
-        ggml_thread_cpumask_next(tpp->cpumask, workers[j].cpumask, tpp->strict_cpu, &cpumask_iter);
-
-        int32_t rc = ggml_thread_create(&workers[j].thrd, NULL, ggml_graph_compute_secondary_thread, &workers[j]);
-        GGML_ASSERT(rc == 0);
-    }
+    // Spert path runs the whole graph inside AI cores via spacemit_spert_launch_graph_kernel;
+    // no ggml worker pthreads are needed. Creating them would busy-spin on the AI cores and
+    // starve the spert tiles. So we skip pthread creation entirely — the threadpool struct is
+    // kept only for API compatibility and is never used to compute.
+    (void) cpumask_iter;
 #else
     for (int j = 1; j < tpp->n_threads; j++) {
         ggml_thread_cpumask_next(tpp->cpumask, workers[j].cpumask, tpp->strict_cpu, &cpumask_iter);
@@ -3416,25 +3444,49 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
     GGML_ASSERT(cplan->n_threads > 0);
     GGML_ASSERT(cplan->work_size == 0 || cplan->work_data != NULL);
 
-    int n_threads                               = cplan->n_threads;
+    int n_threads = cplan->n_threads;
+
+#ifdef GGML_USE_CPU_RISCV64_SPACEMIT
+    // Spert whole-graph path: bypass threadpool entirely.
+    // Launch one spert stream sized to num_prefer_cores (8 on K3), traverse the whole graph
+    // inside AI cores. No pthread creation, no TCM wait/release.
+    {
+        const int n_ai_cores = (int)ggml_backend_cpu_riscv64_spacemit_num_prefer_cores();
+        const int n_tiles    = (n_ai_cores > 0 && n_ai_cores < n_threads) ? n_ai_cores : n_threads;
+
+        struct ggml_spert_context spert_ctx = {0};
+        spert_ctx.cgraph        = cgraph;
+        spert_ctx.cplan         = cplan;
+        spert_ctx.tp.cgraph     = cgraph;
+        spert_ctx.tp.cplan      = cplan;
+        atomic_store_explicit(&spert_ctx.tp.current_chunk, 0, memory_order_relaxed);
+
+        int launch_result = spacemit_spert_launch_graph_kernel(
+            ggml_graph_compute_spert_kernel,
+            &spert_ctx,
+            n_tiles
+        );
+
+        clear_numa_thread_affinity();
+        return (launch_result == 0) ? GGML_STATUS_SUCCESS : GGML_STATUS_FAILED;
+    }
+#endif
+
     struct ggml_threadpool * threadpool = cplan->threadpool;
 
     bool disposable_threadpool = false;
 
     if (threadpool == NULL) {
-        //GGML_PRINT_DEBUG("Threadpool is not specified. Will create a disposable threadpool : n_threads %d\n", n_threads);
         disposable_threadpool = true;
 
         struct ggml_threadpool_params ttp = ggml_threadpool_params_default(n_threads);
         threadpool = ggml_threadpool_new_impl(&ttp, cgraph, cplan);
     } else {
-        // Reset some of the parameters that need resetting
-        // No worker threads should be accessing the parameters below at this stage
-        threadpool->cgraph           = cgraph;
-        threadpool->cplan            = cplan;
-        threadpool->current_chunk    = 0;
-        threadpool->abort            = -1;
-        threadpool->ec               = GGML_STATUS_SUCCESS;
+        threadpool->cgraph        = cgraph;
+        threadpool->cplan         = cplan;
+        threadpool->current_chunk = 0;
+        threadpool->abort         = -1;
+        threadpool->ec            = GGML_STATUS_SUCCESS;
     }
 
 #ifdef GGML_USE_OPENMP
@@ -3467,14 +3519,9 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
         n_threads = threadpool->n_threads;
     }
 
-#ifdef GGML_USE_CPU_RISCV64_SPACEMIT
-    ggml_backend_cpu_riscv64_spacemit_tcm_mem_wait_all(n_threads);
-
-    ggml_graph_compute_wait_for_workers(threadpool, n_threads);
-
-    ggml_backend_cpu_riscv64_spacemit_tcm_mem_release_all(n_threads);
-#else
     // Kick all threads to start the new graph
+    // (SpacemiT spert path returns early above and never reaches here.)
+#ifndef GGML_USE_CPU_RISCV64_SPACEMIT
     ggml_graph_compute_kickoff(threadpool, n_threads);
 
     // This is a work thread too
