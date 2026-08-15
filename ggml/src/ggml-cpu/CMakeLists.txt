@@ -444,7 +444,33 @@ function(ggml_add_cpu_backend_variant_impl tag_name)
         if (GGML_CPU_RISCV64_SPACEMIT)
             include(ggml-cpu/cmake/FindSMTIME.cmake)
             target_compile_definitions(${GGML_CPU_NAME} PRIVATE GGML_USE_CPU_RISCV64_SPACEMIT ${RISCV64_SPACEMIT_IME_SPEC})
+
+            # spine-runtime (spert) is consumed as a prebuilt release package, not a submodule.
+            # Point SPERT_DIR at the extracted release tree (contains include/ and lib/), e.g.
+            #   https://github.com/spacemit-com/spine-runtime/releases -> spine-runtime.riscv64.<ver>
+            # Mirrors how SPACEMIT_ORT_DIR is passed in build_spacemit.sh.
+            if (NOT DEFINED SPERT_DIR)
+                if (DEFINED ENV{SPERT_DIR})
+                    set(SPERT_DIR $ENV{SPERT_DIR})
+                endif()
+            endif()
+            if (NOT SPERT_DIR)
+                message(FATAL_ERROR "SPERT_DIR is not set. Point it at the extracted spine-runtime release (with include/ and lib/).")
+            endif()
+            find_library(SPERT_LIB NAMES spert PATHS ${SPERT_DIR}/lib NO_CMAKE_FIND_ROOT_PATH REQUIRED)
+            message(STATUS "SpacemiT IME backend enabled, using spine-runtime at ${SPERT_DIR} (${SPERT_LIB})")
+            target_include_directories(${GGML_CPU_NAME} PRIVATE ${SPERT_DIR}/include)
+            target_link_libraries(${GGML_CPU_NAME} PRIVATE ${SPERT_LIB})
+            # libggml-cpu.so carries NEEDED libspert.so.1; downstream targets that link it must
+            # be able to resolve that indirect dependency at link time. Propagate the spert lib
+            # dir as a public link directory and an rpath-link flag so executables/libs that
+            # depend on ggml-cpu can find libspert.so.1 without failing with undefined refs.
+            target_link_directories(${GGML_CPU_NAME} PUBLIC ${SPERT_DIR}/lib)
+            target_link_options(${GGML_CPU_NAME} PUBLIC "-Wl,-rpath-link,${SPERT_DIR}/lib")
+
             list(APPEND GGML_CPU_SOURCES
+                ggml-cpu/spacemit/spacemit_spert_adapter.h
+                ggml-cpu/spacemit/spacemit_spert_adapter.cpp
                 ggml-cpu/spacemit/ime.cpp
                 ggml-cpu/spacemit/ime.h
                 ggml-cpu/spacemit/spine_mem_pool.cpp

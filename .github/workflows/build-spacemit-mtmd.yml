@@ -59,27 +59,34 @@ jobs:
           {
             echo "SPACEMIT_TOOLCHAIN_URL=${SPACEMIT_TOOLCHAIN_URL}"
             echo "SPACEMIT_ORT_URL=${SPACEMIT_ORT_URL}"
+            echo "SPACEMIT_SPERT_URL=${SPACEMIT_SPERT_URL}"
             echo "SPACEMIT_MTMD_RELEASE_TAG=${SPACEMIT_MTMD_RELEASE_TAG}"
             echo "SPACEMIT_MTMD_PACKAGE_NAME=${SPACEMIT_MTMD_PACKAGE_NAME}"
             echo "SPACEMIT_TOOLCHAIN_ARCHIVE=${SPACEMIT_TOOLCHAIN_ARCHIVE}"
             echo "SPACEMIT_ORT_ARCHIVE=${SPACEMIT_ORT_ARCHIVE}"
+            echo "SPACEMIT_SPERT_ARCHIVE=${SPACEMIT_SPERT_ARCHIVE}"
             echo "SPACEMIT_TOOLCHAIN_DIR=${SPACEMIT_TOOLCHAIN_DIR}"
+            echo "SPACEMIT_SPERT_DIR=${SPACEMIT_SPERT_DIR}"
           } >> "$GITHUB_ENV"
 
           toolchain_cache_key=$(printf '%s' "$SPACEMIT_TOOLCHAIN_URL" | sha256sum | cut -c1-16)
           ort_cache_key=$(printf '%s' "$SPACEMIT_ORT_URL" | sha256sum | cut -c1-16)
+          spert_cache_key=$(printf '%s' "$SPACEMIT_SPERT_URL" | sha256sum | cut -c1-16)
 
           {
             echo "toolchain_url=${SPACEMIT_TOOLCHAIN_URL}"
             echo "ort_url=${SPACEMIT_ORT_URL}"
+            echo "spert_url=${SPACEMIT_SPERT_URL}"
             echo "version_number=${VERSION_NUMBER}"
             echo "release_tag=${SPACEMIT_MTMD_RELEASE_TAG}"
             echo "package_name=${SPACEMIT_MTMD_PACKAGE_NAME}"
             echo "toolchain_archive=${SPACEMIT_TOOLCHAIN_ARCHIVE}"
             echo "ort_archive=${SPACEMIT_ORT_ARCHIVE}"
+            echo "spert_archive=${SPACEMIT_SPERT_ARCHIVE}"
             echo "toolchain_dir=${SPACEMIT_TOOLCHAIN_DIR}"
             echo "toolchain_cache_key=${toolchain_cache_key}"
             echo "ort_cache_key=${ort_cache_key}"
+            echo "spert_cache_key=${spert_cache_key}"
           } >> "$GITHUB_OUTPUT"
 
       - name: Decide whether to publish a new release
@@ -155,6 +162,13 @@ jobs:
           path: ${{ steps.vars.outputs.ort_archive }}
           key: spacemit-ort-archive-${{ steps.vars.outputs.ort_cache_key }}-${{ runner.os }}
 
+      - name: Cache SpacemiT SPERT archive
+        id: cache-spert
+        uses: actions/cache@v5
+        with:
+          path: ${{ steps.vars.outputs.spert_archive }}
+          key: spacemit-spert-archive-${{ steps.vars.outputs.spert_cache_key }}-${{ runner.os }}
+
       - name: Prepare SpacemiT Toolchain
         shell: bash
         run: |
@@ -203,6 +217,31 @@ jobs:
 
           echo "SPACEMIT_ORT_DIR=${ORT_DIR}" >> "$GITHUB_ENV"
 
+      - name: Prepare SpacemiT SPERT
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          mkdir -p "$(dirname "$SPACEMIT_SPERT_ARCHIVE")"
+          if [[ ! -f "$SPACEMIT_SPERT_ARCHIVE" ]]; then
+            curl -L --fail --retry 5 --retry-all-errors \
+              -o "$SPACEMIT_SPERT_ARCHIVE" \
+              "$SPACEMIT_SPERT_URL"
+          fi
+
+          rm -rf "$SPACEMIT_SPERT_DIR"
+          mkdir -p "$SPACEMIT_SPERT_DIR"
+          tar -xzf "$SPACEMIT_SPERT_ARCHIVE" -C "$SPACEMIT_SPERT_DIR" --strip-components=1
+
+          SPERT_DIR="${PWD}/${SPACEMIT_SPERT_DIR}"
+          if [[ ! -d "${SPERT_DIR}/include" || ! -d "${SPERT_DIR}/lib" ]]; then
+            echo "error: invalid SPERT_DIR layout at ${SPERT_DIR}" >&2
+            find "$SPACEMIT_SPERT_DIR" -maxdepth 2 -type d | sort
+            exit 1
+          fi
+
+          echo "SPERT_DIR=${SPERT_DIR}" >> "$GITHUB_ENV"
+
       - name: Build
         shell: bash
         run: |
@@ -240,7 +279,8 @@ jobs:
               -DCMAKE_INSTALL_PREFIX=build/installed \
               -DCMAKE_TOOLCHAIN_FILE=${PWD}/cmake/riscv64-spacemit-linux-gnu-gcc.cmake \
               -DLLAMA_SERVER_SMT_MTMD=ON \
-              -DSPACEMIT_ORT_DIR=${SPACEMIT_ORT_DIR}
+              -DSPACEMIT_ORT_DIR=${SPACEMIT_ORT_DIR} \
+              -DSPERT_DIR=${SPERT_DIR}
 
           cmake --build build --parallel "$(nproc)" --config Release
 
@@ -349,22 +389,28 @@ jobs:
           {
             echo "SPACEMIT_TOOLCHAIN_OHOS_URL=${SPACEMIT_TOOLCHAIN_OHOS_URL}"
             echo "SPACEMIT_ORT_OHOS_URL=${SPACEMIT_ORT_OHOS_URL}"
+            echo "SPACEMIT_SPERT_OHOS_URL=${SPACEMIT_SPERT_OHOS_URL}"
             echo "SPACEMIT_TOOLCHAIN_OHOS_ARCHIVE=${SPACEMIT_TOOLCHAIN_OHOS_ARCHIVE}"
             echo "SPACEMIT_ORT_OHOS_ARCHIVE=${SPACEMIT_ORT_OHOS_ARCHIVE}"
+            echo "SPACEMIT_SPERT_OHOS_ARCHIVE=${SPACEMIT_SPERT_OHOS_ARCHIVE}"
             echo "SPACEMIT_TOOLCHAIN_OHOS_DIR=${SPACEMIT_TOOLCHAIN_OHOS_DIR}"
+            echo "SPACEMIT_SPERT_OHOS_DIR=${SPACEMIT_SPERT_OHOS_DIR}"
             echo "SPACEMIT_MTMD_OHOS_PACKAGE_NAME=${SPACEMIT_MTMD_OHOS_PACKAGE_NAME}"
           } >> "$GITHUB_ENV"
 
           toolchain_cache_key=$(printf '%s' "$SPACEMIT_TOOLCHAIN_OHOS_URL" | sha256sum | cut -c1-16)
           ort_cache_key=$(printf '%s' "$SPACEMIT_ORT_OHOS_URL" | sha256sum | cut -c1-16)
+          spert_cache_key=$(printf '%s' "$SPACEMIT_SPERT_OHOS_URL" | sha256sum | cut -c1-16)
 
           {
             echo "version_number=${VERSION_NUMBER}"
             echo "package_name=${SPACEMIT_MTMD_OHOS_PACKAGE_NAME}"
             echo "toolchain_archive=${SPACEMIT_TOOLCHAIN_OHOS_ARCHIVE}"
             echo "ort_archive=${SPACEMIT_ORT_OHOS_ARCHIVE}"
+            echo "spert_archive=${SPACEMIT_SPERT_OHOS_ARCHIVE}"
             echo "toolchain_cache_key=${toolchain_cache_key}"
             echo "ort_cache_key=${ort_cache_key}"
+            echo "spert_cache_key=${spert_cache_key}"
           } >> "$GITHUB_OUTPUT"
 
       - name: Cache SpacemiT OHOS Toolchain archive
@@ -380,6 +426,13 @@ jobs:
         with:
           path: ${{ steps.vars.outputs.ort_archive }}
           key: spacemit-ort-ohos-archive-${{ steps.vars.outputs.ort_cache_key }}-${{ runner.os }}
+
+      - name: Cache SpacemiT OHOS SPERT archive
+        id: cache-spert
+        uses: actions/cache@v5
+        with:
+          path: ${{ steps.vars.outputs.spert_archive }}
+          key: spacemit-spert-ohos-archive-${{ steps.vars.outputs.spert_cache_key }}-${{ runner.os }}
 
       - name: Prepare SpacemiT OHOS Toolchain
         shell: bash
@@ -429,6 +482,31 @@ jobs:
 
           echo "SPACEMIT_ORT_DIR=${ORT_DIR}" >> "$GITHUB_ENV"
 
+      - name: Prepare SpacemiT OHOS SPERT
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          mkdir -p "$(dirname "$SPACEMIT_SPERT_OHOS_ARCHIVE")"
+          if [[ ! -f "$SPACEMIT_SPERT_OHOS_ARCHIVE" ]]; then
+            curl -L --fail --retry 5 --retry-all-errors \
+              -o "$SPACEMIT_SPERT_OHOS_ARCHIVE" \
+              "$SPACEMIT_SPERT_OHOS_URL"
+          fi
+
+          rm -rf "$SPACEMIT_SPERT_OHOS_DIR"
+          mkdir -p "$SPACEMIT_SPERT_OHOS_DIR"
+          tar -xzf "$SPACEMIT_SPERT_OHOS_ARCHIVE" -C "$SPACEMIT_SPERT_OHOS_DIR" --strip-components=1
+
+          SPERT_DIR="${PWD}/${SPACEMIT_SPERT_OHOS_DIR}"
+          if [[ ! -d "${SPERT_DIR}/include" || ! -d "${SPERT_DIR}/lib" ]]; then
+            echo "error: invalid SPERT_DIR layout at ${SPERT_DIR}" >&2
+            find "$SPACEMIT_SPERT_OHOS_DIR" -maxdepth 2 -type d | sort
+            exit 1
+          fi
+
+          echo "SPERT_DIR=${SPERT_DIR}" >> "$GITHUB_ENV"
+
       - name: Build (OHOS)
         shell: bash
         run: |
@@ -462,7 +540,8 @@ jobs:
               -DCMAKE_INSTALL_PREFIX=build-ohos/installed \
               -DCMAKE_TOOLCHAIN_FILE=${PWD}/cmake/riscv64-spacemit-ohos.cmake \
               -DLLAMA_SERVER_SMT_MTMD=ON \
-              -DSPACEMIT_ORT_DIR=${SPACEMIT_ORT_DIR}
+              -DSPACEMIT_ORT_DIR=${SPACEMIT_ORT_DIR} \
+              -DSPERT_DIR=${SPERT_DIR}
 
           cmake --build build-ohos --parallel "$(nproc)" --config Release
 

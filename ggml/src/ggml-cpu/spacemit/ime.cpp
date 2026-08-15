@@ -14,6 +14,7 @@
 #include "repack.h"
 #include "rvv_kernels.h"
 #include "spine_mem_pool.h"
+#include "spacemit_spert_adapter.h"
 #include "traits.h"
 #include "vec.h"
 
@@ -338,8 +339,8 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS> class tensor_
 
         uintptr_t ws_ptr = reinterpret_cast<uintptr_t>(params->wdata);
 
-        void *        tcm_buffer      = ggml::cpu::riscv64_spacemit::tls_context.tcm_buffer;
-        const int64_t tcm_buffer_size = ggml::cpu::riscv64_spacemit::tls_context.tcm_buffer_size;
+        long          tcm_buffer_size = 0;
+        void *        tcm_buffer      = spacemit_spert_shared_buffer(&tcm_buffer_size);
 
         auto * quant_a_buffer = reinterpret_cast<uint8_t *>(ws_ptr);
 
@@ -353,7 +354,7 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS> class tensor_
         const int64_t barrier_idx = static_cast<int64_t>(ith / 2);
 
         GGML_ASSERT(global_spine_env_info.init_barrier != nullptr);
-        GGML_ASSERT(barrier_idx < spine_init_barrier_count);
+        GGML_ASSERT(barrier_idx < static_cast<int64_t>(spine_init_barrier_count));
         spine_barrier_t * cur_barrier = &global_spine_env_info.init_barrier[barrier_idx];
 
         if (gemm_m == 1) {
@@ -388,7 +389,7 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS> class tensor_
             }
         }
 
-        ggml_barrier(params->threadpool);
+        spacemit_spert_grid_sync();
 
         const int64_t gemm_m_stride     = gemm_n / gemm_m > 64 ? gemm_m : 16;
         const int64_t gemm_m_blocked    = spacemit_kernels::div_round_up(gemm_m, gemm_m_stride);
@@ -734,10 +735,10 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS> class tensor_
         const int64_t barrier_idx = static_cast<int64_t>(ith / 2);
 
         GGML_ASSERT(global_spine_env_info.init_barrier != nullptr);
-        GGML_ASSERT(barrier_idx < spine_init_barrier_count);
+        GGML_ASSERT(barrier_idx < static_cast<int64_t>(spine_init_barrier_count));
         spine_barrier_t * cur_barrier = &global_spine_env_info.init_barrier[barrier_idx];
 
-        ggml_barrier(params->threadpool);
+        spacemit_spert_grid_sync();
 
         const size_t row_stride_b      = b_k_blks * get_repacked_block_type_size<BLOC_TYPE, INTER_SIZE, NB_COLS>();
         const size_t expert_b_stride   = ne01 * row_stride_b;
@@ -746,8 +747,8 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS> class tensor_
         std::array<const uint8_t *, 2> src_workspaces;
         std::array<float *, 2>         dst_workspaces;
 
-        auto *     tcm_buffer      = ggml::cpu::riscv64_spacemit::tls_context.tcm_buffer;
-        const auto tcm_buffer_size = ggml::cpu::riscv64_spacemit::tls_context.tcm_buffer_size;
+        long       tcm_buffer_size = 0;
+        auto *     tcm_buffer      = spacemit_spert_shared_buffer(&tcm_buffer_size);
 
         const auto valid_ep_count_t  = valid_ep_count[0];
         const auto valid_act_count_t = valid_act_count[0];
@@ -1248,36 +1249,26 @@ class tensor_traits_common : public tensor_traits_base {
         //     nchunk = nth;
         // }
 
-        int64_t nchunk = nth;
-
-        if (ith == 0) {
-            // Every thread starts at ith, so the first unprocessed chunk is nth.  This save a bit of coordination right at the start.
-            ggml_threadpool_chunk_set(params->threadpool, nth);
-        }
-
-        ggml_barrier(params->threadpool);
+        const int64_t nchunk = nth;
 
         // The number of elements in each chunk
         const int64_t dr = (nr + nchunk - 1) / nchunk;
 
-        // The first chunk comes from our thread_id, the rest will get auto-assigned.
-        int current_chunk = ith;
+        long   tcm_size = 0;
+        void * tcm_buf  = spacemit_spert_shared_buffer(&tcm_size);
 
-        while (current_chunk < nchunk) {
+        const int current_chunk = ith;
+        if (current_chunk < nchunk) {
             const int64_t ir0 = dr * current_chunk;
             const int64_t ir1 = MIN(ir0 + dr, nr);
 
             if (use_tiled) {
                 spacemit_kernels::rvv::forward_flash_attn_ext_f16_tiled_vlen1024_vf16(
-                    params, dst, ir0, ir1, ggml::cpu::riscv64_spacemit::tls_context.tcm_buffer,
-                    ggml::cpu::riscv64_spacemit::tls_context.tcm_buffer_size);
+                    params, dst, ir0, ir1, tcm_buf, tcm_size);
             } else {
                 spacemit_kernels::rvv::forward_flash_attn_ext_f16_one_chunk_vlen1024_vf16(
-                    params, dst, ir0, ir1, ggml::cpu::riscv64_spacemit::tls_context.tcm_buffer,
-                    ggml::cpu::riscv64_spacemit::tls_context.tcm_buffer_size);
+                    params, dst, ir0, ir1, tcm_buf, tcm_size);
             }
-
-            current_chunk = ggml_threadpool_chunk_add(params->threadpool, 1);
         }
     }
 
@@ -1777,90 +1768,7 @@ static int bind_ai_thread() {
     return 0;
 }
 
-void ggml_backend_cpu_riscv64_spacemit_set_numa_thread_affinity(int thread_n) {
-    int cpu_id = sched_getcpu();
-    if (ggml::cpu::riscv64_spacemit::global_spine_env_info.use_ime2 &&
-        (cpu_id < 0 || cpu_id >= 64 ||
-         !((1ULL << cpu_id) & ggml::cpu::riscv64_spacemit::global_spine_env_info.cpu_mask))) {
-        GGML_PRINT_DEBUG("bind_ai_thread for thread %d, pid %d\n", thread_n, getpid());
-        bind_ai_thread();
-    }
-
-    if (ggml::cpu::riscv64_spacemit::global_spine_env_info.use_tcm &&
-        ggml::cpu::riscv64_spacemit::tls_context.cpu_id == -1) {
-        CPU_ZERO(&(ggml::cpu::riscv64_spacemit::tls_context.cpuset));
-        pthread_t    main_thread     = pthread_self();
-        const auto & perfer_core_ids = ggml::cpu::riscv64_spacemit::global_spine_env_info.perfer_core_ids;
-        if (thread_n < 0 || static_cast<size_t>(thread_n) >= perfer_core_ids.size()) {
-            GGML_ABORT("thread_n %d exceeds perfer_core_ids size %zu\n", thread_n, perfer_core_ids.size());
-        }
-        auto perfer_cpu_id = perfer_core_ids[static_cast<size_t>(thread_n)];
-        CPU_SET(perfer_cpu_id, &(ggml::cpu::riscv64_spacemit::tls_context.cpuset));
-        int s =
-            pthread_setaffinity_np(main_thread, sizeof(cpu_set_t), &(ggml::cpu::riscv64_spacemit::tls_context.cpuset));
-        if (s != 0) {
-            GGML_ABORT("set thread affinity error for thread_n %d, cpu_id %d\n", thread_n, perfer_cpu_id);
-        }
-
-        int ai_cpu_id                                   = ggml_spacemit_ai_cpu_id_for_thread(thread_n);
-        ggml::cpu::riscv64_spacemit::tls_context.cpu_id = ai_cpu_id;
-        ggml::cpu::riscv64_spacemit::tls_context.tcm_buffer =
-            ggml::cpu::riscv64_spacemit::spine_mem_pool_tcm_mem_get(ai_cpu_id);
-        ggml::cpu::riscv64_spacemit::tls_context.tcm_buffer_size =
-            ggml::cpu::riscv64_spacemit::global_spine_env_info.tcm_blk_size;
-    }
-}
-
-void ggml_backend_cpu_riscv64_spacemit_clear_numa_thread_affinity_threaded(int thread_n) {
-    (void) thread_n;
-}
-
-void ggml_backend_cpu_riscv64_spacemit_tcm_mem_wait_all(int n_threads) {
-    if (!ggml::cpu::riscv64_spacemit::global_spine_env_info.use_tcm) {
-        return;
-    }
-
-    for (int i = 0; i < n_threads; ++i) {
-        if (ggml_spacemit_tcm_buffer_for_thread(i) == nullptr) {
-            continue;
-        }
-
-        const int ai_cpu_id = ggml_spacemit_ai_cpu_id_for_thread(i);
-        void *    rt        = ggml::cpu::riscv64_spacemit::spine_mem_pool_tcm_mem_wait(ai_cpu_id);
-        if (rt == nullptr) {
-            for (int j = i; j-- > 0;) {
-                if (ggml_spacemit_tcm_buffer_for_thread(j) == nullptr) {
-                    continue;
-                }
-
-                const int acquired_ai_cpu_id = ggml_spacemit_ai_cpu_id_for_thread(j);
-                ggml::cpu::riscv64_spacemit::spine_mem_pool_tcm_mem_release(acquired_ai_cpu_id);
-            }
-            GGML_ABORT("wait tcm buffer failed for cpu_id: %d", ai_cpu_id);
-        }
-    }
-}
-
-void ggml_backend_cpu_riscv64_spacemit_tcm_mem_release_all(int n_threads) {
-    if (!ggml::cpu::riscv64_spacemit::global_spine_env_info.use_tcm) {
-        return;
-    }
-
-    int first_failed_cpu_id = -1;
-    for (int i = n_threads; i-- > 0;) {
-        if (ggml_spacemit_tcm_buffer_for_thread(i) == nullptr) {
-            continue;
-        }
-
-        const int ai_cpu_id = ggml_spacemit_ai_cpu_id_for_thread(i);
-        auto      rt        = ggml::cpu::riscv64_spacemit::spine_mem_pool_tcm_mem_release(ai_cpu_id);
-        if (rt != 0 && first_failed_cpu_id < 0) {
-            first_failed_cpu_id = ai_cpu_id;
-        }
-    }
-
-    if (first_failed_cpu_id >= 0) {
-        GGML_ABORT("release tcm buffer failed for cpu_id: %d", first_failed_cpu_id);
-    }
+int ggml_backend_cpu_riscv64_spacemit_num_prefer_cores(void) {
+    return ggml::cpu::riscv64_spacemit::global_spine_env_info.num_perfer_cores;
 }
 }
