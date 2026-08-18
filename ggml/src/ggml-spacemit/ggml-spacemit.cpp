@@ -374,7 +374,7 @@ static size_t ggml_backend_spacemit_buffer_type_get_alloc_size(ggml_backend_buff
 }
 
 static bool ggml_backend_spacemit_buffer_type_is_host(ggml_backend_buffer_type_t buft) {
-    return true;
+    return false;
     GGML_UNUSED(buft);
 }
 
