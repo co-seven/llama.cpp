@@ -307,25 +307,168 @@ void forward_solve_tri_f32(ggml::spacemit::context & ctx, ggml_tensor * op) {
     }
 }
 
-// ── GATED DELTA NET ───────────────────────────────────────────────────────────
-// Scalar fallback — single-threaded on core 0
-void forward_gated_delta_net(ggml::spacemit::context & ctx, ggml_tensor * op) {
-    if (ctx.ith != 0) return;
+// ── SSM CONV ──────────────────────────────────────────────────────────────────
+// Ported from ggml_compute_forward_ssm_conv_f32, parallelised over d_inner rows.
+void forward_ssm_conv_f32(ggml::spacemit::context & ctx, ggml_tensor * op) {
+    const ggml_tensor * src0 = op->src[0]; // conv_x  {d_conv-1+n_t, d_inner, n_seqs}
+    const ggml_tensor * src1 = op->src[1]; // weight  {d_conv, d_inner}
 
-    // GATED_DELTA_NET is a complex state-space op; delegate to CPU reference
-    // by constructing a minimal params struct.  This avoids barrier issues
-    // because we run single-threaded (nth=1).
-    // We intentionally do NOT call ggml_compute_forward_* here because that
-    // would pull in the threadpool barrier.  Instead we just zero the output
-    // as a safe no-op placeholder until a proper implementation is added.
-    memset(op->data, 0, ggml_nbytes(op));
+    GGML_ASSERT(src0->nb[0] == sizeof(float));
+    GGML_ASSERT(src1->nb[0] == sizeof(float));
+    GGML_ASSERT(src0->nb[1] == src0->ne[0] * sizeof(float));
+
+    const int nc  = (int)src1->ne[0]; // d_conv
+    const int ncs = (int)src0->ne[0]; // d_conv - 1 + n_t
+    const int nr  = (int)src0->ne[1]; // d_inner
+    const int n_t = (int)op->ne[1];   // tokens per sequence
+    const int n_s = (int)op->ne[2];   // number of sequences
+
+    GGML_ASSERT(op->ne[0] == nr);
+
+    const int64_t dr  = (nr + ctx.nth - 1) / ctx.nth;
+    const int64_t ir0 = dr * ctx.ith;
+    const int64_t ir1 = std::min((int64_t)nr, ir0 + dr);
+
+    for (int i3 = 0; i3 < n_s; ++i3) {
+        for (int i2 = 0; i2 < n_t; ++i2) {
+            const float * s = (const float *)((const char *)src0->data
+                + ir0 * src0->nb[1] + i2 * src0->nb[0] + i3 * src0->nb[2]);
+            const float * c = (const float *)((const char *)src1->data
+                + ir0 * src1->nb[1]);
+            float * x = (float *)((char *)op->data
+                + ir0 * op->nb[0] + i2 * op->nb[1] + i3 * op->nb[2]);
+
+            const int ir = (int)(ir1 - ir0);
+            for (int i1 = 0; i1 < ir; ++i1) {
+                float sumf = 0.0f;
+                for (int i0 = 0; i0 < nc; ++i0) {
+                    sumf += s[i0 + i1 * ncs] * c[i0 + i1 * nc];
+                }
+                x[i1] = sumf;
+            }
+        }
+    }
 }
 
-// ── SSM CONV ──────────────────────────────────────────────────────────────────
-// Scalar fallback — single-threaded on core 0
-void forward_ssm_conv_f32(ggml::spacemit::context & ctx, ggml_tensor * op) {
-    if (ctx.ith != 0) return;
-    memset(op->data, 0, ggml_nbytes(op));
+// ── GATED DELTA NET ───────────────────────────────────────────────────────────
+// Ported from ggml_compute_forward_gated_delta_net_one_chunk.
+// Parallelised over heads × sequences (ir = head_index + seq * H).
+void forward_gated_delta_net(ggml::spacemit::context & ctx, ggml_tensor * op) {
+    ggml_tensor * src_q     = op->src[0];
+    ggml_tensor * src_k     = op->src[1];
+    ggml_tensor * src_v     = op->src[2];
+    ggml_tensor * src_g     = op->src[3];
+    ggml_tensor * src_beta  = op->src[4];
+    ggml_tensor * src_state = op->src[5];
+
+    const int64_t S_v      = src_v->ne[0];
+    const int64_t H        = src_v->ne[1];
+    const int64_t n_tokens = src_v->ne[2];
+    const int64_t n_seqs   = src_v->ne[3];
+
+    const int64_t K = ggml_get_op_params_i32(op, 0);
+    GGML_ASSERT(K >= 1);
+
+    const int64_t nr  = H * n_seqs;
+    const int64_t dr  = (nr + ctx.nth - 1) / ctx.nth;
+    const int64_t ir0 = dr * ctx.ith;
+    const int64_t ir1 = std::min(nr, ir0 + dr);
+
+    const int64_t state_seq_stride = src_state->nb[3] / sizeof(float);
+    const int64_t attn_score_elems = S_v * H * n_tokens * n_seqs;
+    const int64_t state_size_per_snap = S_v * S_v * H * n_seqs;
+
+    float * attn_out_base  = (float *)op->data;
+    float * state_out_base = (float *)op->data + attn_score_elems;
+    const float * state_in_base = (const float *)src_state->data;
+
+    const float scale = 1.0f / sqrtf((float)S_v);
+    const bool kda = (src_g->ne[0] == S_v);
+
+    // scratch buffer for delta (S_v floats) and optional state_work (S_v*S_v floats)
+    std::vector<float> scratch((size_t)(S_v + (K > 1 ? S_v * S_v : 0)));
+    float * delta      = scratch.data();
+    float * state_work = K > 1 ? (delta + S_v) : nullptr;
+
+    // local tensor nb helpers
+    const size_t nbq1 = src_q->nb[1], nbq2 = src_q->nb[2], nbq3 = src_q->nb[3];
+    const size_t nbk1 = src_k->nb[1], nbk2 = src_k->nb[2], nbk3 = src_k->nb[3];
+    const size_t nbv1 = src_v->nb[1], nbv2 = src_v->nb[2], nbv3 = src_v->nb[3];
+    const size_t nbg1 = src_g->nb[1], nbg2 = src_g->nb[2], nbg3 = src_g->nb[3];
+    const size_t nbb1 = src_beta->nb[1], nbb2 = src_beta->nb[2], nbb3 = src_beta->nb[3];
+    const int64_t neq1 = src_q->ne[1], neq3 = src_q->ne[3];
+    const int64_t nek1 = src_k->ne[1], nek3 = src_k->ne[3];
+    const int64_t nev3 = src_v->ne[3];
+    const int64_t rq3  = nev3 / neq3;
+    const int64_t rk3  = nev3 / nek3;
+
+    for (int64_t ir = ir0; ir < ir1; ++ir) {
+        const int64_t iv1 = ir % H;   // head index
+        const int64_t iv3 = ir / H;   // sequence index
+
+        const int64_t iq1 = iv1 % neq1;
+        const int64_t ik1 = iv1 % nek1;
+        const int64_t iq3 = iv3 / rq3;
+        const int64_t ik3 = iv3 / rk3;
+
+        float * s_out = (K > 1)
+            ? state_work
+            : state_out_base + (iv3 * H + iv1) * S_v * S_v;
+
+        const float * s_in = state_in_base + iv3 * state_seq_stride + iv1 * S_v * S_v;
+        memcpy(s_out, s_in, (size_t)(S_v * S_v) * sizeof(float));
+
+        float * attn_data = attn_out_base + (iv3 * n_tokens * H + iv1) * S_v;
+
+        for (int64_t t = 0; t < n_tokens; t++) {
+            const float * q_d = (const float *)((const char *)src_q->data + iq3*nbq3 + t*nbq2 + iq1*nbq1);
+            const float * k_d = (const float *)((const char *)src_k->data + ik3*nbk3 + t*nbk2 + ik1*nbk1);
+            const float * v_d = (const float *)((const char *)src_v->data + iv3*nbv3 + t*nbv2 + iv1*nbv1);
+            const float   beta_val = *(const float *)((const char *)src_beta->data + iv3*nbb3 + t*nbb2 + iv1*nbb1);
+            const float * g_d      =  (const float *)((const char *)src_g->data    + iv3*nbg3 + t*nbg2 + iv1*nbg1);
+
+            if (kda) {
+                for (int64_t i = 0; i < S_v; ++i) delta[i] = expf(g_d[i]);
+                for (int64_t j = 0; j < S_v; ++j) {
+                    float * row = &s_out[j * S_v];
+                    for (int64_t i = 0; i < S_v; ++i) row[i] *= delta[i];
+                }
+            } else {
+                float eg = expf(g_d[0]);
+                for (int64_t i = 0; i < S_v * S_v; ++i) s_out[i] *= eg;
+            }
+
+            for (int64_t j = 0; j < S_v; ++j) {
+                float sum = 0.0f;
+                const float * row = &s_out[j * S_v];
+                for (int64_t i = 0; i < S_v; ++i) sum += row[i] * k_d[i];
+                delta[j] = (v_d[j] - sum) * beta_val;
+            }
+
+            for (int64_t j = 0; j < S_v; ++j) {
+                float * row = &s_out[j * S_v];
+                for (int64_t i = 0; i < S_v; ++i) row[i] += k_d[i] * delta[j];
+            }
+
+            for (int64_t j = 0; j < S_v; ++j) {
+                float sum = 0.0f;
+                const float * row = &s_out[j * S_v];
+                for (int64_t i = 0; i < S_v; ++i) sum += row[i] * q_d[i];
+                attn_data[j] = sum * scale;
+            }
+
+            attn_data += S_v * H;
+
+            if (K > 1) {
+                const int64_t target_slot = n_tokens - 1 - t;
+                if (target_slot >= 0 && target_slot < K) {
+                    float * curr_state_o = state_out_base + target_slot * state_size_per_snap
+                                         + (iv3 * H + iv1) * S_v * S_v;
+                    memcpy(curr_state_o, s_out, (size_t)(S_v * S_v) * sizeof(float));
+                }
+            }
+        }
+    }
 }
 
 } // namespace spacemit_kernels::scalar
