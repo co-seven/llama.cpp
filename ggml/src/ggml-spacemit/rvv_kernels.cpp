@@ -3634,14 +3634,25 @@ static void forward_rope_impl(ggml::spacemit::context & ctx, ggml_tensor * op) {
     const ggml_tensor * src2         = op->src[2];  // freq_factors, may be null
     const float *       freq_factors = src2 ? (const float *) src2->data : nullptr;
 
-    const int n_dims = ggml_get_op_params_i32(op, 1);
-    const int mode   = ggml_get_op_params_i32(op, 2);
-    float freq_base;
-    float freq_scale;
-    float attn_factor;
-    memcpy(&freq_base,   op->op_params + 5, sizeof(float));
-    memcpy(&freq_scale,  op->op_params + 6, sizeof(float));
-    memcpy(&attn_factor, op->op_params + 8, sizeof(float));
+    const int n_dims     = ggml_get_op_params_i32(op, 1);
+    const int mode       = ggml_get_op_params_i32(op, 2);
+    const int n_ctx_orig = ggml_get_op_params_i32(op, 4);
+
+    float freq_base, freq_scale, ext_factor, attn_factor, beta_fast, beta_slow;
+    memcpy(&freq_base,   op->op_params + 5,  sizeof(float));
+    memcpy(&freq_scale,  op->op_params + 6,  sizeof(float));
+    memcpy(&ext_factor,  op->op_params + 7,  sizeof(float));
+    memcpy(&attn_factor, op->op_params + 8,  sizeof(float));
+    memcpy(&beta_fast,   op->op_params + 9,  sizeof(float));
+    memcpy(&beta_slow,   op->op_params + 10, sizeof(float));
+
+    // YaRN correction dims
+    float corr_dims[2] = { 0.0f, 0.0f };
+    if (ext_factor != 0.0f) {
+        ggml_rope_yarn_corr_dims(n_dims, n_ctx_orig, freq_base, beta_fast, beta_slow, corr_dims);
+        // mscale correction for interpolation
+        attn_factor *= 1.0f + 0.1f * logf(1.0f / freq_scale);
+    }
 
     const int64_t nr  = ggml_nrows(op);
     const int64_t dr  = (nr + ctx.nth - 1) / ctx.nth;
@@ -3657,11 +3668,21 @@ static void forward_rope_impl(ggml::spacemit::context & ctx, ggml_tensor * op) {
         const int64_t i2 = (ir / op->ne[1]) % op->ne[2];
         const int64_t i1 = ir % op->ne[1];
         if (i2 != last_i2) {
-            float theta = pos[i2] * freq_scale;
+            float theta = (float) pos[i2];  // unscaled base theta
             for (int i0 = 0; i0 < n_dims; i0 += 2) {
-                const float ff    = freq_factors ? freq_factors[i0 / 2] : 1.0f;
-                cache[i0 + 0] = cosf(theta * ff) * attn_factor;
-                cache[i0 + 1] = sinf(theta * ff) * attn_factor;
+                const float ff          = freq_factors ? freq_factors[i0 / 2] : 1.0f;
+                const float theta_extrap = theta / ff;
+                const float theta_interp = freq_scale * theta_extrap;
+                float t;
+                if (ext_factor != 0.0f) {
+                    const float y        = (i0 / 2 - corr_dims[0]) / fmaxf(0.001f, corr_dims[1] - corr_dims[0]);
+                    const float ramp_mix = (1.0f - fminf(1.0f, fmaxf(0.0f, y))) * ext_factor;
+                    t = theta_interp * (1.0f - ramp_mix) + theta_extrap * ramp_mix;
+                } else {
+                    t = theta_interp;
+                }
+                cache[i0 + 0] = cosf(t) * attn_factor;
+                cache[i0 + 1] = sinf(t) * attn_factor;
                 theta *= theta_scale;
             }
             last_i2 = i2;

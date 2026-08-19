@@ -1629,9 +1629,7 @@ const ggml::spacemit::tensor_traits_base * ggml_spacemit_get_tensor_traits(const
         case GGML_OP_ROPE:
             if (op->src[0] && op->src[1]) {
                 float freq_base;
-                float ext_factor;
                 memcpy(&freq_base,  op->op_params + 5, sizeof(float));
-                memcpy(&ext_factor, op->op_params + 7, sizeof(float));
                 const int n_dims = ggml_get_op_params_i32(op, 1);
                 const int mode   = ggml_get_op_params_i32(op, 2);
                 // src[2] is optional freq_factors (F32 per-dim scale); kernel handles null and non-null
@@ -1642,7 +1640,7 @@ const ggml::spacemit::tensor_traits_base * ggml_spacemit_get_tensor_traits(const
                     op->src[0]->nb[0] == ggml_type_size(op->src[0]->type) && op->nb[0] == ggml_type_size(op->type) &&
                     op->src[1]->nb[0] == sizeof(int32_t) && ggml_are_same_shape(op, op->src[0]) &&
                     ggml_nelements(op->src[1]) >= op->ne[2] && freq_base > 0.0f &&
-                    n_dims > 0 && n_dims <= op->ne[0] && n_dims <= 512 && n_dims % 2 == 0 && ext_factor == 0.0f &&
+                    n_dims > 0 && n_dims <= op->ne[0] && n_dims <= 512 && n_dims % 2 == 0 &&
                     (mode == GGML_ROPE_TYPE_NORMAL || mode == GGML_ROPE_TYPE_NEOX)) {
                     return common;
                 }
