@@ -1632,16 +1632,22 @@ const ggml::spacemit::tensor_traits_base * ggml_spacemit_get_tensor_traits(const
                 memcpy(&freq_base,  op->op_params + 5, sizeof(float));
                 const int n_dims = ggml_get_op_params_i32(op, 1);
                 const int mode   = ggml_get_op_params_i32(op, 2);
-                // src[2] is optional freq_factors (F32 per-dim scale); kernel handles null and non-null
                 const bool src2_ok = op->src[2] == nullptr ||
                     (op->src[2]->type == GGML_TYPE_F32 && ggml_is_contiguous(op->src[2]));
-                if ((op->src[0]->type == GGML_TYPE_F32 || op->src[0]->type == GGML_TYPE_F16) &&
-                    op->type == op->src[0]->type && op->src[1]->type == GGML_TYPE_I32 && src2_ok &&
-                    op->src[0]->nb[0] == ggml_type_size(op->src[0]->type) && op->nb[0] == ggml_type_size(op->type) &&
-                    op->src[1]->nb[0] == sizeof(int32_t) && ggml_are_same_shape(op, op->src[0]) &&
-                    ggml_nelements(op->src[1]) >= op->ne[2] && freq_base > 0.0f &&
-                    n_dims > 0 && n_dims <= op->ne[0] && n_dims <= 512 && n_dims % 2 == 0 &&
-                    (mode == GGML_ROPE_TYPE_NORMAL || mode == GGML_ROPE_TYPE_NEOX)) {
+                const bool mode_ok = (mode == GGML_ROPE_TYPE_NORMAL ||
+                                      mode == GGML_ROPE_TYPE_NEOX   ||
+                                      mode == GGML_ROPE_TYPE_MROPE  ||
+                                      mode == GGML_ROPE_TYPE_IMROPE);
+                const bool c1 = (op->src[0]->type == GGML_TYPE_F32 || op->src[0]->type == GGML_TYPE_F16);
+                const bool c2 = op->type == op->src[0]->type;
+                const bool c3 = op->src[1]->type == GGML_TYPE_I32;
+                const bool c4 = src2_ok;
+                const bool c5 = op->src[0]->nb[0] == ggml_type_size(op->src[0]->type);
+                const bool c6 = op->nb[0] == ggml_type_size(op->type);
+                const bool c7 = freq_base > 0.0f;
+                const bool c8 = n_dims > 0 && n_dims <= op->ne[0] && n_dims <= 512 && n_dims % 2 == 0;
+                const bool c9 = mode_ok;
+                if (c1 && c2 && c3 && c4 && c5 && c6 && c7 && c8 && c9) {
                     return common;
                 }
             }

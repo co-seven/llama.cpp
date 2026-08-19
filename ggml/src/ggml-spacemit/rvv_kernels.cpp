@@ -3631,7 +3631,7 @@ template <typename T>
 static void forward_rope_impl(ggml::spacemit::context & ctx, ggml_tensor * op) {
     const ggml_tensor * src0         = op->src[0];
     const ggml_tensor * src1         = op->src[1];
-    const ggml_tensor * src2         = op->src[2];  // freq_factors, may be null
+    const ggml_tensor * src2         = op->src[2];
     const float *       freq_factors = src2 ? (const float *) src2->data : nullptr;
 
     const int n_dims     = ggml_get_op_params_i32(op, 1);
@@ -3646,14 +3646,21 @@ static void forward_rope_impl(ggml::spacemit::context & ctx, ggml_tensor * op) {
     memcpy(&beta_fast,   op->op_params + 9,  sizeof(float));
     memcpy(&beta_slow,   op->op_params + 10, sizeof(float));
 
+    int sections[4] = {0, 0, 0, 0};
+    memcpy(sections, op->op_params + 11, sizeof(int) * 4);
+
+    const bool mrope_used = (mode & GGML_ROPE_TYPE_MROPE) != 0;
+    const bool is_imrope  = (mode == GGML_ROPE_TYPE_IMROPE);
+
     // YaRN correction dims
     float corr_dims[2] = { 0.0f, 0.0f };
+    float mscale = attn_factor;
     if (ext_factor != 0.0f) {
         ggml_rope_yarn_corr_dims(n_dims, n_ctx_orig, freq_base, beta_fast, beta_slow, corr_dims);
-        // mscale correction for interpolation
-        attn_factor *= 1.0f + 0.1f * logf(1.0f / freq_scale);
+        mscale *= 1.0f + 0.1f * logf(1.0f / freq_scale);
     }
 
+    const int64_t ne2 = op->ne[2];  // seq-len dimension
     const int64_t nr  = ggml_nrows(op);
     const int64_t dr  = (nr + ctx.nth - 1) / ctx.nth;
     const int64_t ir0 = dr * ctx.ith;
@@ -3661,54 +3668,103 @@ static void forward_rope_impl(ggml::spacemit::context & ctx, ggml_tensor * op) {
     const int32_t * pos = (const int32_t *) src1->data;
     const float theta_scale = powf(freq_base, -2.0f / n_dims);
 
+    const int sect_dims = sections[0] + sections[1] + sections[2] + sections[3];
+    const int sec_w     = sections[0] + sections[1];
+    const int sec_e     = sec_w + sections[2];
+
     float cache[512];
     int64_t last_i2 = -1;
+
     for (int64_t ir = ir0; ir < ir1; ++ir) {
         const int64_t i3 = ir / (op->ne[2] * op->ne[1]);
         const int64_t i2 = (ir / op->ne[1]) % op->ne[2];
         const int64_t i1 = ir % op->ne[1];
+
         if (i2 != last_i2) {
-            float theta = (float) pos[i2];  // unscaled base theta
-            for (int i0 = 0; i0 < n_dims; i0 += 2) {
-                const float ff          = freq_factors ? freq_factors[i0 / 2] : 1.0f;
-                const float theta_extrap = theta / ff;
-                const float theta_interp = freq_scale * theta_extrap;
-                float t;
-                if (ext_factor != 0.0f) {
-                    const float y        = (i0 / 2 - corr_dims[0]) / fmaxf(0.001f, corr_dims[1] - corr_dims[0]);
-                    const float ramp_mix = (1.0f - fminf(1.0f, fmaxf(0.0f, y))) * ext_factor;
-                    t = theta_interp * (1.0f - ramp_mix) + theta_extrap * ramp_mix;
-                } else {
-                    t = theta_interp;
+            if (!mrope_used) {
+                // Standard / YaRN rope
+                float theta = (float) pos[i2];
+                for (int i0 = 0; i0 < n_dims; i0 += 2) {
+                    const float ff           = freq_factors ? freq_factors[i0 / 2] : 1.0f;
+                    const float theta_extrap = theta / ff;
+                    const float theta_interp = freq_scale * theta_extrap;
+                    float t;
+                    if (ext_factor != 0.0f) {
+                        const float y        = (i0 / 2 - corr_dims[0]) / fmaxf(0.001f, corr_dims[1] - corr_dims[0]);
+                        const float ramp_mix = (1.0f - fminf(1.0f, fmaxf(0.0f, y))) * ext_factor;
+                        t = theta_interp * (1.0f - ramp_mix) + theta_extrap * ramp_mix;
+                    } else {
+                        t = theta_interp;
+                    }
+                    cache[i0 + 0] = cosf(t) * mscale;
+                    cache[i0 + 1] = sinf(t) * mscale;
+                    theta *= theta_scale;
                 }
-                cache[i0 + 0] = cosf(t) * attn_factor;
-                cache[i0 + 1] = sinf(t) * attn_factor;
-                theta *= theta_scale;
+            } else {
+                // M-RoPE / IMROPE: multiple position sequences in src1
+                const float p_t = (float) pos[i2];
+                const float p_h = (float) pos[i2 + ne2];
+                const float p_w = (float) pos[i2 + ne2 * 2];
+                const float p_e = (float) pos[i2 + ne2 * 3];
+
+                float theta_t = p_t;
+                float theta_h = p_h;
+                float theta_w = p_w;
+                float theta_e = p_e;
+
+                for (int i0 = 0; i0 < n_dims; i0 += 2) {
+                    const float ff = freq_factors ? freq_factors[i0 / 2] : 1.0f;
+                    int sector = (sect_dims > 0) ? (i0 / 2) % sect_dims : 0;
+
+                    float theta;
+                    if (is_imrope) {
+                        if      (sector % 3 == 0 && sector < 3 * sections[0]) theta = theta_t;
+                        else if (sector % 3 == 1 && sector < 3 * sections[1]) theta = theta_h;
+                        else if (sector % 3 == 2 && sector < 3 * sections[2]) theta = theta_w;
+                        else                                                    theta = theta_e;
+                    } else {
+                        if      (sector < sections[0])  theta = theta_t;
+                        else if (sector < sec_w)         theta = theta_h;
+                        else if (sector < sec_e)         theta = theta_w;
+                        else                             theta = theta_e;
+                    }
+
+                    const float theta_extrap = theta / ff;
+                    const float theta_interp = freq_scale * theta_extrap;
+                    float t;
+                    if (ext_factor != 0.0f) {
+                        const float y        = (i0 / 2 - corr_dims[0]) / fmaxf(0.001f, corr_dims[1] - corr_dims[0]);
+                        const float ramp_mix = (1.0f - fminf(1.0f, fmaxf(0.0f, y))) * ext_factor;
+                        t = theta_interp * (1.0f - ramp_mix) + theta_extrap * ramp_mix;
+                    } else {
+                        t = theta_interp;
+                    }
+                    cache[i0 + 0] = cosf(t) * mscale;
+                    cache[i0 + 1] = sinf(t) * mscale;
+
+                    theta_t *= theta_scale;
+                    theta_h *= theta_scale;
+                    theta_w *= theta_scale;
+                    theta_e *= theta_scale;
+                }
             }
             last_i2 = i2;
         }
 
         const T * src = (const T *) ((const char *) src0->data + i3 * src0->nb[3] + i2 * src0->nb[2] + i1 * src0->nb[1]);
-        T * dst = (T *) ((char *) op->data + i3 * op->nb[3] + i2 * op->nb[2] + i1 * op->nb[1]);
-        if (mode == GGML_ROPE_TYPE_NEOX) {
-            const int offset = n_dims / 2;
-            for (int i0 = 0; i0 < n_dims; i0 += 2) {
-                const int ic = i0 / 2;
-                const float x0 = src[ic];
-                const float x1 = src[ic + offset];
-                dst[ic]          = (T) (x0 * cache[i0] - x1 * cache[i0 + 1]);
-                dst[ic + offset] = (T) (x0 * cache[i0 + 1] + x1 * cache[i0]);
-            }
-        } else {
-            for (int i0 = 0; i0 < n_dims; i0 += 2) {
-                const float x0 = src[i0];
-                const float x1 = src[i0 + 1];
-                dst[i0]     = (T) (x0 * cache[i0] - x1 * cache[i0 + 1]);
-                dst[i0 + 1] = (T) (x0 * cache[i0 + 1] + x1 * cache[i0]);
-            }
+        T * dst_row   = (T *) ((char *) op->data + i3 * op->nb[3] + i2 * op->nb[2] + i1 * op->nb[1]);
+
+        // NEOX / MROPE / IMROPE all use half-offset rotation
+        const int offset = n_dims / 2;
+        for (int i0 = 0; i0 < n_dims; i0 += 2) {
+            const int ic = i0 / 2;
+            const float x0 = (float) src[ic];
+            const float x1 = (float) src[ic + offset];
+            dst_row[ic]          = (T) (x0 * cache[i0] - x1 * cache[i0 + 1]);
+            dst_row[ic + offset] = (T) (x0 * cache[i0 + 1] + x1 * cache[i0]);
         }
         for (int64_t i0 = n_dims; i0 < op->ne[0]; ++i0) {
-            dst[i0] = src[i0];
+            dst_row[i0] = src[i0];
         }
     }
 }
