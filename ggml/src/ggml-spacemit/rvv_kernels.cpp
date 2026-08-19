@@ -3390,6 +3390,46 @@ void forward_unary_silu_f32(ggml::spacemit::context & ctx, ggml_tensor * op) {
     }
 }
 
+// Helper macro: simple elementwise F32 unary kernel with RVV
+#define DEFINE_UNARY_F32_RVV(name, rvv_expr) \
+void name(ggml::spacemit::context & ctx, ggml_tensor * op) { \
+    const ggml_tensor * src0 = op->src[0]; \
+    ggml_tensor *       dst  = op; \
+    GGML_ASSERT(src0->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32); \
+    GGML_ASSERT(ggml_is_contiguous(src0) && ggml_are_same_shape(src0, dst)); \
+    const int64_t ne  = ggml_nelements(src0); \
+    const int64_t ith = ctx.ith, nth = ctx.nth; \
+    const int64_t dr  = (ne + nth - 1) / nth; \
+    const int64_t i0  = dr * ith, i1 = MIN(i0 + dr, ne); \
+    const float * sp  = (const float *) src0->data; \
+    float *       dp  = (float *)       dst->data; \
+    int64_t i = i0; \
+    while (i < i1) { \
+        const size_t vl = __riscv_vsetvl_e32m2(i1 - i); \
+        vfloat32m2_t v  = __riscv_vle32_v_f32m2(sp + i, vl); \
+        vfloat32m2_t r  = (rvv_expr); \
+        __riscv_vse32_v_f32m2(dp + i, r, vl); \
+        i += vl; \
+    } \
+}
+
+DEFINE_UNARY_F32_RVV(forward_unary_exp_f32,
+    rvv_expf_approx_f32m2(v, vl))
+DEFINE_UNARY_F32_RVV(forward_unary_sigmoid_f32,
+    __riscv_vfdiv_vv_f32m2(
+        __riscv_vfmv_v_f_f32m2(1.0f, vl),
+        __riscv_vfadd_vf_f32m2(rvv_expf_approx_f32m2(__riscv_vfneg_v_f32m2(v, vl), vl), 1.0f, vl),
+        vl))
+DEFINE_UNARY_F32_RVV(forward_unary_neg_f32,
+    __riscv_vfneg_v_f32m2(v, vl))
+DEFINE_UNARY_F32_RVV(forward_unary_softplus_f32,
+    /* softplus(x) = log(1 + exp(x)) */
+    __riscv_vfadd_vv_f32m2(
+        __riscv_vfmax_vf_f32m2(v, 0.0f, vl),
+        rvv_expf_approx_f32m2(
+            __riscv_vfneg_v_f32m2(__riscv_vfabs_v_f32m2(v, vl), vl), vl),
+        vl))
+
 void forward_soft_max_f32(ggml::spacemit::context & ctx, ggml_tensor * op) {
     const ggml_tensor * src0 = op->src[0];
     ggml_tensor *       dst  = op;

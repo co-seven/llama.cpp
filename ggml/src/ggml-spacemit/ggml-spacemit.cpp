@@ -650,6 +650,16 @@ static bool ggml_backend_spacemit_device_supports_op(ggml_backend_dev_t dev, con
         case GGML_OP_SUM_ROWS:
         case GGML_OP_SOFT_MAX:
         case GGML_OP_FLASH_ATTN_EXT:
+        case GGML_OP_L2_NORM:
+        case GGML_OP_FILL:
+        case GGML_OP_CUMSUM:
+        case GGML_OP_PAD:
+        case GGML_OP_TRI:
+        case GGML_OP_DIAG:
+        case GGML_OP_SET:
+        case GGML_OP_SOLVE_TRI:
+        case GGML_OP_GATED_DELTA_NET:
+        case GGML_OP_SSM_CONV:
             supp = ggml_spacemit_get_tensor_traits(op) != nullptr;
             break;
 

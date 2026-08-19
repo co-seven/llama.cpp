@@ -10,6 +10,7 @@
 #include "ime_kernels.h"
 #include "repack.h"
 #include "rvv_kernels.h"
+#include "scalar_kernels.h"
 #include "spacemit-context.h"
 #include "spacemit-env.h"
 #include "spine_mem_pool.h"
@@ -996,6 +997,13 @@ class tensor_traits_common : public ggml::spacemit::tensor_traits_base {
                     spacemit_kernels::rvv::forward_mul_mat_f16_f32(ctx, op);
                     return true;
                 }
+                if (op->src[0]->type == GGML_TYPE_F32 &&
+                    op->src[1]->type == GGML_TYPE_F32 &&
+                    op->src[0]->nb[0] == sizeof(float) &&
+                    op->src[1]->nb[0] == sizeof(float)) {
+                    spacemit_kernels::scalar::forward_mul_mat_f32(ctx, op);
+                    return true;
+                }
                 return false;
             case GGML_OP_NORM:
                 switch (op->src[0]->type) {
@@ -1073,6 +1081,18 @@ class tensor_traits_common : public ggml::spacemit::tensor_traits_base {
                         return true;
                     case GGML_UNARY_OP_SILU:
                         spacemit_kernels::rvv::forward_unary_silu_f32(ctx, op);
+                        return true;
+                    case GGML_UNARY_OP_EXP:
+                        spacemit_kernels::rvv::forward_unary_exp_f32(ctx, op);
+                        return true;
+                    case GGML_UNARY_OP_SIGMOID:
+                        spacemit_kernels::rvv::forward_unary_sigmoid_f32(ctx, op);
+                        return true;
+                    case GGML_UNARY_OP_NEG:
+                        spacemit_kernels::rvv::forward_unary_neg_f32(ctx, op);
+                        return true;
+                    case GGML_UNARY_OP_SOFTPLUS:
+                        spacemit_kernels::rvv::forward_unary_softplus_f32(ctx, op);
                         return true;
                     default:
                         return false;
@@ -1234,9 +1254,37 @@ class tensor_traits_common : public ggml::spacemit::tensor_traits_base {
                     return false;
                 }
                 return true;
-            // TODO For GGML_OP_GATED_DELTA_NET
-            // case GGML_OP_GATED_DELTA_NET:
-            //     return true;
+            // Scalar ops dispatched to scalar_kernels
+            case GGML_OP_L2_NORM:
+                spacemit_kernels::scalar::forward_l2_norm_f32(ctx, op);
+                return true;
+            case GGML_OP_FILL:
+                spacemit_kernels::scalar::forward_fill_f32(ctx, op);
+                return true;
+            case GGML_OP_CUMSUM:
+                spacemit_kernels::scalar::forward_cumsum_f32(ctx, op);
+                return true;
+            case GGML_OP_PAD:
+                spacemit_kernels::scalar::forward_pad_f32(ctx, op);
+                return true;
+            case GGML_OP_TRI:
+                spacemit_kernels::scalar::forward_tri_f32(ctx, op);
+                return true;
+            case GGML_OP_DIAG:
+                spacemit_kernels::scalar::forward_diag_f32(ctx, op);
+                return true;
+            case GGML_OP_SET:
+                spacemit_kernels::scalar::forward_set_f32(ctx, op);
+                return true;
+            case GGML_OP_SOLVE_TRI:
+                spacemit_kernels::scalar::forward_solve_tri_f32(ctx, op);
+                return true;
+            case GGML_OP_GATED_DELTA_NET:
+                spacemit_kernels::scalar::forward_gated_delta_net(ctx, op);
+                return true;
+            case GGML_OP_SSM_CONV:
+                spacemit_kernels::scalar::forward_ssm_conv_f32(ctx, op);
+                return true;
             default:
                 break;
         }
@@ -1738,9 +1786,13 @@ const ggml::spacemit::tensor_traits_base * ggml_spacemit_get_tensor_traits(const
             break;
         case GGML_OP_UNARY:
             if (op->src[0] && op->src[0]->type == GGML_TYPE_F32 && ggml_is_contiguous(op->src[0]) &&
-                (ggml_get_unary_op(op) == GGML_UNARY_OP_TANH ||
-                 ggml_get_unary_op(op) == GGML_UNARY_OP_GELU ||
-                 ggml_get_unary_op(op) == GGML_UNARY_OP_SILU)) {
+                (ggml_get_unary_op(op) == GGML_UNARY_OP_TANH    ||
+                 ggml_get_unary_op(op) == GGML_UNARY_OP_GELU    ||
+                 ggml_get_unary_op(op) == GGML_UNARY_OP_SILU    ||
+                 ggml_get_unary_op(op) == GGML_UNARY_OP_EXP     ||
+                 ggml_get_unary_op(op) == GGML_UNARY_OP_SIGMOID ||
+                 ggml_get_unary_op(op) == GGML_UNARY_OP_NEG     ||
+                 ggml_get_unary_op(op) == GGML_UNARY_OP_SOFTPLUS)) {
                 return common;
             }
             break;
@@ -1768,6 +1820,62 @@ const ggml::spacemit::tensor_traits_base * ggml_spacemit_get_tensor_traits(const
                     }
                 }
             }
+            break;
+        default:
+            break;
+    }
+
+    // Scalar ops: route to common so compute_forward dispatches to scalar_kernels
+    switch (op->op) {
+        case GGML_OP_L2_NORM:
+            if (op->src[0] && op->src[0]->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32)
+                return common;
+            break;
+        case GGML_OP_FILL:
+            if (op->src[0] && (op->src[0]->type == GGML_TYPE_F32 || op->src[0]->type == GGML_TYPE_F16))
+                return common;
+            break;
+        case GGML_OP_CUMSUM:
+            if (op->src[0] && op->src[0]->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32)
+                return common;
+            break;
+        case GGML_OP_PAD:
+            if (op->src[0] && op->src[0]->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32)
+                return common;
+            break;
+        case GGML_OP_TRI:
+            if (op->src[0] && op->src[0]->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32 &&
+                ggml_is_contiguous(op->src[0]))
+                return common;
+            break;
+        case GGML_OP_DIAG:
+            if (op->src[0] && op->src[0]->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32)
+                return common;
+            break;
+        case GGML_OP_SET:
+            if (op->src[0] && op->src[1] &&
+                op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32 &&
+                op->type == GGML_TYPE_F32)
+                return common;
+            break;
+        case GGML_OP_SOLVE_TRI:
+            if (op->src[0] && op->src[1] &&
+                op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32 &&
+                op->type == GGML_TYPE_F32)
+                return common;
+            break;
+        case GGML_OP_GATED_DELTA_NET:
+            return common;
+        case GGML_OP_SSM_CONV:
+            if (op->src[0] && op->src[0]->type == GGML_TYPE_F32)
+                return common;
+            break;
+        case GGML_OP_MUL_MAT:
+            // F32 dense weight (not already handled above by tensor_traits)
+            if (op->src[0] && op->src[1] &&
+                op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32 &&
+                op->src[0]->nb[0] == sizeof(float) && op->src[1]->nb[0] == sizeof(float))
+                return common;
             break;
         default:
             break;

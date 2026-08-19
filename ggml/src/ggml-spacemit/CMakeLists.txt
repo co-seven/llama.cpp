@@ -52,6 +52,7 @@ ggml_add_backend_library(${TARGET_NAME}
     ime1_kernels.cpp
     ime2_kernels.cpp
     rvv_kernels.cpp
+    scalar_kernels.cpp
     repack.cpp
     spacemit-context.h
     spacemit-env.h
