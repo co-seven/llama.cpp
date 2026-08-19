@@ -1109,9 +1109,18 @@ class tensor_traits_common : public ggml::spacemit::tensor_traits_base {
                         op->ne[3] * op->ne[2] * op->nb[2] == src0->ne[3] * src0->ne[2] * src0->nb[2]) {
                         spacemit_kernels::rvv::forward_cont_with_permute(ctx, op);
                         return true;
-                    } else {
-                        return false;
                     }
+                    if (op->type == src0->type && ggml_is_contiguous(op) &&
+                        ggml_nelements(op) == ggml_nelements(src0) &&
+                        (op->type == GGML_TYPE_F32 || op->type == GGML_TYPE_F16)) {
+                        if (op->type == GGML_TYPE_F32) {
+                            spacemit_kernels::rvv::forward_cont_general<float>(ctx, op);
+                        } else {
+                            spacemit_kernels::rvv::forward_cont_general<_Float16>(ctx, op);
+                        }
+                        return true;
+                    }
+                    return false;
                 }
             case GGML_OP_CPY:
                 {
@@ -1640,10 +1649,18 @@ const ggml::spacemit::tensor_traits_base * ggml_spacemit_get_tensor_traits(const
             }
             break;
         case GGML_OP_CONT:
-            if (op->src[0] && op->type == op->src[0]->type && op->nb[0] != op->src[0]->nb[0] &&
-                op->nb[0] == op->src[0]->nb[1] &&
-                op->ne[3] * op->ne[2] * op->nb[2] == op->src[0]->ne[3] * op->src[0]->ne[2] * op->src[0]->nb[2]) {
-                return common;
+            if (op->src[0] && op->type == op->src[0]->type) {
+                // permute case
+                if (op->nb[0] != op->src[0]->nb[0] && op->nb[0] == op->src[0]->nb[1] &&
+                    op->ne[3] * op->ne[2] * op->nb[2] == op->src[0]->ne[3] * op->src[0]->ne[2] * op->src[0]->nb[2]) {
+                    return common;
+                }
+                // general stride-aware copy for F32/F16
+                if ((op->type == GGML_TYPE_F32 || op->type == GGML_TYPE_F16) &&
+                    ggml_is_contiguous(op) &&
+                    ggml_nelements(op) == ggml_nelements(op->src[0])) {
+                    return common;
+                }
             }
             break;
         case GGML_OP_CPY:

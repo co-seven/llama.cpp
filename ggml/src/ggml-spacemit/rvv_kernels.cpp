@@ -3522,6 +3522,44 @@ void forward_mul_mat_f16_f32(ggml::spacemit::context & ctx, ggml_tensor * op) {
     }
 }
 
+// General stride-aware contiguous copy for F32/F16.
+// src0 may be non-contiguous; dst is always contiguous.
+// Parallel over elements across ctx.nth cores.
+template <typename T>
+void forward_cont_general(ggml::spacemit::context & ctx, ggml_tensor * op) {
+    const ggml_tensor * src0 = op->src[0];
+    ggml_tensor *       dst  = op;
+
+    GGML_ASSERT(src0->type == dst->type);
+    GGML_ASSERT(ggml_type_size(src0->type) == sizeof(T));
+    GGML_ASSERT(ggml_is_contiguous(dst));
+    GGML_ASSERT(ggml_nelements(src0) == ggml_nelements(dst));
+
+    const int64_t ne    = ggml_nelements(src0);
+    const int64_t ith   = ctx.ith;
+    const int64_t nth   = ctx.nth;
+    const int64_t dr    = (ne + nth - 1) / nth;
+    const int64_t i0    = dr * ith;
+    const int64_t i1    = MIN(i0 + dr, ne);
+
+    T * dst_ptr = (T *) dst->data + i0;
+
+    for (int64_t i = i0; i < i1; i++) {
+        int64_t rem  = i;
+        const int64_t i3_ = rem / (src0->ne[0] * src0->ne[1] * src0->ne[2]); rem -= i3_ * src0->ne[0] * src0->ne[1] * src0->ne[2];
+        const int64_t i2_ = rem / (src0->ne[0] * src0->ne[1]);                rem -= i2_ * src0->ne[0] * src0->ne[1];
+        const int64_t i1_ = rem / src0->ne[0];
+        const int64_t i0_ = rem % src0->ne[0];
+        const T * src_elem = (const T *)((const char *)src0->data
+            + i0_ * src0->nb[0] + i1_ * src0->nb[1]
+            + i2_ * src0->nb[2] + i3_ * src0->nb[3]);
+        dst_ptr[i - i0] = *src_elem;
+    }
+}
+
+template void forward_cont_general<float>(ggml::spacemit::context & ctx, ggml_tensor * op);
+template void forward_cont_general<_Float16>(ggml::spacemit::context & ctx, ggml_tensor * op);
+
 void forward_glu_geglu_f32(ggml::spacemit::context & ctx, ggml_tensor * op) {
     const ggml_tensor * src0 = op->src[0];
     const ggml_tensor * src1 = op->src[1];

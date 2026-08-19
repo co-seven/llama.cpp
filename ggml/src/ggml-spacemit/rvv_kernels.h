@@ -77,6 +77,7 @@ void forward_unary_gelu_f32(ggml::spacemit::context & ctx, ggml_tensor * op);
 void forward_unary_silu_f32(ggml::spacemit::context & ctx, ggml_tensor * op);
 void forward_soft_max_f32(ggml::spacemit::context & ctx, ggml_tensor * op);
 void forward_mul_mat_f16_f32(ggml::spacemit::context & ctx, ggml_tensor * op);
+template <typename T> void forward_cont_general(ggml::spacemit::context & ctx, ggml_tensor * op);
 
 void forward_glu_geglu_f32(ggml::spacemit::context & ctx, ggml_tensor * op);
 void forward_glu_swiglu_f32(ggml::spacemit::context & ctx, ggml_tensor * op);
