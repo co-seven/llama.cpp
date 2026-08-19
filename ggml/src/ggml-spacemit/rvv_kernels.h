@@ -68,8 +68,12 @@ template <typename T> void forward_concat(ggml::spacemit::context & ctx, ggml_te
 
 template <ggml_op op_type, typename T> void forward_binary(ggml::spacemit::context & ctx, ggml_tensor * op);
 
+void forward_scale_f32(ggml::spacemit::context & ctx, ggml_tensor * op);
+void forward_cpy_strided_f32(ggml::spacemit::context & ctx, ggml_tensor * op);
 void forward_unary_tanh_f32(ggml::spacemit::context & ctx, ggml_tensor * op);
 void forward_unary_gelu_f32(ggml::spacemit::context & ctx, ggml_tensor * op);
+void forward_unary_silu_f32(ggml::spacemit::context & ctx, ggml_tensor * op);
+void forward_soft_max_f32(ggml::spacemit::context & ctx, ggml_tensor * op);
 
 void forward_glu_geglu_f32(ggml::spacemit::context & ctx, ggml_tensor * op);
 void forward_glu_swiglu_f32(ggml::spacemit::context & ctx, ggml_tensor * op);

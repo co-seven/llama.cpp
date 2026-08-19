@@ -3157,6 +3157,78 @@ template <typename T> void forward_concat(ggml::spacemit::context & ctx, ggml_te
     }
 }
 
+void forward_scale_f32(ggml::spacemit::context & ctx, ggml_tensor * op) {
+    const ggml_tensor * src0 = op->src[0];
+    ggml_tensor *       dst  = op;
+
+    GGML_ASSERT(ggml_are_same_shape(src0, dst));
+    GGML_ASSERT(src0->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32);
+
+    float scale;
+    memcpy(&scale, op->op_params, sizeof(float));
+
+    const int64_t ith = ctx.ith;
+    const int64_t nth = ctx.nth;
+
+    const int64_t ne0 = src0->ne[0], ne1 = src0->ne[1],
+                  ne2 = src0->ne[2], ne3 = src0->ne[3];
+    const int64_t nrows = ne1 * ne2 * ne3;
+    const int64_t dr    = (nrows + nth - 1) / nth;
+    const int64_t ir0   = dr * ith;
+    const int64_t ir1   = MIN(ir0 + dr, nrows);
+
+    for (int64_t ir = ir0; ir < ir1; ir++) {
+        const int64_t i3 = ir / (ne1 * ne2);
+        const int64_t i2 = (ir - i3 * ne1 * ne2) / ne1;
+        const int64_t i1 = ir % ne1;
+
+        const float * src_row = (const float *)((const char *)src0->data
+            + i1 * src0->nb[1] + i2 * src0->nb[2] + i3 * src0->nb[3]);
+        float * dst_row = (float *)((char *)dst->data
+            + i1 * dst->nb[1] + i2 * dst->nb[2] + i3 * dst->nb[3]);
+
+        int64_t remaining = ne0;
+        while (remaining > 0) {
+            const size_t vl = __riscv_vsetvl_e32m4(remaining);
+            vfloat32m4_t v  = __riscv_vle32_v_f32m4(src_row, vl);
+            v               = __riscv_vfmul_vf_f32m4(v, scale, vl);
+            __riscv_vse32_v_f32m4(dst_row, v, vl);
+            src_row   += vl;
+            dst_row   += vl;
+            remaining -= vl;
+        }
+    }
+}
+
+void forward_cpy_strided_f32(ggml::spacemit::context & ctx, ggml_tensor * op) {
+    const ggml_tensor * src0 = op->src[0];
+    ggml_tensor *       dst  = op;
+
+    GGML_ASSERT(op->type == GGML_TYPE_F32 && src0->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_is_contiguous(dst));
+    GGML_ASSERT(ggml_nelements(src0) == ggml_nelements(dst));
+
+    const int64_t ne    = ggml_nelements(src0);
+    const int64_t ith   = ctx.ith;
+    const int64_t nth   = ctx.nth;
+    const int64_t dr    = (ne + nth - 1) / nth;
+    const int64_t i0    = dr * ith;
+    const int64_t i1    = MIN(i0 + dr, ne);
+    float *       dst_ptr = (float *) dst->data + i0;
+
+    for (int64_t i = i0; i < i1; i++) {
+        int64_t rem = i;
+        const int64_t i3_  = rem / (src0->ne[0] * src0->ne[1] * src0->ne[2]); rem -= i3_ * src0->ne[0] * src0->ne[1] * src0->ne[2];
+        const int64_t i2_  = rem / (src0->ne[0] * src0->ne[1]);                rem -= i2_ * src0->ne[0] * src0->ne[1];
+        const int64_t i1_  = rem / src0->ne[0];
+        const int64_t i0_  = rem % src0->ne[0];
+        const float * src_elem = (const float *)((const char *)src0->data
+            + i0_ * src0->nb[0] + i1_ * src0->nb[1]
+            + i2_ * src0->nb[2] + i3_ * src0->nb[3]);
+        dst_ptr[i - i0] = *src_elem;
+    }
+}
+
 void forward_unary_tanh_f32(ggml::spacemit::context & ctx, ggml_tensor * op) {
     const ggml_tensor * src0 = op->src[0];
     ggml_tensor *       dst  = op;
@@ -3222,6 +3294,119 @@ void forward_unary_gelu_f32(ggml::spacemit::context & ctx, ggml_tensor * op) {
                 __riscv_vfmul_vv_f32m2(x, __riscv_vfadd_vf_f32m2(th, 1.0f, vl), vl), 0.5f, vl);
         __riscv_vse32_v_f32m2(dst_ptr + i, out, vl);
         i += vl;
+    }
+}
+
+void forward_unary_silu_f32(ggml::spacemit::context & ctx, ggml_tensor * op) {
+    const ggml_tensor * src0 = op->src[0];
+    ggml_tensor *       dst  = op;
+
+    GGML_ASSERT(ggml_is_contiguous(src0) && ggml_is_contiguous(dst) && ggml_are_same_shape(src0, dst));
+    GGML_ASSERT(src0->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32);
+
+    const int64_t ne  = ggml_nelements(src0);
+    const int64_t ith = ctx.ith;
+    const int64_t nth = ctx.nth;
+
+    const int64_t dr = (ne + nth - 1) / nth;
+    const int64_t i0 = dr * ith;
+    const int64_t i1 = MIN(i0 + dr, ne);
+
+    const float * src_ptr = (const float *) src0->data;
+    float *       dst_ptr = (float *) dst->data;
+
+    int64_t i = i0;
+    while (i < i1) {
+        const size_t     vl      = __riscv_vsetvl_e32m2(i1 - i);
+        vfloat32m2_t     x       = __riscv_vle32_v_f32m2(src_ptr + i, vl);
+        vfloat32m2_t     neg_x   = __riscv_vfneg_v_f32m2(x, vl);
+        vfloat32m2_t     exp_neg = rvv_expf_approx_f32m2(neg_x, vl);
+        vfloat32m2_t     denom   = __riscv_vfadd_vf_f32m2(exp_neg, 1.0f, vl);
+        vfloat32m2_t     out     = __riscv_vfdiv_vv_f32m2(x, denom, vl);
+        __riscv_vse32_v_f32m2(dst_ptr + i, out, vl);
+        i += vl;
+    }
+}
+
+void forward_soft_max_f32(ggml::spacemit::context & ctx, ggml_tensor * op) {
+    const ggml_tensor * src0 = op->src[0];
+    ggml_tensor *       dst  = op;
+
+    GGML_ASSERT(src0->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32);
+    GGML_ASSERT(src0->nb[0] == sizeof(float) && dst->nb[0] == sizeof(float));
+
+    GGML_TENSOR_UNARY_OP_LOCALS
+
+    const int64_t ncols      = ne00;
+    const int64_t task_count = ne01 * ne02 * ne03;
+    const int64_t ith        = ctx.ith;
+    const int64_t nth        = ctx.nth;
+
+    const float scale = ggml_get_op_params_f32(op, 0);
+
+    const int64_t dr    = (task_count + nth - 1) / nth;
+    const int64_t row0  = dr * ith;
+    const int64_t row1  = MIN(row0 + dr, task_count);
+
+    for (int64_t row = row0; row < row1; row++) {
+        const int64_t i03 = row / (ne02 * ne01);
+        const int64_t i02 = (row - i03 * ne02 * ne01) / ne01;
+        const int64_t i01 = row - i03 * ne02 * ne01 - i02 * ne01;
+
+        const float * src_row = (const float *) ((const char *) src0->data
+            + i01 * nb01 + i02 * nb02 + i03 * nb03);
+        float * dst_row = (float *) ((const char *) dst->data
+            + i01 * nb1  + i02 * nb2  + i03 * nb3);
+
+        // find max
+        float max_val = -INFINITY;
+        {
+            int64_t n = ncols;
+            const float * p = src_row;
+            while (n > 0) {
+                const size_t     vl  = __riscv_vsetvl_e32m4(n);
+                vfloat32m4_t     v   = __riscv_vle32_v_f32m4(p, vl);
+                vfloat32m1_t     red = __riscv_vfredmax_vs_f32m4_f32m1(
+                    v, __riscv_vfmv_v_f_f32m1(-INFINITY, 1), vl);
+                float cur_max = __riscv_vfmv_f_s_f32m1_f32(red);
+                if (cur_max > max_val) max_val = cur_max;
+                p += vl;
+                n -= vl;
+            }
+        }
+        max_val *= scale;
+
+        // copy src*scale into dst, then compute exp(dst[i] - max_val) in-place and sum
+        {
+            int64_t       n  = ncols;
+            const float * sp = src_row;
+            float *       dp = dst_row;
+            while (n > 0) {
+                const size_t vl = __riscv_vsetvl_e32m4(n);
+                vfloat32m4_t v  = __riscv_vle32_v_f32m4(sp, vl);
+                v               = __riscv_vfmul_vf_f32m4(v, scale, vl);
+                __riscv_vse32_v_f32m4(dp, v, vl);
+                sp += vl;
+                dp += vl;
+                n  -= vl;
+            }
+        }
+        const float sum = rvv_softmax_exp_inplace_f32(dst_row, ncols, max_val);
+
+        // normalize
+        const float inv_sum = (sum > 0.0f) ? (1.0f / sum) : 0.0f;
+        {
+            int64_t n  = ncols;
+            float * dp = dst_row;
+            while (n > 0) {
+                const size_t vl = __riscv_vsetvl_e32m4(n);
+                vfloat32m4_t v  = __riscv_vle32_v_f32m4(dp, vl);
+                v               = __riscv_vfmul_vf_f32m4(v, inv_sum, vl);
+                __riscv_vse32_v_f32m4(dp, v, vl);
+                dp += vl;
+                n  -= vl;
+            }
+        }
     }
 }
 

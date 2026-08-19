@@ -629,6 +629,7 @@ static bool ggml_backend_spacemit_device_supports_op(ggml_backend_dev_t dev, con
             supp = true;
             break;
 
+        case GGML_OP_SCALE:
         case GGML_OP_MUL_MAT:
         case GGML_OP_MUL_MAT_ID:
         case GGML_OP_RMS_NORM:
@@ -647,6 +648,7 @@ static bool ggml_backend_spacemit_device_supports_op(ggml_backend_dev_t dev, con
         case GGML_OP_CONT:
         case GGML_OP_REPEAT:
         case GGML_OP_SUM_ROWS:
+        case GGML_OP_SOFT_MAX:
         case GGML_OP_FLASH_ATTN_EXT:
             supp = ggml_spacemit_get_tensor_traits(op) != nullptr;
             break;

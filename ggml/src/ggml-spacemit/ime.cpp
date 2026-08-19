@@ -1048,6 +1048,12 @@ class tensor_traits_common : public ggml::spacemit::tensor_traits_base {
                     default:
                         return false;
                 }
+            case GGML_OP_SCALE:
+                if (op->src[0]->type == GGML_TYPE_F32) {
+                    spacemit_kernels::rvv::forward_scale_f32(ctx, op);
+                    return true;
+                }
+                return false;
             case GGML_OP_UNARY:
                 switch (ggml_get_unary_op(op)) {
                     case GGML_UNARY_OP_TANH:
@@ -1056,9 +1062,18 @@ class tensor_traits_common : public ggml::spacemit::tensor_traits_base {
                     case GGML_UNARY_OP_GELU:
                         spacemit_kernels::rvv::forward_unary_gelu_f32(ctx, op);
                         return true;
+                    case GGML_UNARY_OP_SILU:
+                        spacemit_kernels::rvv::forward_unary_silu_f32(ctx, op);
+                        return true;
                     default:
                         return false;
                 }
+            case GGML_OP_SOFT_MAX:
+                if (op->src[0]->type == GGML_TYPE_F32) {
+                    spacemit_kernels::rvv::forward_soft_max_f32(ctx, op);
+                    return true;
+                }
+                return false;
             case GGML_OP_GLU:
                 if (op->src[0]->type == GGML_TYPE_F32) {
                     switch (ggml_get_glu_op(op)) {
@@ -1092,13 +1107,20 @@ class tensor_traits_common : public ggml::spacemit::tensor_traits_base {
             case GGML_OP_CPY:
                 {
                     const ggml_tensor * src0 = op->src[0];
+                    if (ggml_nelements(op) == 0) {
+                        return true;
+                    }
                     if (op->type == src0->type && op->nb[0] == src0->nb[1] && src0->nb[0] != src0->nb[1] &&
                         ggml_nelements(src0) == ggml_nelements(op)) {
                         spacemit_kernels::rvv::forward_cpy_with_permute(ctx, op);
                         return true;
-                    } else {
-                        return false;
                     }
+                    if (op->type == GGML_TYPE_F32 && src0->type == GGML_TYPE_F32 &&
+                        ggml_is_contiguous(op) && ggml_nelements(src0) == ggml_nelements(op)) {
+                        spacemit_kernels::rvv::forward_cpy_strided_f32(ctx, op);
+                        return true;
+                    }
+                    return false;
                 }
             case GGML_OP_SET_ROWS:
                 spacemit_kernels::rvv::forward_set_rows(ctx, op);
@@ -1538,6 +1560,11 @@ const ggml::spacemit::tensor_traits_base * ggml_spacemit_get_tensor_traits(const
                 return common;
             }
             break;
+        case GGML_OP_SCALE:
+            if (op->src[0] && op->src[0]->type == GGML_TYPE_F32) {
+                return common;
+            }
+            break;
         case GGML_OP_ADD:
         case GGML_OP_SUB:
         case GGML_OP_MUL:
@@ -1589,8 +1616,15 @@ const ggml::spacemit::tensor_traits_base * ggml_spacemit_get_tensor_traits(const
             }
             break;
         case GGML_OP_CPY:
+            if (op->src[0] && ggml_nelements(op) == 0) {
+                return common;
+            }
             if (op->src[0] && op->type == op->src[0]->type && op->nb[0] == op->src[0]->nb[1] &&
                 op->src[0]->nb[0] != op->src[0]->nb[1] && ggml_nelements(op->src[0]) == ggml_nelements(op)) {
+                return common;
+            }
+            if (op->src[0] && op->type == GGML_TYPE_F32 && op->src[0]->type == GGML_TYPE_F32 &&
+                ggml_is_contiguous(op) && ggml_nelements(op->src[0]) == ggml_nelements(op)) {
                 return common;
             }
             break;
@@ -1642,7 +1676,14 @@ const ggml::spacemit::tensor_traits_base * ggml_spacemit_get_tensor_traits(const
         case GGML_OP_UNARY:
             if (op->src[0] && op->src[0]->type == GGML_TYPE_F32 && ggml_is_contiguous(op->src[0]) &&
                 (ggml_get_unary_op(op) == GGML_UNARY_OP_TANH ||
-                 ggml_get_unary_op(op) == GGML_UNARY_OP_GELU)) {
+                 ggml_get_unary_op(op) == GGML_UNARY_OP_GELU ||
+                 ggml_get_unary_op(op) == GGML_UNARY_OP_SILU)) {
+                return common;
+            }
+            break;
+        case GGML_OP_SOFT_MAX:
+            if (op->src[0] && op->src[0]->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32 &&
+                op->src[0]->nb[0] == sizeof(float) && op->nb[0] == sizeof(float)) {
                 return common;
             }
             break;
