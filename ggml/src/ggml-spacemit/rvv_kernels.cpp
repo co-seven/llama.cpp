@@ -3472,6 +3472,56 @@ void forward_soft_max_f32(ggml::spacemit::context & ctx, ggml_tensor * op) {
     }
 }
 
+// F16 weight (src0[K,M]) x F32 activation (src1[K,N]) -> F32 output (dst[M,N])
+// Parallel over output rows m across ctx.nth cores.
+void forward_mul_mat_f16_f32(ggml::spacemit::context & ctx, ggml_tensor * op) {
+    const ggml_tensor * src0 = op->src[0];
+    const ggml_tensor * src1 = op->src[1];
+    ggml_tensor *       dst  = op;
+
+    GGML_ASSERT(src0->type == GGML_TYPE_F16 && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32);
+    GGML_ASSERT(src0->nb[0] == sizeof(_Float16) && src1->nb[0] == sizeof(float) && dst->nb[0] == sizeof(float));
+
+    const int64_t M   = src0->ne[1];
+    const int64_t K   = src0->ne[0];
+    const int64_t N   = src1->ne[1];
+    const int64_t ith = ctx.ith;
+    const int64_t nth = ctx.nth;
+
+    const int64_t dr = (M + nth - 1) / nth;
+    const int64_t m0 = ith * dr;
+    const int64_t m1 = MIN(m0 + dr, M);
+
+    for (int64_t m = m0; m < m1; ++m) {
+        const _Float16 * w_row = (const _Float16 *)((const char *)src0->data + m * src0->nb[1]);
+        float *          d_row = (float *)((char *)dst->data + m * dst->nb[1]);
+
+        for (int64_t n = 0; n < N; ++n) {
+            const float * x_row = (const float *)((const char *)src1->data + n * src1->nb[1]);
+
+            vfloat32m4_t     acc    = __riscv_vfmv_v_f_f32m4(0.0f, __riscv_vsetvlmax_e32m4());
+            int64_t          k_left = K;
+            const _Float16 * wp     = w_row;
+            const float *    xp     = x_row;
+
+            while (k_left > 0) {
+                const size_t vl  = __riscv_vsetvl_e16m2(k_left);
+                vfloat16m2_t w16 = __riscv_vle16_v_f16m2(wp, vl);
+                vfloat32m4_t w32 = __riscv_vfwcvt_f_f_v_f32m4(w16, vl);
+                vfloat32m4_t x32 = __riscv_vle32_v_f32m4(xp, vl);
+                acc              = __riscv_vfmacc_vv_f32m4(acc, w32, x32, vl);
+                wp     += vl;
+                xp     += vl;
+                k_left -= vl;
+            }
+
+            vfloat32m1_t zero = __riscv_vfmv_v_f_f32m1(0.0f, 1);
+            vfloat32m1_t sum  = __riscv_vfredusum_vs_f32m4_f32m1(acc, zero, __riscv_vsetvlmax_e32m4());
+            d_row[n]          = __riscv_vfmv_f_s_f32m1_f32(sum);
+        }
+    }
+}
+
 void forward_glu_geglu_f32(ggml::spacemit::context & ctx, ggml_tensor * op) {
     const ggml_tensor * src0 = op->src[0];
     const ggml_tensor * src1 = op->src[1];

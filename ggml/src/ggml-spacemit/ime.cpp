@@ -988,6 +988,15 @@ class tensor_traits_common : public ggml::spacemit::tensor_traits_base {
 
     bool compute_forward(ggml::spacemit::context & ctx, ggml_tensor * op) const override {
         switch (op->op) {
+            case GGML_OP_MUL_MAT:
+                if (op->src[0]->type == GGML_TYPE_F16 &&
+                    op->src[1]->type == GGML_TYPE_F32 &&
+                    op->src[0]->nb[0] == sizeof(_Float16) &&
+                    op->src[1]->nb[0] == sizeof(float)) {
+                    spacemit_kernels::rvv::forward_mul_mat_f16_f32(ctx, op);
+                    return true;
+                }
+                return false;
             case GGML_OP_NORM:
                 switch (op->src[0]->type) {
                     case GGML_TYPE_F32:
@@ -1555,7 +1564,15 @@ const ggml::spacemit::tensor_traits_base * ggml_spacemit_get_tensor_traits(const
             if (op->src[0] && op->src[1] && ggml_n_dims(op->src[0]) == 2 &&
                 op->src[1]->type == GGML_TYPE_F32) {
                 const auto * traits = static_cast<const ggml::spacemit::tensor_traits_base *>(op->src[0]->extra);
-                return traits ? traits : ggml_spacemit_get_optimal_repack_type(op->src[0]);
+                if (traits) return traits;
+                const auto * repack = ggml_spacemit_get_optimal_repack_type(op->src[0]);
+                if (repack) return repack;
+                // F16 dense weight: same condition as compute_forward
+                if (op->src[0]->type == GGML_TYPE_F16 &&
+                    op->src[0]->nb[0] == sizeof(_Float16) &&
+                    op->src[1]->nb[0] == sizeof(float)) {
+                    return common;
+                }
             }
             break;
         case GGML_OP_MUL_MAT_ID:
