@@ -1120,6 +1120,17 @@ class tensor_traits_common : public ggml::spacemit::tensor_traits_base {
                         spacemit_kernels::rvv::forward_cpy_strided_f32(ctx, op);
                         return true;
                     }
+                    if (ggml_is_contiguous(op) && ggml_is_contiguous(src0) &&
+                        ggml_nelements(src0) == ggml_nelements(op)) {
+                        if (op->type == GGML_TYPE_F16 && src0->type == GGML_TYPE_F32) {
+                            spacemit_kernels::rvv::forward_cpy_f32_to_f16(ctx, op);
+                            return true;
+                        }
+                        if (op->type == GGML_TYPE_F32 && src0->type == GGML_TYPE_F16) {
+                            spacemit_kernels::rvv::forward_cpy_f16_to_f32(ctx, op);
+                            return true;
+                        }
+                    }
                     return false;
                 }
             case GGML_OP_SET_ROWS:
@@ -1597,8 +1608,11 @@ const ggml::spacemit::tensor_traits_base * ggml_spacemit_get_tensor_traits(const
                 memcpy(&ext_factor, op->op_params + 7, sizeof(float));
                 const int n_dims = ggml_get_op_params_i32(op, 1);
                 const int mode   = ggml_get_op_params_i32(op, 2);
+                // src[2] is optional freq_factors (F32 per-dim scale); kernel handles null and non-null
+                const bool src2_ok = op->src[2] == nullptr ||
+                    (op->src[2]->type == GGML_TYPE_F32 && ggml_is_contiguous(op->src[2]));
                 if ((op->src[0]->type == GGML_TYPE_F32 || op->src[0]->type == GGML_TYPE_F16) &&
-                    op->type == op->src[0]->type && op->src[1]->type == GGML_TYPE_I32 && op->src[2] == nullptr &&
+                    op->type == op->src[0]->type && op->src[1]->type == GGML_TYPE_I32 && src2_ok &&
                     op->src[0]->nb[0] == ggml_type_size(op->src[0]->type) && op->nb[0] == ggml_type_size(op->type) &&
                     op->src[1]->nb[0] == sizeof(int32_t) && ggml_are_same_shape(op, op->src[0]) &&
                     ggml_nelements(op->src[1]) >= op->ne[2] && freq_base > 0.0f &&
@@ -1625,6 +1639,13 @@ const ggml::spacemit::tensor_traits_base * ggml_spacemit_get_tensor_traits(const
             }
             if (op->src[0] && op->type == GGML_TYPE_F32 && op->src[0]->type == GGML_TYPE_F32 &&
                 ggml_is_contiguous(op) && ggml_nelements(op->src[0]) == ggml_nelements(op)) {
+                return common;
+            }
+            if (op->src[0] &&
+                ((op->type == GGML_TYPE_F16 && op->src[0]->type == GGML_TYPE_F32) ||
+                 (op->type == GGML_TYPE_F32 && op->src[0]->type == GGML_TYPE_F16)) &&
+                ggml_is_contiguous(op) && ggml_is_contiguous(op->src[0]) &&
+                ggml_nelements(op->src[0]) == ggml_nelements(op)) {
                 return common;
             }
             break;
@@ -1658,18 +1679,22 @@ const ggml::spacemit::tensor_traits_base * ggml_spacemit_get_tensor_traits(const
             }
             break;
         case GGML_OP_GET_ROWS:
-            if (op->src[0] && op->src[1] && op->src[0]->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32 &&
+            if (op->src[0] && op->src[1] &&
+                (op->src[0]->type == GGML_TYPE_F32 || op->src[0]->type == GGML_TYPE_F16) &&
+                op->type == op->src[0]->type &&
                 op->src[1]->type == GGML_TYPE_I32 && op->ne[0] == op->src[0]->ne[0] &&
-                op->src[0]->ne[2] == op->src[1]->ne[1] && op->src[0]->nb[0] == sizeof(float) &&
+                op->src[0]->ne[2] == op->src[1]->ne[1] &&
+                op->src[0]->nb[0] == ggml_type_size(op->src[0]->type) &&
                 ggml_nrows(op) == ggml_nelements(op->src[1])) {
                 return common;
             }
             break;
         case GGML_OP_CONCAT:
             if (op->src[0] && op->src[1] && ggml_get_op_params_i32(op, 0) == 0 &&
-                op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32 &&
-                op->type == GGML_TYPE_F32 && op->nb[0] == sizeof(float) &&
-                op->nb[1] == sizeof(float) * (op->src[0]->ne[0] + op->src[1]->ne[0])) {
+                (op->src[0]->type == GGML_TYPE_F32 || op->src[0]->type == GGML_TYPE_F16) &&
+                op->src[1]->type == op->src[0]->type && op->type == op->src[0]->type &&
+                op->nb[0] == ggml_type_size(op->type) &&
+                op->nb[1] == ggml_type_size(op->type) * (op->src[0]->ne[0] + op->src[1]->ne[0])) {
                 return common;
             }
             break;

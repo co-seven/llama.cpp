@@ -3051,7 +3051,7 @@ template <typename T> void forward_get_rows(ggml::spacemit::context & ctx, ggml_
 
     assert(ne0 == nc);
     assert(ne02 == ne11);
-    assert(nb00 == sizeof(float));
+    assert(nb00 == sizeof(T));
     assert(ggml_nrows(op) == nr);
 
     const int ith = ctx.ith;
@@ -3098,13 +3098,13 @@ template <typename T> void forward_concat(ggml::spacemit::context & ctx, ggml_te
     const ggml_tensor * src1 = op->src[1];
     ggml_tensor *       dst  = op;
 
-    GGML_ASSERT(ggml_type_size(src0->type) == sizeof(float));
+    GGML_ASSERT(ggml_type_size(src0->type) == sizeof(T));
 
     GGML_TENSOR_BINARY_OP_LOCALS
 
     const int32_t dim = ggml_get_op_params_i32(dst, 0);
 
-    GGML_ASSERT(dim == 0 && nb0 == sizeof(float) && nb1 == sizeof(float) * (ne00 + ne10));
+    GGML_ASSERT(dim == 0 && nb0 == sizeof(T) && nb1 == sizeof(T) * (ne00 + ne10));
 
     const int64_t nr = ggml_nrows(dst);
     const int64_t nc = ne0;
@@ -3135,7 +3135,7 @@ template <typename T> void forward_concat(ggml::spacemit::context & ctx, ggml_te
 
     int64_t o[4] = { 0, 0, 0, 0 };
     o[dim]       = src0->ne[dim];
-    const float * x;
+    const T * x;
 
     for (int64_t i = ir0; i < ir1; ++i) {
         const int64_t i3 = i / (ne02 * ne01);
@@ -3144,13 +3144,13 @@ template <typename T> void forward_concat(ggml::spacemit::context & ctx, ggml_te
 
         for (int i0 = cr0; i0 < cr1; i0++) {
             if (i0 < ne00 && i1 < ne01 && i2 < ne02 && i3 < ne03) {
-                x = (const float *) ((const char *) src0->data + (i0) *nb00 + (i1) *nb01 + (i2) *nb02 + (i3) *nb03);
+                x = (const T *) ((const char *) src0->data + (i0) *nb00 + (i1) *nb01 + (i2) *nb02 + (i3) *nb03);
             } else {
-                x = (const float *) ((const char *) src1->data + (i0 - o[0]) * nb10 + (i1 - o[1]) * nb11 +
+                x = (const T *) ((const char *) src1->data + (i0 - o[0]) * nb10 + (i1 - o[1]) * nb11 +
                                      (i2 - o[2]) * nb12 + (i3 - o[3]) * nb13);
             }
 
-            float * y = (float *) ((char *) dst->data + i0 * nb0 + i1 * nb1 + i2 * nb2 + i3 * nb3);
+            T * y = (T *) ((char *) dst->data + i0 * nb0 + i1 * nb1 + i2 * nb2 + i3 * nb3);
 
             *y = *x;
         }
@@ -3226,6 +3226,68 @@ void forward_cpy_strided_f32(ggml::spacemit::context & ctx, ggml_tensor * op) {
             + i0_ * src0->nb[0] + i1_ * src0->nb[1]
             + i2_ * src0->nb[2] + i3_ * src0->nb[3]);
         dst_ptr[i - i0] = *src_elem;
+    }
+}
+
+void forward_cpy_f32_to_f16(ggml::spacemit::context & ctx, ggml_tensor * op) {
+    const ggml_tensor * src0 = op->src[0];
+    ggml_tensor *       dst  = op;
+
+    GGML_ASSERT(src0->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F16);
+    GGML_ASSERT(ggml_is_contiguous(src0) && ggml_is_contiguous(dst));
+    GGML_ASSERT(ggml_nelements(src0) == ggml_nelements(dst));
+
+    const int64_t ne  = ggml_nelements(src0);
+    const int64_t ith = ctx.ith;
+    const int64_t nth = ctx.nth;
+
+    const int64_t dr = (ne + nth - 1) / nth;
+    const int64_t i0 = dr * ith;
+    const int64_t i1 = MIN(i0 + dr, ne);
+
+    const float *    sp = (const float *)    src0->data + i0;
+    _Float16 *       dp = (_Float16 *)       dst->data  + i0;
+
+    int64_t remaining = i1 - i0;
+    while (remaining > 0) {
+        const size_t     vl  = __riscv_vsetvl_e32m4(remaining);
+        vfloat32m4_t     v32 = __riscv_vle32_v_f32m4(sp, vl);
+        vfloat16m2_t     v16 = __riscv_vfncvt_f_f_w_f16m2(v32, vl);
+        __riscv_vse16_v_f16m2(dp, v16, vl);
+        sp        += vl;
+        dp        += vl;
+        remaining -= vl;
+    }
+}
+
+void forward_cpy_f16_to_f32(ggml::spacemit::context & ctx, ggml_tensor * op) {
+    const ggml_tensor * src0 = op->src[0];
+    ggml_tensor *       dst  = op;
+
+    GGML_ASSERT(src0->type == GGML_TYPE_F16 && dst->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_is_contiguous(src0) && ggml_is_contiguous(dst));
+    GGML_ASSERT(ggml_nelements(src0) == ggml_nelements(dst));
+
+    const int64_t ne  = ggml_nelements(src0);
+    const int64_t ith = ctx.ith;
+    const int64_t nth = ctx.nth;
+
+    const int64_t dr = (ne + nth - 1) / nth;
+    const int64_t i0 = dr * ith;
+    const int64_t i1 = MIN(i0 + dr, ne);
+
+    const _Float16 * sp = (const _Float16 *) src0->data + i0;
+    float *          dp = (float *)          dst->data  + i0;
+
+    int64_t remaining = i1 - i0;
+    while (remaining > 0) {
+        const size_t     vl  = __riscv_vsetvl_e16m2(remaining);
+        vfloat16m2_t     v16 = __riscv_vle16_v_f16m2(sp, vl);
+        vfloat32m4_t     v32 = __riscv_vfwcvt_f_f_v_f32m4(v16, vl);
+        __riscv_vse32_v_f32m4(dp, v32, vl);
+        sp        += vl;
+        dp        += vl;
+        remaining -= vl;
     }
 }
 
@@ -3479,8 +3541,10 @@ void forward_glu_geglu_f32(ggml::spacemit::context & ctx, ggml_tensor * op) {
 
 template <typename T>
 static void forward_rope_impl(ggml::spacemit::context & ctx, ggml_tensor * op) {
-    const ggml_tensor * src0 = op->src[0];
-    const ggml_tensor * src1 = op->src[1];
+    const ggml_tensor * src0         = op->src[0];
+    const ggml_tensor * src1         = op->src[1];
+    const ggml_tensor * src2         = op->src[2];  // freq_factors, may be null
+    const float *       freq_factors = src2 ? (const float *) src2->data : nullptr;
 
     const int n_dims = ggml_get_op_params_i32(op, 1);
     const int mode   = ggml_get_op_params_i32(op, 2);
@@ -3507,8 +3571,9 @@ static void forward_rope_impl(ggml::spacemit::context & ctx, ggml_tensor * op) {
         if (i2 != last_i2) {
             float theta = pos[i2] * freq_scale;
             for (int i0 = 0; i0 < n_dims; i0 += 2) {
-                cache[i0 + 0] = cosf(theta) * attn_factor;
-                cache[i0 + 1] = sinf(theta) * attn_factor;
+                const float ff    = freq_factors ? freq_factors[i0 / 2] : 1.0f;
+                cache[i0 + 0] = cosf(theta * ff) * attn_factor;
+                cache[i0 + 1] = sinf(theta * ff) * attn_factor;
                 theta *= theta_scale;
             }
             last_i2 = i2;

@@ -70,6 +70,8 @@ template <ggml_op op_type, typename T> void forward_binary(ggml::spacemit::conte
 
 void forward_scale_f32(ggml::spacemit::context & ctx, ggml_tensor * op);
 void forward_cpy_strided_f32(ggml::spacemit::context & ctx, ggml_tensor * op);
+void forward_cpy_f32_to_f16(ggml::spacemit::context & ctx, ggml_tensor * op);
+void forward_cpy_f16_to_f32(ggml::spacemit::context & ctx, ggml_tensor * op);
 void forward_unary_tanh_f32(ggml::spacemit::context & ctx, ggml_tensor * op);
 void forward_unary_gelu_f32(ggml::spacemit::context & ctx, ggml_tensor * op);
 void forward_unary_silu_f32(ggml::spacemit::context & ctx, ggml_tensor * op);
