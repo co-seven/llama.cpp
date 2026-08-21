@@ -64,11 +64,15 @@ target_link_libraries(${TARGET_NAME} PRIVATE spert)
 target_include_directories(${TARGET_NAME} PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}
     ${CMAKE_CURRENT_SOURCE_DIR}/../ggml-cpu
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../include
     ${SPINE_RUNTIME_DIR}/include)
 
 target_compile_definitions(${TARGET_NAME} PRIVATE
     ${RISCV64_SPACEMIT_IME_SPEC}
 )
+if (GGML_BUILD_PROFILE)
+    target_compile_definitions(${TARGET_NAME} PRIVATE GGML_BUILD_PROFILE)
+endif()
 
 # Pass the full march string to both targets
 if(CMAKE_SYSTEM_PROCESSOR MATCHES "riscv")

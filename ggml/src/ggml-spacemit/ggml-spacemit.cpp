@@ -29,6 +29,7 @@
 #include "rvv_kernels.h"
 
 #include "ggml-cpu.h"
+#include "ggml-profile.h"
 
 // spine-runtime C++ API (hard dependency)
 #include <spert.hpp>
@@ -487,10 +488,13 @@ static ggml_status ggml_backend_spacemit_graph_compute(ggml_backend_t backend, g
                     continue;
                 }
 
+                ggml_profile_log_spacemit_op_begin(node, (int) ith, (int) runtime->grid_dim(0));
+
                 if (!ggml_spacemit_compute_forward(ctx, node)) {
                     throw std::runtime_error(std::string("ggml-spacemit: failed to dispatch op ") +
                                              ggml_op_desc(node) + " (" + ggml_type_name(node->type) + ")");
                 }
+                ggml_profile_log_spacemit_op_end(node, (int) ith, (int) runtime->grid_dim(0));
 
                 // Every core must finish the current node before any core starts
                 // the next one. A bounded pointer look-ahead is not sufficient:
