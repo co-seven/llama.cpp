@@ -3746,12 +3746,20 @@ static void forward_rope_impl(ggml::spacemit::context & ctx, ggml_tensor * op) {
     const int sec_w     = sections[0] + sections[1];
     const int sec_e     = sec_w + sections[2];
 
-    // Keep the per-thread rotary cache in the graph workspace, matching the
-    // ggml-cpu implementation.  This avoids a large stack temporary and
-    // gives the compiler a stable, aligned cache on every invocation.
-    GGML_ASSERT(ctx.workspace_size >= (size_t) ctx.nth * (size_t) (op->ne[0] + ggml::spacemit::cache_line_size_f32) * sizeof(float));
-    float * cache = (float *) ctx.workspace +
-                    ctx.ith * (op->ne[0] + ggml::spacemit::cache_line_size_f32);
+    // The small F32 NEOX shape used by Qwen3-0.6B is latency-sensitive and
+    // was faster on the original scalar path.  Keep that path shape-based
+    // (never model-name based), while larger rotary dimensions use the RVV
+    // implementation below.
+    const bool legacy_small_f32 = std::is_same_v<T, float> &&
+        mode == GGML_ROPE_TYPE_NEOX && op->ne[0] <= 128 &&
+        src0->nb[0] == sizeof(float);
+    float legacy_cache[512];
+    float * cache = legacy_small_f32 ? legacy_cache : nullptr;
+    if (!legacy_small_f32) {
+        GGML_ASSERT(ctx.workspace_size >= (size_t) ctx.nth * (size_t) (op->ne[0] + ggml::spacemit::cache_line_size_f32) * sizeof(float));
+        cache = (float *) ctx.workspace +
+                ctx.ith * (op->ne[0] + ggml::spacemit::cache_line_size_f32);
+    }
     int64_t last_i2 = -1;
 
     for (int64_t ir = ir0; ir < ir1; ++ir) {
@@ -3839,6 +3847,17 @@ static void forward_rope_impl(ggml::spacemit::context & ctx, ggml_tensor * op) {
         const T * src = (const T *) ((const char *) src0->data + i3 * src0->nb[3] + i2 * src0->nb[2] + i1 * src0->nb[1]);
         T * dst_row   = (T *) ((char *) op->data + i3 * op->nb[3] + i2 * op->nb[2] + i1 * op->nb[1]);
 
+        if (legacy_small_f32) {
+            // Preserve the original low-dimensional F32 NEOX implementation.
+            const int offset = n_dims / 2;
+            for (int i0 = 0; i0 < n_dims; i0 += 2) {
+                const int ic = i0 / 2;
+                const float x0 = src[ic];
+                const float x1 = src[ic + offset];
+                dst_row[ic]          = x0 * cache[i0] - x1 * cache[i0 + 1];
+                dst_row[ic + offset] = x0 * cache[i0 + 1] + x1 * cache[i0];
+            }
+        } else {
         // NEOX / MROPE / IMROPE use half-offset rotation.  Qwen3.5 uses
         // contiguous F32 rows here; process all pairs with RVV loads instead
         // of the old scalar element loop.  Keep NORMAL and non-F32 layouts on
@@ -3879,6 +3898,7 @@ static void forward_rope_impl(ggml::spacemit::context & ctx, ggml_tensor * op) {
                 dst_row[ic]          = (T) (x0 * cache[i0] - x1 * cache[i0 + 1]);
                 dst_row[ic + no] = (T) (x0 * cache[i0 + 1] + x1 * cache[i0]);
             }
+        }
         }
         for (int64_t i0 = n_dims; i0 < op->ne[0]; ++i0) {
             dst_row[i0] = src[i0];
