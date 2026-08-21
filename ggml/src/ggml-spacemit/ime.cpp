@@ -958,6 +958,19 @@ class tensor_traits : public ggml::spacemit::tensor_traits_base {
 class tensor_traits_common : public ggml::spacemit::tensor_traits_base {
     bool work_size(int n_threads, const ggml_tensor * op, size_t & size) const override {
         switch (op->op) {
+            case GGML_OP_MUL_MAT:
+                if (op->src[0] && op->src[1] && op->src[1]->type == GGML_TYPE_F32) {
+                    const auto * traits = ggml_get_type_traits_cpu(op->src[0]->type);
+                    if (traits && traits->vec_dot) {
+                    const size_t row_size = ggml_row_size(traits->vec_dot_type, op->src[1]->ne[0]);
+                    const size_t bytes = row_size * op->src[1]->ne[1] * op->src[1]->ne[2] * op->src[1]->ne[3];
+                        if (op->src[1]->type != traits->vec_dot_type) {
+                            size = bytes;
+                            return true;
+                        }
+                    }
+                }
+                break;
             case GGML_OP_FLASH_ATTN_EXT:
                 {
                     const int     n_tasks = n_threads;
@@ -976,7 +989,7 @@ class tensor_traits_common : public ggml::spacemit::tensor_traits_base {
                     // Decode path: n_kv_chunks = n_tasks (one chunk per thread)
                     // Per-thread: VKQ accmulator (DV), partial M, partial S + intra-thread scratch for V, Q and VKQ
                     size_t n_chunks = n_tasks;
-                    size_t decode   = sizeof(float) * (neq2 * n_chunks * (2 + DV) + n_tasks * (DK + 2 * DV));
+                    size_t decode   = sizeof(float) * n_tasks * (DK + 2 * DV + 64);
 
                     size = MAX(prefill, decode);
                 }
@@ -997,11 +1010,9 @@ class tensor_traits_common : public ggml::spacemit::tensor_traits_base {
                     spacemit_kernels::rvv::forward_mul_mat_f16_f32(ctx, op);
                     return true;
                 }
-                if (op->src[0]->type == GGML_TYPE_F32 &&
-                    op->src[1]->type == GGML_TYPE_F32 &&
-                    op->src[0]->nb[0] == sizeof(float) &&
-                    op->src[1]->nb[0] == sizeof(float)) {
-                    spacemit_kernels::scalar::forward_mul_mat_f32(ctx, op);
+                if (op->src[1]->type == GGML_TYPE_F32 &&
+                    ggml_get_type_traits_cpu(op->src[0]->type)->vec_dot != nullptr) {
+                    spacemit_kernels::scalar::forward_mul_mat(ctx, op);
                     return true;
                 }
                 return false;
@@ -1010,6 +1021,9 @@ class tensor_traits_common : public ggml::spacemit::tensor_traits_base {
                     case GGML_TYPE_F32:
                         spacemit_kernels::rvv::forward_norm_f32(ctx, op);
                         return true;
+                    case GGML_TYPE_F16:
+                        spacemit_kernels::scalar::forward_norm_f16(ctx, op);
+                        return true;
                     default:
                         GGML_ABORT("fatal error");
                 }
@@ -1017,6 +1031,9 @@ class tensor_traits_common : public ggml::spacemit::tensor_traits_base {
                 switch (op->src[0]->type) {
                     case GGML_TYPE_F32:
                         spacemit_kernels::rvv::forward_rms_norm_f32(ctx, op);
+                        return true;
+                    case GGML_TYPE_F16:
+                        spacemit_kernels::scalar::forward_rms_norm_f16(ctx, op);
                         return true;
                     default:
                         GGML_ABORT("fatal error");
@@ -1118,7 +1135,14 @@ class tensor_traits_common : public ggml::spacemit::tensor_traits_base {
                 }
                 return false;
             case GGML_OP_FLASH_ATTN_EXT:
-                return forward_flash_attn_ext_f16(ctx, op);
+                // Use the RVV implementation for its supported F32-Q/F16-KV
+                // shapes; retain the CPU-equivalent implementation for all
+                // other layouts and dtypes.
+                if (forward_flash_attn_ext_f16(ctx, op)) {
+                    return true;
+                }
+                spacemit_kernels::scalar::forward_flash_attn_ext(ctx, op);
+                return true;
             case GGML_OP_ROPE:
                 spacemit_kernels::rvv::forward_rope(ctx, op);
                 return true;
@@ -1641,7 +1665,7 @@ const ggml::spacemit::tensor_traits_base * ggml_spacemit_get_tensor_traits(const
             break;
         case GGML_OP_NORM:
         case GGML_OP_RMS_NORM:
-            if (op->src[0] && op->src[0]->type == GGML_TYPE_F32) {
+            if (op->src[0] && (op->src[0]->type == GGML_TYPE_F32 || op->src[0]->type == GGML_TYPE_F16)) {
                 return common;
             }
             break;
@@ -1667,10 +1691,10 @@ const ggml::spacemit::tensor_traits_base * ggml_spacemit_get_tensor_traits(const
         case GGML_OP_FLASH_ATTN_EXT:
             if (op->src[0] && op->src[1] && op->src[2] &&
                 (op->op_params[3] == GGML_PREC_F32 || op->op_params[3] == GGML_PREC_DEFAULT) &&
-                op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F16 &&
-                op->src[2]->type == GGML_TYPE_F16 && op->src[1]->ne[0] > 0 && op->src[1]->ne[0] <= 128 &&
-                op->src[2]->ne[0] > 0 && op->src[2]->ne[0] <= 128 &&
-                ggml::cpu::riscv64_spacemit::global_spine_env_info.vlen == 128) {
+                (op->src[0]->type == GGML_TYPE_F32 || op->src[0]->type == GGML_TYPE_F16) &&
+                (op->src[1]->type == GGML_TYPE_F32 || op->src[1]->type == GGML_TYPE_F16) &&
+                (op->src[2]->type == GGML_TYPE_F32 || op->src[2]->type == GGML_TYPE_F16) &&
+                op->src[1]->ne[0] > 0 && op->src[2]->ne[0] > 0) {
                 return common;
             }
             break;
@@ -1871,11 +1895,22 @@ const ggml::spacemit::tensor_traits_base * ggml_spacemit_get_tensor_traits(const
                 return common;
             break;
         case GGML_OP_MUL_MAT:
-            // F32 dense weight (not already handled above by tensor_traits)
-            if (op->src[0] && op->src[1] &&
-                op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32 &&
-                op->src[0]->nb[0] == sizeof(float) && op->src[1]->nb[0] == sizeof(float))
+            // Generic CPU dot fallback for dense or unsupported quantized
+            // layouts which do not have a repacked Spacemit trait.
+            if (op->src[0] && op->src[1] && op->src[1]->type == GGML_TYPE_F32 &&
+                ggml_get_type_traits_cpu(op->src[0]->type)->vec_dot != nullptr) {
                 return common;
+            }
+            break;
+        case GGML_OP_FLASH_ATTN_EXT:
+            if (op->src[0] && op->src[1] && op->src[2] &&
+                (op->op_params[3] == GGML_PREC_F32 || op->op_params[3] == GGML_PREC_DEFAULT) &&
+                (op->src[0]->type == GGML_TYPE_F32 || op->src[0]->type == GGML_TYPE_F16) &&
+                (op->src[1]->type == GGML_TYPE_F32 || op->src[1]->type == GGML_TYPE_F16) &&
+                (op->src[2]->type == GGML_TYPE_F32 || op->src[2]->type == GGML_TYPE_F16) &&
+                op->src[1]->ne[0] > 0 && op->src[2]->ne[0] > 0) {
+                return common;
+            }
             break;
         default:
             break;

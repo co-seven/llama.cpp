@@ -466,9 +466,14 @@ static ggml_status ggml_backend_spacemit_graph_compute(ggml_backend_t backend, g
         spert::Grid{(uint32_t)n_threads},
         [nodes, n_nodes, workspace_size = sess->workspace_size, workspace, contexts,
          shared_mem_size = spert::backend_info().shared_mem_size](spert::Context * runtime) {
-            auto shared = shared_mem_size > 0 ? runtime->alloc_shared(shared_mem_size) : spert::SharedBufferView{};
-            if (shared_mem_size > 0 && !shared) {
-                throw std::runtime_error("ggml-spacemit: failed to allocate shared memory");
+            // Match the old ggml-cpu/spacemit path: use the complete
+            // worker-local TCM buffer directly.  alloc_shared() is a
+            // dynamic sub-allocation API and is not equivalent here; it
+            // adds allocator bookkeeping and can select a different shared
+            // pool block layout than the original RVV kernels expect.
+            auto shared = shared_mem_size > 0 ? runtime->shared_buffer() : spert::SharedBufferView{};
+            if (shared_mem_size > 0 && (!shared || shared.size < shared_mem_size)) {
+                throw std::runtime_error("ggml-spacemit: worker shared buffer unavailable");
             }
 
             const uint32_t ith = runtime->program_id(0);
@@ -493,9 +498,6 @@ static ggml_status ggml_backend_spacemit_graph_compute(ggml_backend_t backend, g
                 ctx.sync();
             }
 
-            if (shared) {
-                runtime->free_shared(shared);
-            }
             ctx.clear();
         }
     );

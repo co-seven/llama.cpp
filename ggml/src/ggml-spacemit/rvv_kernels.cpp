@@ -3214,6 +3214,25 @@ void forward_cpy_strided_f32(ggml::spacemit::context & ctx, ggml_tensor * op) {
     const int64_t dr    = (ne + nth - 1) / nth;
     const int64_t i0    = dr * ith;
     const int64_t i1    = MIN(i0 + dr, ne);
+
+    // A contiguous source can be copied with the RVV memcpy primitive, but
+    // CPY is also used for state/view updates where source and destination
+    // may alias.  Only take the flat-copy path when the complete byte ranges
+    // are disjoint; otherwise retain the coordinate-aware implementation
+    // below (which is safe for exact/self-overlapping views).
+    if (ggml_is_contiguous(src0)) {
+        const uintptr_t src_begin = reinterpret_cast<uintptr_t>(src0->data);
+        const uintptr_t dst_begin = reinterpret_cast<uintptr_t>(dst->data);
+        const uintptr_t bytes     = (uintptr_t) ne * sizeof(float);
+        const bool disjoint = dst_begin >= src_begin + bytes || src_begin >= dst_begin + bytes;
+        if (disjoint) {
+            memcpy1d((char *) dst->data + i0 * sizeof(float),
+                     (const char *) src0->data + i0 * sizeof(float),
+                     (i1 - i0) * sizeof(float));
+            return;
+        }
+    }
+
     float *       dst_ptr = (float *) dst->data + i0;
 
     for (int64_t i = i0; i < i1; i++) {
