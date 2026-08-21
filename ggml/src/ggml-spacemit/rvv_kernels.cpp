@@ -3595,25 +3595,39 @@ void forward_cont_general(ggml::spacemit::context & ctx, ggml_tensor * op) {
     GGML_ASSERT(ggml_is_contiguous(dst));
     GGML_ASSERT(ggml_nelements(src0) == ggml_nelements(dst));
 
-    const int64_t ne    = ggml_nelements(src0);
     const int64_t ith   = ctx.ith;
     const int64_t nth   = ctx.nth;
-    const int64_t dr    = (ne + nth - 1) / nth;
-    const int64_t i0    = dr * ith;
-    const int64_t i1    = MIN(i0 + dr, ne);
+    const int64_t nr    = src0->ne[1] * src0->ne[2] * src0->ne[3];
+    const int64_t dr    = (nr + nth - 1) / nth;
+    const int64_t r0    = dr * ith;
+    const int64_t r1    = MIN(r0 + dr, nr);
+    const size_t row_size = (size_t) src0->ne[0] * sizeof(T);
 
-    T * dst_ptr = (T *) dst->data + i0;
+    // Match ggml-cpu's fast duplicate path: when the source row itself is
+    // contiguous, copy complete rows instead of doing per-element index math.
+    if (src0->nb[0] == sizeof(T)) {
+        for (int64_t r = r0; r < r1; ++r) {
+            const int64_t i3 = r / (src0->ne[2] * src0->ne[1]);
+            const int64_t rem = r - i3 * src0->ne[2] * src0->ne[1];
+            const int64_t i2 = rem / src0->ne[1];
+            const int64_t i1 = rem - i2 * src0->ne[1];
+            const char * src_row = (const char *) src0->data + i1 * src0->nb[1] + i2 * src0->nb[2] + i3 * src0->nb[3];
+            char * dst_row = (char *) dst->data + r * row_size;
+            memcpy(dst_row, src_row, row_size);
+        }
+        return;
+    }
 
-    for (int64_t i = i0; i < i1; i++) {
-        int64_t rem  = i;
-        const int64_t i3_ = rem / (src0->ne[0] * src0->ne[1] * src0->ne[2]); rem -= i3_ * src0->ne[0] * src0->ne[1] * src0->ne[2];
-        const int64_t i2_ = rem / (src0->ne[0] * src0->ne[1]);                rem -= i2_ * src0->ne[0] * src0->ne[1];
-        const int64_t i1_ = rem / src0->ne[0];
-        const int64_t i0_ = rem % src0->ne[0];
-        const T * src_elem = (const T *)((const char *)src0->data
-            + i0_ * src0->nb[0] + i1_ * src0->nb[1]
-            + i2_ * src0->nb[2] + i3_ * src0->nb[3]);
-        dst_ptr[i - i0] = *src_elem;
+    // Fully general strided fallback (rare for model graphs).
+    for (int64_t r = r0; r < r1; ++r) {
+        const int64_t i3 = r / (src0->ne[2] * src0->ne[1]);
+        const int64_t rem = r - i3 * src0->ne[2] * src0->ne[1];
+        const int64_t i2 = rem / src0->ne[1];
+        const int64_t i1 = rem - i2 * src0->ne[1];
+        for (int64_t i0 = 0; i0 < src0->ne[0]; ++i0) {
+            const T * src_elem = (const T *)((const char *)src0->data + i0 * src0->nb[0] + i1 * src0->nb[1] + i2 * src0->nb[2] + i3 * src0->nb[3]);
+            ((T *) dst->data)[r * src0->ne[0] + i0] = *src_elem;
+        }
     }
 }
 
