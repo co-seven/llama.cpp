@@ -8,6 +8,7 @@
 #include <cmath>
 #include <cstdint>
 #include <stdexcept>
+#include <type_traits>
 
 #if !defined(__riscv_v) || !defined(__riscv_v_intrinsic)
 #    error "riscv v extension or v_intrinsic not enabled"
@@ -3731,7 +3732,12 @@ static void forward_rope_impl(ggml::spacemit::context & ctx, ggml_tensor * op) {
     const int sec_w     = sections[0] + sections[1];
     const int sec_e     = sec_w + sections[2];
 
-    float cache[512];
+    // Keep the per-thread rotary cache in the graph workspace, matching the
+    // ggml-cpu implementation.  This avoids a large stack temporary and
+    // gives the compiler a stable, aligned cache on every invocation.
+    GGML_ASSERT(ctx.workspace_size >= (size_t) ctx.nth * (size_t) (op->ne[0] + ggml::spacemit::cache_line_size_f32) * sizeof(float));
+    float * cache = (float *) ctx.workspace +
+                    ctx.ith * (op->ne[0] + ggml::spacemit::cache_line_size_f32);
     int64_t last_i2 = -1;
 
     for (int64_t ir = ir0; ir < ir1; ++ir) {
@@ -3755,8 +3761,11 @@ static void forward_rope_impl(ggml::spacemit::context & ctx, ggml_tensor * op) {
                     } else {
                         t = theta_interp;
                     }
-                    cache[i0 + 0] = cosf(t) * mscale;
-                    cache[i0 + 1] = sinf(t) * mscale;
+                    float s, c;
+                    s = sinf(t);
+                    c = cosf(t);
+                    cache[i0 + 0] = c * mscale;
+                    cache[i0 + 1] = s * mscale;
                     theta *= theta_scale;
                 }
             } else {
@@ -3798,8 +3807,11 @@ static void forward_rope_impl(ggml::spacemit::context & ctx, ggml_tensor * op) {
                     } else {
                         t = theta_interp;
                     }
-                    cache[i0 + 0] = cosf(t) * mscale;
-                    cache[i0 + 1] = sinf(t) * mscale;
+                    float s, c;
+                    s = sinf(t);
+                    c = cosf(t);
+                    cache[i0 + 0] = c * mscale;
+                    cache[i0 + 1] = s * mscale;
 
                     theta_t *= theta_scale;
                     theta_h *= theta_scale;
@@ -3813,14 +3825,46 @@ static void forward_rope_impl(ggml::spacemit::context & ctx, ggml_tensor * op) {
         const T * src = (const T *) ((const char *) src0->data + i3 * src0->nb[3] + i2 * src0->nb[2] + i1 * src0->nb[1]);
         T * dst_row   = (T *) ((char *) op->data + i3 * op->nb[3] + i2 * op->nb[2] + i1 * op->nb[1]);
 
-        // NEOX / MROPE / IMROPE all use half-offset rotation
-        const int offset = n_dims / 2;
-        for (int i0 = 0; i0 < n_dims; i0 += 2) {
-            const int ic = i0 / 2;
-            const float x0 = (float) src[ic];
-            const float x1 = (float) src[ic + offset];
-            dst_row[ic]          = (T) (x0 * cache[i0] - x1 * cache[i0 + 1]);
-            dst_row[ic + offset] = (T) (x0 * cache[i0 + 1] + x1 * cache[i0]);
+        // NEOX / MROPE / IMROPE use half-offset rotation.  Qwen3.5 uses
+        // contiguous F32 rows here; process all pairs with RVV loads instead
+        // of the old scalar element loop.  Keep NORMAL and non-F32 layouts on
+        // the reference path because their pair mapping differs.
+        if constexpr (std::is_same_v<T, float>) {
+            if (mode == GGML_ROPE_TYPE_NEOX || mode == GGML_ROPE_TYPE_MROPE || mode == GGML_ROPE_TYPE_IMROPE) {
+                const int64_t pairs = n_dims / 2;
+                int64_t j = 0;
+                while (j < pairs) {
+                    const size_t vl = __riscv_vsetvl_e32m4((size_t) (pairs - j));
+                    const vfloat32m4_t x0 = __riscv_vle32_v_f32m4(src + j, vl);
+                    const vfloat32m4_t x1 = __riscv_vle32_v_f32m4(src + j + pairs, vl);
+                    const vfloat32m4_t c = __riscv_vlse32_v_f32m4(cache + 2*j, (ptrdiff_t) (2*sizeof(float)), vl);
+                    const vfloat32m4_t s = __riscv_vlse32_v_f32m4(cache + 2*j + 1, (ptrdiff_t) (2*sizeof(float)), vl);
+                    const vfloat32m4_t y0 = __riscv_vfsub_vv_f32m4(__riscv_vfmul_vv_f32m4(x0, c, vl),
+                                                                    __riscv_vfmul_vv_f32m4(x1, s, vl), vl);
+                    const vfloat32m4_t y1 = __riscv_vfadd_vv_f32m4(__riscv_vfmul_vv_f32m4(x0, s, vl),
+                                                                    __riscv_vfmul_vv_f32m4(x1, c, vl), vl);
+                    __riscv_vse32_v_f32m4(dst_row + j, y0, vl);
+                    __riscv_vse32_v_f32m4(dst_row + j + pairs, y1, vl);
+                    j += vl;
+                }
+            } else {
+                for (int i0 = 0; i0 < n_dims; i0 += 2) {
+                    const float x0 = src[i0];
+                    const float x1 = src[i0 + 1];
+                    dst_row[i0] = x0 * cache[i0] - x1 * cache[i0 + 1];
+                    dst_row[i0 + 1] = x0 * cache[i0 + 1] + x1 * cache[i0];
+                }
+            }
+        } else {
+            const int offset = n_dims / 2;
+            for (int i0 = 0; i0 < n_dims; i0 += 2) {
+                const int ic = (mode == GGML_ROPE_TYPE_NORMAL) ? i0 : i0 / 2;
+                const int no = (mode == GGML_ROPE_TYPE_NORMAL) ? 1 : offset;
+                const float x0 = (float) src[ic];
+                const float x1 = (float) src[ic + no];
+                dst_row[ic]          = (T) (x0 * cache[i0] - x1 * cache[i0 + 1]);
+                dst_row[ic + no] = (T) (x0 * cache[i0 + 1] + x1 * cache[i0]);
+            }
         }
         for (int64_t i0 = n_dims; i0 < op->ne[0]; ++i0) {
             dst_row[i0] = src[i0];
