@@ -583,13 +583,14 @@ static inline void rvv_qk_dot_tile(float *       dst,
                                    const float * q_row,
                                    const float * k_pack,
                                    int64_t       dk,
+                                   int64_t       kv_stride,
                                    int64_t       kv_tile,
                                    float         scale) {
     const size_t vl  = __riscv_vsetvl_e32m4(kv_tile);
     vfloat32m4_t acc = __riscv_vfmv_v_f_f32m4(0.0f, vl);
 
     for (int64_t d = 0; d < dk; ++d) {
-        const vfloat32m4_t k_vec = __riscv_vle32_v_f32m4(k_pack + d * kv_tile, vl);
+        const vfloat32m4_t k_vec = __riscv_vle32_v_f32m4(k_pack + d * kv_stride, vl);
         acc                      = __riscv_vfmacc_vf_f32m4(acc, q_row[d] * scale, k_vec, vl);
     }
 
@@ -1453,53 +1454,61 @@ void forward_flash_attn_ext_f16_tiled_vlen1024_vf16(ggml::spacemit::context & ct
 
         for (int64_t ic = 0; ic < nek1; ic += KV_TILE_SZ) {
             const int kv_tile = (int) std::min((int64_t) KV_TILE_SZ, nek1 - ic);
+            int       active_kv[Q_TILE_SZ];
+            int       max_active_kv = kv_tile;
 
             rvv_zero_f32(K_f32, DK * KV_TILE_SZ);
             rvv_zero_f32(V32, KV_TILE_SZ * DV);
 
             // skip the tile entirely if all the masks are -inf
             if (mask) {
-                bool                can_skip = true;
                 const ggml_fp16_t * mp_row =
                     (const ggml_fp16_t *) ((const char *) mask->data + iq1 * mask->nb[1] +
                                            (iq2 % mask->ne[2]) * mask->nb[2] + (iq3 % mask->ne[3]) * mask->nb[3]);
                 rvv_pack_scaled_f16_as_f32(mask32, KV_TILE_SZ * sizeof(float), mp_row + ic, mask->nb[1], tile_rows,
                                            kv_tile, slope);
 
+                max_active_kv = 0;
                 for (int tq = 0; tq < tile_rows; tq++) {
-                    for (int tk = 0; tk < kv_tile; tk++) {
-                        if (mask32[tq * KV_TILE_SZ + tk] != -INFINITY) {
-                            can_skip = false;
-                        }
+                    int tk = kv_tile;
+                    while (tk > 0 && mask32[tq * KV_TILE_SZ + tk - 1] == -INFINITY) {
+                        --tk;
                     }
-                    // Pad remaining mask entries with -inf
-                    for (int tk = kv_tile; tk < KV_TILE_SZ; tk++) {
-                        mask32[tq * KV_TILE_SZ + tk] = -INFINITY;
-                    }
+                    active_kv[tq] = tk;
+                    max_active_kv = std::max(max_active_kv, tk);
                 }
 
-                if (can_skip) {
+                if (max_active_kv == 0) {
                     continue;
                 }
+            } else {
+                std::fill_n(active_kv, tile_rows, kv_tile);
             }
 
             if (kv_type == GGML_TYPE_F16) {
                 rvv_transposed_s16_mn_to_nm((int8_t *) K_f16, KV_TILE_SZ * sizeof(_Float16),
-                                            (int8_t *) k->data + ic * nbk1 + ik2 * nbk2 + ik3 * nbk3, nbk1, kv_tile,
+                                            (int8_t *) k->data + ic * nbk1 + ik2 * nbk2 + ik3 * nbk3, nbk1,
+                                            max_active_kv,
                                             DK);
 
                 int tq = 0;
                 for (; tq + 3 < tile_rows; tq += 4) {
-                    rvv_qk_dot_tile_f16_x4(KQ + (tq + 0) * KV_TILE_SZ, KQ + (tq + 1) * KV_TILE_SZ,
-                                           KQ + (tq + 2) * KV_TILE_SZ, KQ + (tq + 3) * KV_TILE_SZ,
-                                           Q_f16 + (tq + 0) * DK, Q_f16 + (tq + 1) * DK, Q_f16 + (tq + 2) * DK,
-                                           Q_f16 + (tq + 3) * DK, K_f16, DK, kv_tile);
+                    const int group_active = std::max(std::max(active_kv[tq + 0], active_kv[tq + 1]),
+                                                      std::max(active_kv[tq + 2], active_kv[tq + 3]));
+                    if (group_active > 0) {
+                        rvv_qk_dot_tile_f16_x4(KQ + (tq + 0) * KV_TILE_SZ, KQ + (tq + 1) * KV_TILE_SZ,
+                                               KQ + (tq + 2) * KV_TILE_SZ, KQ + (tq + 3) * KV_TILE_SZ,
+                                               Q_f16 + (tq + 0) * DK, Q_f16 + (tq + 1) * DK, Q_f16 + (tq + 2) * DK,
+                                               Q_f16 + (tq + 3) * DK, K_f16, DK, group_active);
+                    }
                 }
                 for (; tq < tile_rows; ++tq) {
-                    rvv_qk_dot_tile_f16_x1(KQ + tq * KV_TILE_SZ, Q_f16 + tq * DK, K_f16, DK, kv_tile);
+                    if (active_kv[tq] > 0) {
+                        rvv_qk_dot_tile_f16_x1(KQ + tq * KV_TILE_SZ, Q_f16 + tq * DK, K_f16, DK, active_kv[tq]);
+                    }
                 }
             } else {
-                for (int tk = 0; tk < kv_tile; tk++) {
+                for (int tk = 0; tk < max_active_kv; tk++) {
                     const char *  k_data = (const char *) k->data + (ic + tk) * nbk1 + ik2 * nbk2 + ik3 * nbk3;
                     float *       k_col  = K_f32 + tk;
                     const float * k_src  = (const float *) k_data;
@@ -1509,33 +1518,32 @@ void forward_flash_attn_ext_f16_tiled_vlen1024_vf16(ggml::spacemit::context & ct
                 }
 
                 for (int tq = 0; tq < tile_rows; ++tq) {
-                    rvv_qk_dot_tile(KQ + tq * KV_TILE_SZ, Q_f32 + tq * DK, K_f32, DK, KV_TILE_SZ, scale);
-                }
-            }
-
-            // Set padded KQ entries to -inf so softmax gives them zero weight
-            if (kv_tile < KV_TILE_SZ) {
-                for (int tq = 0; tq < tile_rows; tq++) {
-                    for (int tk = kv_tile; tk < KV_TILE_SZ; tk++) {
-                        KQ[tq * KV_TILE_SZ + tk] = -INFINITY;
+                    if (active_kv[tq] > 0) {
+                        rvv_qk_dot_tile(KQ + tq * KV_TILE_SZ, Q_f32 + tq * DK, K_f32, DK, KV_TILE_SZ, active_kv[tq],
+                                       scale);
                     }
                 }
-            }
-
-            if (logit_softcap != 0.0f) {
-                rvv_softcap_tanh_inplace_f32(KQ, KV_TILE_SZ, tile_rows, KV_TILE_SZ, logit_softcap);
-            }
-
-            if (mask) {
-                rvv_add_inplace_f32(KQ, KV_TILE_SZ, mask32, KV_TILE_SZ, tile_rows, KV_TILE_SZ);
             }
 
             bool skip[Q_TILE_SZ] = {};
 
             for (int tq = 0; tq < tile_rows; tq++) {
                 float * kq_row = KQ + tq * KV_TILE_SZ;
+                const int row_active = active_kv[tq];
 
-                const float tile_max = rvv_max_f32(kq_row, KV_TILE_SZ);
+                if (row_active == 0) {
+                    skip[tq] = true;
+                    continue;
+                }
+
+                if (logit_softcap != 0.0f) {
+                    rvv_softcap_tanh_inplace_f32(kq_row, KV_TILE_SZ, 1, row_active, logit_softcap);
+                }
+                if (mask) {
+                    rvv_add_inplace_f32(kq_row, KV_TILE_SZ, mask32 + tq * KV_TILE_SZ, KV_TILE_SZ, 1, row_active);
+                }
+
+                const float tile_max = rvv_max_f32(kq_row, row_active);
 
                 if (tile_max == -INFINITY) {
                     skip[tq] = true;
@@ -1552,13 +1560,13 @@ void forward_flash_attn_ext_f16_tiled_vlen1024_vf16(ggml::spacemit::context & ct
                 }
                 M[tq] = Mnew;
 
-                S[tq] += rvv_softmax_exp_inplace_f32(kq_row, KV_TILE_SZ, Mnew);
+                S[tq] += rvv_softmax_exp_inplace_f32(kq_row, row_active, Mnew);
             }
 
             // Pack V as contiguous [KV_TILE_SZ][DV].
             if (kv_type == GGML_TYPE_F16) {
                 const char * v_data = (const char *) v->data + ic * nbv1 + iv2 * nbv2 + iv3 * nbv3;
-                memcpy2d(V_f16, DV * sizeof(_Float16), v_data, nbv1, kv_tile, DV * sizeof(_Float16));
+                memcpy2d(V_f16, DV * sizeof(_Float16), v_data, nbv1, max_active_kv, DV * sizeof(_Float16));
 
                 int tq = 0;
                 for (; tq + 3 < tile_rows; tq += 4) {
@@ -1566,29 +1574,35 @@ void forward_flash_attn_ext_f16_tiled_vlen1024_vf16(ggml::spacemit::context & ct
                         for (int i = 0; i < 4; ++i) {
                             if (!skip[tq + i]) {
                                 rvv_pv_accumulate_f16_x1(VKQ32 + (tq + i) * DV, KQ + (tq + i) * KV_TILE_SZ, V_f16,
-                                                         KV_TILE_SZ, DV);
+                                                         active_kv[tq + i], DV);
                             }
                         }
                         continue;
                     }
 
+                    const int group_active = std::max(std::max(active_kv[tq + 0], active_kv[tq + 1]),
+                                                      std::max(active_kv[tq + 2], active_kv[tq + 3]));
+                    for (int i = 0; i < 4; ++i) {
+                        std::fill(KQ + (tq + i) * KV_TILE_SZ + active_kv[tq + i],
+                                  KQ + (tq + i) * KV_TILE_SZ + group_active, 0.0f);
+                    }
                     rvv_pv_accumulate_f16_x4(VKQ32 + (tq + 0) * DV, VKQ32 + (tq + 1) * DV, VKQ32 + (tq + 2) * DV,
                                              VKQ32 + (tq + 3) * DV, KQ + (tq + 0) * KV_TILE_SZ,
                                              KQ + (tq + 1) * KV_TILE_SZ, KQ + (tq + 2) * KV_TILE_SZ,
-                                             KQ + (tq + 3) * KV_TILE_SZ, V_f16, KV_TILE_SZ, DV);
+                                             KQ + (tq + 3) * KV_TILE_SZ, V_f16, group_active, DV);
                 }
                 for (; tq < tile_rows; ++tq) {
                     if (!skip[tq]) {
-                        rvv_pv_accumulate_f16_x1(VKQ32 + tq * DV, KQ + tq * KV_TILE_SZ, V_f16, KV_TILE_SZ, DV);
+                        rvv_pv_accumulate_f16_x1(VKQ32 + tq * DV, KQ + tq * KV_TILE_SZ, V_f16, active_kv[tq], DV);
                     }
                 }
             } else {
                 const char * v_data = (const char *) v->data + ic * nbv1 + iv2 * nbv2 + iv3 * nbv3;
-                memcpy2d(V32, DV * sizeof(float), v_data, nbv1, kv_tile, DV * sizeof(float));
+                memcpy2d(V32, DV * sizeof(float), v_data, nbv1, max_active_kv, DV * sizeof(float));
 
                 for (int tq = 0; tq < tile_rows; ++tq) {
                     if (!skip[tq]) {
-                        rvv_pv_accumulate(VKQ32 + tq * DV, KQ + tq * KV_TILE_SZ, V32, KV_TILE_SZ, DV);
+                        rvv_pv_accumulate(VKQ32 + tq * DV, KQ + tq * KV_TILE_SZ, V32, active_kv[tq], DV);
                     }
                 }
             }
