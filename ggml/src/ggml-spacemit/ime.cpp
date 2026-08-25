@@ -711,17 +711,17 @@ class tensor_traits : public ggml::spacemit::tensor_traits_base {
             valid_act_count[0] = valid_act_count_t;
         }
 
-        const int64_t barrier_idx = static_cast<int64_t>(ith / 2);
-
-        GGML_ASSERT(global_spine_env_info.init_barrier != nullptr);
-        GGML_ASSERT(barrier_idx < spine_init_barrier_count);
-        spine_barrier_t * cur_barrier = &global_spine_env_info.init_barrier[barrier_idx];
-
         ctx.sync();
 
         const size_t row_stride_b      = b_k_blks * get_repacked_block_type_size<BLOC_TYPE, INTER_SIZE, NB_COLS>();
         const size_t expert_b_stride   = ne01 * row_stride_b;
         const size_t per_nb_cols_wsize = NB_COLS * row_stride_b;
+
+        const int64_t barrier_idx = static_cast<int64_t>(ith / 2);
+
+        GGML_ASSERT(global_spine_env_info.init_barrier != nullptr);
+        GGML_ASSERT(barrier_idx < spine_init_barrier_count);
+        spine_barrier_t * cur_barrier = &global_spine_env_info.init_barrier[barrier_idx];
 
         std::array<const uint8_t *, 2> src_workspaces;
         std::array<float *, 2>         dst_workspaces;
@@ -790,7 +790,6 @@ class tensor_traits : public ggml::spacemit::tensor_traits_base {
                     if (has_pair && ith % 2 != 0) {
                         spine_barrier_wait(cur_barrier);
                     }
-
                     gemm_kernel(b_blk_len, a_row, b_col, b_col_zp, c_blk + ni, 1, nb_real, b_k_blks, ne01);
 
                     if (has_pair && ith % 2 == 0) {
@@ -1304,7 +1303,7 @@ class tensor_traits_common : public ggml::spacemit::tensor_traits_base {
                 spacemit_kernels::scalar::forward_solve_tri_f32(ctx, op);
                 return true;
             case GGML_OP_GATED_DELTA_NET:
-                spacemit_kernels::scalar::forward_gated_delta_net(ctx, op);
+                spacemit_kernels::rvv::forward_gated_delta_net(ctx, op);
                 return true;
             case GGML_OP_SSM_CONV:
                 spacemit_kernels::scalar::forward_ssm_conv_f32(ctx, op);

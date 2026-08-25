@@ -65,6 +65,7 @@ void forward_cpy_with_permute(ggml::spacemit::context & ctx, ggml_tensor * op);
 template <typename T> void forward_get_rows(ggml::spacemit::context & ctx, ggml_tensor * op);
 
 template <typename T> void forward_concat(ggml::spacemit::context & ctx, ggml_tensor * op);
+void forward_gated_delta_net(ggml::spacemit::context & ctx, ggml_tensor * op);
 
 template <ggml_op op_type, typename T> void forward_binary(ggml::spacemit::context & ctx, ggml_tensor * op);
 

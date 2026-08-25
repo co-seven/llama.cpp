@@ -3172,6 +3172,152 @@ template <typename T> void forward_concat(ggml::spacemit::context & ctx, ggml_te
     }
 }
 
+struct rvv_gdn_decay_dots_f32 {
+    float state_k;
+    float state_q;
+};
+
+static inline float rvv_gdn_dot_f32(const float * x, const float * y, int64_t n) {
+    const size_t vl = __riscv_vsetvl_e32m8(n);
+    const vfloat32m8_t xv = __riscv_vle32_v_f32m8(x, vl);
+    const vfloat32m8_t yv = __riscv_vle32_v_f32m8(y, vl);
+    const vfloat32m8_t prod = __riscv_vfmul_vv_f32m8(xv, yv, vl);
+    vfloat32m1_t sum = __riscv_vfmv_v_f_f32m1(0.0f, 1);
+    sum = __riscv_vfredusum_vs_f32m8_f32m1(prod, sum, vl);
+    return __riscv_vfmv_f_s_f32m1_f32(sum);
+}
+
+static inline rvv_gdn_decay_dots_f32 rvv_gdn_decay_dots_f32_impl(float *       state,
+                                                                   const float * decay,
+                                                                   float         decay_scalar,
+                                                                   const float * k,
+                                                                   const float * q,
+                                                                   int64_t       n,
+                                                                   bool          kda) {
+    const size_t vl = __riscv_vsetvl_e32m8(n);
+    vfloat32m8_t s  = __riscv_vle32_v_f32m8(state, vl);
+    if (kda) {
+        const vfloat32m8_t d = __riscv_vle32_v_f32m8(decay, vl);
+        s = __riscv_vfmul_vv_f32m8(s, d, vl);
+    } else {
+        s = __riscv_vfmul_vf_f32m8(s, decay_scalar, vl);
+    }
+    __riscv_vse32_v_f32m8(state, s, vl);
+
+    const vfloat32m8_t kv = __riscv_vle32_v_f32m8(k, vl);
+    const vfloat32m8_t qv = __riscv_vle32_v_f32m8(q, vl);
+    vfloat32m1_t sum_k = __riscv_vfmv_v_f_f32m1(0.0f, 1);
+    vfloat32m1_t sum_q = __riscv_vfmv_v_f_f32m1(0.0f, 1);
+    sum_k = __riscv_vfredusum_vs_f32m8_f32m1(__riscv_vfmul_vv_f32m8(s, kv, vl), sum_k, vl);
+    sum_q = __riscv_vfredusum_vs_f32m8_f32m1(__riscv_vfmul_vv_f32m8(s, qv, vl), sum_q, vl);
+    return { __riscv_vfmv_f_s_f32m1_f32(sum_k), __riscv_vfmv_f_s_f32m1_f32(sum_q) };
+}
+
+static inline void rvv_gdn_update_f32(float * state, const float * k, float delta, int64_t n) {
+    const size_t vl = __riscv_vsetvl_e32m8(n);
+    vfloat32m8_t s  = __riscv_vle32_v_f32m8(state, vl);
+    const vfloat32m8_t kv = __riscv_vle32_v_f32m8(k, vl);
+    s = __riscv_vfmacc_vf_f32m8(s, delta, kv, vl);
+    __riscv_vse32_v_f32m8(state, s, vl);
+}
+
+void forward_gated_delta_net(ggml::spacemit::context & ctx, ggml_tensor * op) {
+    const ggml_tensor * src_q     = op->src[0];
+    const ggml_tensor * src_k     = op->src[1];
+    const ggml_tensor * src_v     = op->src[2];
+    const ggml_tensor * src_g     = op->src[3];
+    const ggml_tensor * src_beta  = op->src[4];
+    const ggml_tensor * src_state = op->src[5];
+
+    const int64_t S_v      = src_v->ne[0];
+    const int64_t H        = src_v->ne[1];
+    const int64_t n_tokens = src_v->ne[2];
+    const int64_t n_seqs   = src_v->ne[3];
+    const int64_t K        = ggml_get_op_params_i32(op, 0);
+    GGML_ASSERT(K >= 1 && S_v <= (int64_t) __riscv_vsetvlmax_e32m8());
+
+    const int64_t nr  = H * n_seqs;
+    const int64_t dr  = (nr + ctx.nth - 1) / ctx.nth;
+    const int64_t ir0 = dr * ctx.ith;
+    const int64_t ir1 = std::min(nr, ir0 + dr);
+
+    const int64_t state_seq_stride = src_state->nb[3] / sizeof(float);
+    const int64_t attn_score_elems = S_v * H * n_tokens * n_seqs;
+    const int64_t state_size_per_snap = S_v * S_v * H * n_seqs;
+    float *       attn_out_base  = (float *) op->data;
+    float *       state_out_base = attn_out_base + attn_score_elems;
+    const float * state_in_base  = (const float *) src_state->data;
+
+    const float scale = 1.0f / sqrtf((float) S_v);
+    const bool  kda   = src_g->ne[0] == S_v;
+    // KDA needs the per-column decay vector for every state row, so keep it
+    // separate from the row-wise delta values that are produced in-place.
+    std::vector<float> scratch((size_t) (3 * S_v + (K > 1 ? S_v * S_v : 0)));
+    float * delta      = scratch.data();
+    float * decay      = delta + S_v;
+    float * state_q     = decay + S_v;
+    float * state_work  = K > 1 ? state_q + S_v : nullptr;
+
+    const int64_t rq3 = src_v->ne[3] / src_q->ne[3];
+    const int64_t rk3 = src_v->ne[3] / src_k->ne[3];
+
+    for (int64_t ir = ir0; ir < ir1; ++ir) {
+        const int64_t iv1 = ir % H;
+        const int64_t iv3 = ir / H;
+        const int64_t iq1 = iv1 % src_q->ne[1];
+        const int64_t ik1 = iv1 % src_k->ne[1];
+        const int64_t iq3 = iv3 / rq3;
+        const int64_t ik3 = iv3 / rk3;
+
+        float * s_out = K > 1 ? state_work : state_out_base + (iv3 * H + iv1) * S_v * S_v;
+        const float * s_in = state_in_base + iv3 * state_seq_stride + iv1 * S_v * S_v;
+        memcpy(s_out, s_in, (size_t) (S_v * S_v) * sizeof(float));
+
+        float * attn_data = attn_out_base + (iv3 * n_tokens * H + iv1) * S_v;
+        for (int64_t t = 0; t < n_tokens; ++t) {
+            const float * q = (const float *) ((const char *) src_q->data + iq3 * src_q->nb[3] +
+                                                t * src_q->nb[2] + iq1 * src_q->nb[1]);
+            const float * k = (const float *) ((const char *) src_k->data + ik3 * src_k->nb[3] +
+                                                t * src_k->nb[2] + ik1 * src_k->nb[1]);
+            const float * v = (const float *) ((const char *) src_v->data + iv3 * src_v->nb[3] +
+                                                t * src_v->nb[2] + iv1 * src_v->nb[1]);
+            const float beta = *(const float *) ((const char *) src_beta->data + iv3 * src_beta->nb[3] +
+                                                  t * src_beta->nb[2] + iv1 * src_beta->nb[1]);
+            const float * g = (const float *) ((const char *) src_g->data + iv3 * src_g->nb[3] +
+                                                t * src_g->nb[2] + iv1 * src_g->nb[1]);
+
+            const float kq = rvv_gdn_dot_f32(k, q, S_v);
+
+            float decay_scalar = 0.0f;
+            if (kda) {
+                for (int64_t i = 0; i < S_v; ++i) decay[i] = expf(g[i]);
+            } else {
+                decay_scalar = expf(g[0]);
+            }
+
+            for (int64_t j = 0; j < S_v; ++j) {
+                const auto dots = rvv_gdn_decay_dots_f32_impl(s_out + j * S_v, decay, decay_scalar, k, q, S_v, kda);
+                delta[j] = (v[j] - dots.state_k) * beta;
+                state_q[j] = dots.state_q;
+            }
+            for (int64_t j = 0; j < S_v; ++j) {
+                rvv_gdn_update_f32(s_out + j * S_v, k, delta[j], S_v);
+                attn_data[j] = (state_q[j] + delta[j] * kq) * scale;
+            }
+            attn_data += S_v * H;
+
+            if (K > 1) {
+                const int64_t target_slot = n_tokens - 1 - t;
+                if (target_slot >= 0 && target_slot < K) {
+                    float * state_snapshot = state_out_base + target_slot * state_size_per_snap +
+                                             (iv3 * H + iv1) * S_v * S_v;
+                    memcpy(state_snapshot, s_out, (size_t) (S_v * S_v) * sizeof(float));
+                }
+            }
+        }
+    }
+}
+
 void forward_scale_f32(ggml::spacemit::context & ctx, ggml_tensor * op) {
     const ggml_tensor * src0 = op->src[0];
     ggml_tensor *       dst  = op;
