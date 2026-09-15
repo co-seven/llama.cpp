@@ -23,6 +23,10 @@ void smt_multi_asr_service::init(llama_model * model, const common_params & serv
     // its own sequence; generation is batched across those sequences.
     p.n_ctx = server_params.n_ctx;
     p.n_batch = std::max(1, server_params.n_batch);
+    // Propagate -t/-tb into the decoder context; otherwise the decoder's
+    // zeroed common_params falls back to GGML_DEFAULT_N_THREADS and the spert
+    // path only checks out that many tiles (cores) from the preferred set.
+    p.decoder_n_threads = server_params.cpuparams.n_threads;
 
     orchestrator_ = std::make_unique<multi_asr_orchestrator>();
     orchestrator_->init_shared(model, p);
