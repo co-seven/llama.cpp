@@ -5,6 +5,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <vector>
 
 namespace ggml::cpu::riscv64_spacemit {
 
@@ -28,6 +29,7 @@ struct spine_env_info {
     bool                   use_ime1{ false };
     spine_mem_pool_backend mem_backend{ spine_mem_pool_backend::transparent_hugepage };
     spine_barrier_t *      init_barrier{ nullptr };
+    std::vector<int>       perfer_core_ids;
 
     spine_env_info();
     ~spine_env_info();

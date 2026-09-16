@@ -4,6 +4,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <unistd.h>
 
 #include <algorithm>
 #include <mutex>
@@ -37,8 +38,9 @@
 
 using namespace ggml::cpu::riscv64_spacemit;
 
-// global_spine_env_info is initialized from spert::backend_info() and
-// GGML_SPACEMIT_WORKERS instead of parsing /proc/cpuinfo.
+// global_spine_env_info is initialized from spert::backend_info(),
+// GGML_SPACEMIT_WORKERS and SPACEMIT_PERFER_CORE_ID instead of parsing
+// /proc/cpuinfo.
 
 namespace ggml::cpu::riscv64_spacemit {
 
@@ -65,6 +67,40 @@ spine_env_info::spine_env_info() {
         num_cores = (int) info.num_cores;
         if (num_cores <= 0) num_cores = 1;
     }
+
+    // Optional core pinning: SPACEMIT_PERFER_CORE_ID lists preferred physical
+    // CC-core ids (comma-separated, same semantics as the old ggml-cpu/spacemit
+    // backend). The graph-compute stream is then bound to these cores and the
+    // worker count is capped by the pool size.
+    if (const char * perfer_str = getenv("SPACEMIT_PERFER_CORE_ID"); perfer_str && *perfer_str) {
+        const int n_cpus = (int) sysconf(_SC_NPROCESSORS_CONF);
+        std::vector<int> ids;
+        std::string       list(perfer_str);
+        size_t            start = 0;
+        while (start <= list.size()) {
+            size_t end = list.find(',', start);
+            if (end == std::string::npos) {
+                end = list.size();
+            }
+            std::string tok = list.substr(start, end - start);
+            if (!tok.empty()) {
+                int core_id = atoi(tok.c_str());
+                if (core_id < 0 || (n_cpus > 0 && core_id >= n_cpus)) {
+                    GGML_ABORT("invalid core id %d in SPACEMIT_PERFER_CORE_ID, should be between 0 and %d\n",
+                               core_id, n_cpus - 1);
+                }
+                ids.push_back(core_id);
+            }
+            start = end + 1;
+        }
+        if (!ids.empty()) {
+            perfer_core_ids = std::move(ids);
+            if (num_cores > (int) perfer_core_ids.size()) {
+                num_cores = (int) perfer_core_ids.size();
+            }
+        }
+    }
+
     vlen = info.vlen;
     mem_backend = spine_mem_pool_backend::transparent_hugepage;
     const char * mem_backend_str = getenv("SPACEMIT_MEM_BACKEND");
@@ -82,8 +118,16 @@ spine_env_info::spine_env_info() {
     init_barrier = new spine_barrier_t[spine_init_barrier_count];
     spine_barrier_init(init_barrier, spine_init_barrier_count, 2);
 
-    GGML_LOG_INFO("ggml-spacemit: num_cores=%d, arch_id=0x%x, vlen=%zu, shared_mem=%zu, use_ime1=%d, use_ime2=%d\n",
-                  num_cores, (unsigned) arch, info.vlen, info.shared_mem_size, use_ime1, use_ime2);
+    std::string core_ids_str = "auto";
+    if (!perfer_core_ids.empty()) {
+        core_ids_str.clear();
+        for (int core_id : perfer_core_ids) {
+            core_ids_str += std::to_string(core_id) + ",";
+        }
+        core_ids_str.pop_back();
+    }
+    GGML_LOG_INFO("ggml-spacemit: num_cores=%d, core_ids=%s, arch_id=0x%x, vlen=%zu, shared_mem=%zu, use_ime1=%d, use_ime2=%d\n",
+                  num_cores, core_ids_str.c_str(), (unsigned) arch, info.vlen, info.shared_mem_size, use_ime1, use_ime2);
 }
 
 spine_env_info::~spine_env_info() {
@@ -453,7 +497,14 @@ static ggml_status ggml_backend_spacemit_graph_compute(ggml_backend_t backend, g
     }
     auto * workspace = static_cast<uint8_t *>(sess->workspace);
 
-    spert::Stream stream(sess->num_cores);
+    spert::StreamConfig stream_cfg;
+    stream_cfg.n_cores = (uint32_t) sess->num_cores;
+    {
+        const auto & pool = global_spine_env_info.perfer_core_ids;
+        stream_cfg.core_ids.assign(pool.begin(),
+                                   pool.begin() + std::min<size_t>(pool.size(), stream_cfg.n_cores));
+    }
+    spert::Stream stream(stream_cfg);
     if (!stream.valid()) {
         GGML_LOG_ERROR("ggml-spacemit: failed to create spert stream\n");
         return GGML_STATUS_FAILED;
