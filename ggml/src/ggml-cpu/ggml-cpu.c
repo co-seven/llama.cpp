@@ -14,6 +14,7 @@
 #include "ops.h"
 #include "ggml.h"
 #include "common.h"
+#include "ggml-profile.h"
 
 #ifdef GGML_USE_CPU_RISCV64_SPACEMIT
 #include "spacemit/spacemit_spert_adapter.h"
@@ -3154,6 +3155,8 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
             continue;
         }
 
+        ggml_profile_log_op_begin(node, state->ith, params.nth);
+
         // TODO: move fused-op detection into ggml_graph_plan so fusion decisions are made once at planning time
         // Try fused ops, fall back to normal compute
         const int n_fused = ggml_cpu_try_fuse_ops(cgraph, node_n, &params, cplan);
@@ -3162,6 +3165,7 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
         } else {
             ggml_compute_forward(&params, node);
         }
+        ggml_profile_log_op_end(node, state->ith, params.nth);
 
         if (state->ith == 0 && cplan->abort_callback &&
                 cplan->abort_callback(cplan->abort_callback_data)) {
