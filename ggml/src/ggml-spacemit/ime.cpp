@@ -987,6 +987,19 @@ class tensor_traits_common : public ggml::spacemit::tensor_traits_base {
                     size = MAX(prefill, decode);
                 }
                 return true;
+            case GGML_OP_ROPE:
+                {
+                    // forward_rope_impl caches sin/cos per thread unless the
+                    // small-F32-NEOX legacy path (stack cache) is taken
+                    const int  mode    = ggml_get_op_params_i32(op, 2);
+                    const bool legacy  = op->src[0]->type == GGML_TYPE_F32 &&
+                                        mode == GGML_ROPE_TYPE_NEOX && op->ne[0] <= 128 &&
+                                        op->src[0]->nb[0] == sizeof(float);
+                    size = legacy ? 0
+                                  : (size_t) n_threads *
+                                        (op->ne[0] + ggml::spacemit::cache_line_size_f32) * sizeof(float);
+                }
+                return true;
             default:
                 break;
         }

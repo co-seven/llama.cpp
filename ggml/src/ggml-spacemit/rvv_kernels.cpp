@@ -3689,7 +3689,8 @@ DEFINE_UNARY_F32_RVV(forward_unary_softplus_f32,
             __riscv_vfneg_v_f32m2(__riscv_vfabs_v_f32m2(v, vl), vl), vl),
         vl))
 
-void forward_soft_max_f32(ggml::spacemit::context & ctx, ggml_tensor * op) {
+// Plain softmax (no mask, no sinks, no ALiBi) — RVV fast path
+static void forward_soft_max_plain_f32(ggml::spacemit::context & ctx, ggml_tensor * op, float scale) {
     const ggml_tensor * src0 = op->src[0];
     ggml_tensor *       dst  = op;
 
@@ -3702,8 +3703,6 @@ void forward_soft_max_f32(ggml::spacemit::context & ctx, ggml_tensor * op) {
     const int64_t task_count = ne01 * ne02 * ne03;
     const int64_t ith        = ctx.ith;
     const int64_t nth        = ctx.nth;
-
-    const float scale = ggml_get_op_params_f32(op, 0);
 
     const int64_t dr    = (task_count + nth - 1) / nth;
     const int64_t row0  = dr * ith;
@@ -3771,6 +3770,97 @@ void forward_soft_max_f32(ggml::spacemit::context & ctx, ggml_tensor * op) {
     }
 }
 
+void forward_soft_max_f32(ggml::spacemit::context & ctx, ggml_tensor * op) {
+    const ggml_tensor * src0 = op->src[0];
+    const ggml_tensor * src1 = op->src[1];  // mask (f32 or f16), optional
+    const ggml_tensor * src2 = op->src[2];  // sinks (f32 [ne2]), optional
+    ggml_tensor *       dst  = op;
+
+    GGML_ASSERT(src0->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32);
+    GGML_ASSERT(src0->nb[0] == sizeof(float) && dst->nb[0] == sizeof(float));
+
+    GGML_TENSOR_UNARY_OP_LOCALS
+
+    float scale    = 1.0f;
+    float max_bias = 0.0f;
+    memcpy(&scale,    (const float *) op->op_params + 0, sizeof(float));
+    memcpy(&max_bias, (const float *) op->op_params + 1, sizeof(float));
+
+    if (!src1 && !src2 && max_bias == 0.0f) {
+        forward_soft_max_plain_f32(ctx, op, scale);
+        return;
+    }
+
+    // mask / sinks / ALiBi path — mirrors ggml_compute_forward_soft_max_f32
+    const int64_t ith = ctx.ith;
+    const int64_t nth = ctx.nth;
+
+    const bool use_f16 = src1 && src1->type == GGML_TYPE_F16;
+    const int64_t ne12 = src1 ? src1->ne[2] : 1;
+    const int64_t ne13 = src1 ? src1->ne[3] : 1;
+
+    const uint32_t n_head      = ne02;
+    const uint32_t n_head_log2 = 1u << (uint32_t) floor(log2(n_head));
+
+    const float m0 = powf(2.0f, -(max_bias       ) / n_head_log2);
+    const float m1 = powf(2.0f, -(max_bias / 2.0f) / n_head_log2);
+
+    const float * sk = src2 ? (const float *) src2->data : nullptr;
+
+    for (int64_t i3 = 0; i3 < ne03; ++i3) {
+        for (int64_t i2 = 0; i2 < ne02; ++i2) {
+            for (int64_t i1 = ith; i1 < ne01; i1 += nth) {
+                const float * sp = (const float *) ((const char *) src0->data + i1 * nb01 + i2 * nb02 + i3 * nb03);
+                float       * dp = (float *)       ((char *) dst->data  + i1 * nb1  + i2 * nb2  + i3 * nb3);
+
+                const char * mp = nullptr;
+                if (src1) {
+                    const int64_t i12 = i2 % ne12;
+                    const int64_t i13 = i3 % ne13;
+                    mp = (const char *) src1->data + i1 * src1->nb[1] + i12 * src1->nb[2] + i13 * src1->nb[3];
+                }
+
+                const uint32_t h     = i2;
+                const float    slope = (max_bias > 0.0f)
+                    ? (h < n_head_log2 ? powf(m0, h + 1) : powf(m1, 2 * (h - n_head_log2) + 1))
+                    : 1.0f;
+
+                // pass 1: max of src*scale (+ slope*mask), corrected by the sink
+                float max_val = -INFINITY;
+                for (int64_t i0 = 0; i0 < ne00; ++i0) {
+                    float val = sp[i0] * scale;
+                    if (mp) {
+                        const float mv = use_f16
+                            ? ggml_compute_fp16_to_fp32(*(const ggml_fp16_t *) (mp + i0 * src1->nb[0]))
+                            : *(const float *) (mp + i0 * src1->nb[0]);
+                        val += slope * mv;
+                    }
+                    if (val > max_val) max_val = val;
+                }
+                if (sk && sk[i2] > max_val) max_val = sk[i2];
+
+                // pass 2: exp and normalise (double accumulation like ggml-cpu)
+                double sum = 0.0;
+                for (int64_t i0 = 0; i0 < ne00; ++i0) {
+                    float val = sp[i0] * scale;
+                    if (mp) {
+                        const float mv = use_f16
+                            ? ggml_compute_fp16_to_fp32(*(const ggml_fp16_t *) (mp + i0 * src1->nb[0]))
+                            : *(const float *) (mp + i0 * src1->nb[0]);
+                        val += slope * mv;
+                    }
+                    dp[i0] = expf(val - max_val);
+                    sum   += dp[i0];
+                }
+                if (sk) sum += expf(sk[i2] - max_val);
+
+                const float inv_sum = (sum > 0.0) ? (float) (1.0 / sum) : 0.0f;
+                for (int64_t i0 = 0; i0 < ne00; ++i0) dp[i0] *= inv_sum;
+            }
+        }
+    }
+}
+
 // F16 weight (src0[K,M]) x F32 activation (src1[K,N]) -> F32 output (dst[M,N])
 // Parallel over output rows m across ctx.nth cores.
 void forward_mul_mat_f16_f32(ggml::spacemit::context & ctx, ggml_tensor * op) {
@@ -3781,22 +3871,38 @@ void forward_mul_mat_f16_f32(ggml::spacemit::context & ctx, ggml_tensor * op) {
     GGML_ASSERT(src0->type == GGML_TYPE_F16 && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32);
     GGML_ASSERT(src0->nb[0] == sizeof(_Float16) && src1->nb[0] == sizeof(float) && dst->nb[0] == sizeof(float));
 
-    const int64_t M   = src0->ne[1];
-    const int64_t K   = src0->ne[0];
-    const int64_t N   = src1->ne[1];
-    const int64_t ith = ctx.ith;
-    const int64_t nth = ctx.nth;
+    const int64_t M    = src0->ne[1];
+    const int64_t K    = src0->ne[0];
+    const int64_t N    = src1->ne[1];
+    const int64_t ne02 = src0->ne[2];
+    const int64_t ne03 = src0->ne[3];
+    const int64_t bn2  = src1->ne[2];
+    const int64_t bn3  = src1->ne[3];
+    const int64_t ith  = ctx.ith;
+    const int64_t nth  = ctx.nth;
 
-    const int64_t dr = (M + nth - 1) / nth;
-    const int64_t m0 = ith * dr;
-    const int64_t m1 = MIN(m0 + dr, M);
+    // one work unit per (batch3, batch2, m): a-rows across all b batches
+    const int64_t nr = M * bn2 * bn3;
+    const int64_t dr = (nr + nth - 1) / nth;
+    const int64_t r0 = ith * dr;
+    const int64_t r1 = MIN(r0 + dr, nr);
 
-    for (int64_t m = m0; m < m1; ++m) {
-        const _Float16 * w_row = (const _Float16 *)((const char *)src0->data + m * src0->nb[1]);
-        float *          d_row = (float *)((char *)dst->data + m * dst->nb[1]);
+    for (int64_t r = r0; r < r1; ++r) {
+        const int64_t i3 = r / (M * bn2);
+        const int64_t i2 = (r - i3 * M * bn2) / M;
+        const int64_t m  = r - i3 * M * bn2 - i2 * M;
+        // src0 batch dims broadcast by block-stretch like ggml-cpu: i02 = i12/r2
+        const int64_t r2 = bn2 / ne02;
+        const int64_t r3 = bn3 / ne03;
+        const int64_t a2 = i2 / r2;
+        const int64_t a3 = i3 / r3;
+
+        const _Float16 * w_row = (const _Float16 *)
+            ((const char *) src0->data + a2 * src0->nb[2] + a3 * src0->nb[3] + m * src0->nb[1]);
 
         for (int64_t n = 0; n < N; ++n) {
-            const float * x_row = (const float *)((const char *)src1->data + n * src1->nb[1]);
+            const float * x_row = (const float *)
+                ((const char *) src1->data + i2 * src1->nb[2] + i3 * src1->nb[3] + n * src1->nb[1]);
 
             vfloat32m4_t     acc    = __riscv_vfmv_v_f_f32m4(0.0f, __riscv_vsetvlmax_e32m4());
             int64_t          k_left = K;
@@ -3816,7 +3922,9 @@ void forward_mul_mat_f16_f32(ggml::spacemit::context & ctx, ggml_tensor * op) {
 
             vfloat32m1_t zero = __riscv_vfmv_v_f_f32m1(0.0f, 1);
             vfloat32m1_t sum  = __riscv_vfredusum_vs_f32m4_f32m1(acc, zero, __riscv_vsetvlmax_e32m4());
-            d_row[n]          = __riscv_vfmv_f_s_f32m1_f32(sum);
+            // dst is [M, N, bn2, bn3]: row n of batch (i2, i3) holds M results
+            float * d_row = (float *) ((char *) dst->data + i2 * dst->nb[2] + i3 * dst->nb[3] + n * dst->nb[1]);
+            d_row[m]      = __riscv_vfmv_f_s_f32m1_f32(sum);
         }
     }
 }

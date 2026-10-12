@@ -212,22 +212,29 @@ void forward_tri_f32(ggml::spacemit::context & ctx, ggml_tensor * op) {
 void forward_diag_f32(ggml::spacemit::context & ctx, ggml_tensor * op) {
     const ggml_tensor * src0 = op->src[0];
     GGML_ASSERT(src0->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32);
+    GGML_ASSERT(src0->nb[0] == sizeof(float) && op->nb[0] == sizeof(float));
 
-    // src0 is 1D vector [n], dst is 2D [n,n]
+    // src0 is [n, 1, B1, B2], dst is [n, n, B1, B2]; each dst row is written whole
     const int64_t n   = src0->ne[0];
-    const int64_t dr  = (n + ctx.nth - 1) / ctx.nth;
-    const int64_t i0  = dr * ctx.ith, i1 = std::min(i0 + dr, n);
+    const int64_t ne2 = src0->ne[2];
+    const int64_t ne3 = src0->ne[3];
+    const int64_t nr  = n * ne2 * ne3;
 
-    // zero the output first (only thread 0 to avoid races)
-    if (ctx.ith == 0) {
-        memset(op->data, 0, ggml_nbytes(op));
-    }
-    ctx.sync();
+    const int64_t dr = (nr + ctx.nth - 1) / ctx.nth;
+    const int64_t j0 = dr * ctx.ith;
+    const int64_t j1 = std::min(j0 + dr, nr);
 
-    const float * src = (const float *)src0->data;
-    for (int64_t i = i0; i < i1; ++i) {
-        float * dst_row = (float *)((char *)op->data + i * op->nb[1]);
-        dst_row[i] = src[i];
+    for (int64_t j = j0; j < j1; ++j) {
+        const int64_t i3 = j / (n * ne2);
+        const int64_t i2 = (j - i3 * n * ne2) / n;
+        const int64_t i1 = j - i3 * n * ne2 - i2 * n;
+
+        const float * s = (const float *)((const char *) src0->data + i2 * src0->nb[2] + i3 * src0->nb[3]);
+        float       * d = (float *)       ((char *) op->data   + i2 * op->nb[2]    + i3 * op->nb[3]    + i1 * op->nb[1]);
+
+        for (int64_t i0 = 0; i0 < i1; ++i0) d[i0] = 0.0f;
+        d[i1] = s[i1];
+        for (int64_t i0 = i1 + 1; i0 < n; ++i0) d[i0] = 0.0f;
     }
 }
 
@@ -493,44 +500,43 @@ void forward_flash_attn_ext(ggml::spacemit::context & ctx, ggml_tensor * dst) {
 }
 
 // ── SOLVE_TRI ─────────────────────────────────────────────────────────────────
-// Forward/backward triangular solve — scalar fallback
+// Forward substitution for lower-triangular A (the only variant ggml_solve_tri
+// supports), batched over ne2/ne3, parallelised over rhs columns like ggml-cpu.
 void forward_solve_tri_f32(ggml::spacemit::context & ctx, ggml_tensor * op) {
-    // Only thread 0 executes; others skip and wait
-    if (ctx.ith != 0) return;
-
-    const ggml_tensor * src0 = op->src[0];  // triangular matrix A
-    const ggml_tensor * src1 = op->src[1];  // right-hand side B
+    const ggml_tensor * src0 = op->src[0];  // A, lower triangular [n, n, B1, B2]
+    const ggml_tensor * src1 = op->src[1];  // B, right-hand side [k, n, B1, B2]
 
     GGML_ASSERT(src0->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32);
 
-    const int upper    = ggml_get_op_params_i32(op, 0);  // 1=upper, 0=lower
-    const int transpose_A = ggml_get_op_params_i32(op, 1);
+    const int64_t k   = src1->ne[0];  // number of RHS columns
+    const int64_t n   = src1->ne[1];  // A is n×n
+    const int64_t ne2 = src0->ne[2];
+    const int64_t nr  = ne2 * src0->ne[3] * k;  // batch2 x batch3 x column work units
 
-    const int64_t n = src0->ne[0];  // matrix size
-    const int64_t nrhs = src1->ne[1];
+    const int64_t dr  = (nr + ctx.nth - 1) / ctx.nth;
+    const int64_t ir0 = dr * ctx.ith;
+    const int64_t ir1 = std::min(ir0 + dr, nr);
 
-    // copy src1 → dst first
-    memcpy(op->data, src1->data, ggml_nbytes(src1));
+    const float * A = (const float *) src0->data;
+    const float * B = (const float *) src1->data;
+    float       * X = (float *) op->data;
 
-    float * X = (float *)op->data;
-    const float * A = (const float *)src0->data;
+    for (int64_t ir = ir0; ir < ir1; ++ir) {
+        const int64_t i3  = ir / (ne2 * k);
+        const int64_t i2  = (ir - i3 * ne2 * k) / k;
+        const int64_t i01 = ir - i3 * ne2 * k - i2 * k;
 
-    // Simple triangular solve (forward substitution for lower, back for upper)
-    for (int64_t j = 0; j < nrhs; ++j) {
-        if (!upper && !transpose_A) {
-            // lower triangular, no transpose
-            for (int64_t i = 0; i < n; ++i) {
-                float s = X[j * n + i];
-                for (int64_t k = 0; k < i; ++k) s -= A[i * n + k] * X[j * n + k];
-                X[j * n + i] = s / A[i * n + i];
+        const float * A_batch = (const float *)((const char *) A + i2 * src0->nb[2] + i3 * src0->nb[3]);
+        const float * B_batch = (const float *)((const char *) B + i2 * src1->nb[2] + i3 * src1->nb[3]);
+        float       * X_batch = (float *)       ((char *) X + i2 * op->nb[2]    + i3 * op->nb[3]);
+
+        for (int64_t i0 = 0; i0 < n; ++i0) {
+            float sum = 0.0f;
+            for (int64_t t = 0; t < i0; ++t) {
+                sum += A_batch[i0 * n + t] * X_batch[t * k + i01];
             }
-        } else {
-            // upper triangular, no transpose (back substitution)
-            for (int64_t i = n - 1; i >= 0; --i) {
-                float s = X[j * n + i];
-                for (int64_t k = i + 1; k < n; ++k) s -= A[i * n + k] * X[j * n + k];
-                X[j * n + i] = s / A[i * n + i];
-            }
+            const float diag = A_batch[i0 * n + i0];
+            X_batch[i0 * k + i01] = (B_batch[i0 * k + i01] - sum) / diag;
         }
     }
 }
