@@ -29,7 +29,9 @@
 #include <cstdlib>
 #include <cstring>
 #include <stdexcept>
+#include <string>
 #include <thread>
+#include <vector>
 // clang-format off
 #if defined(__riscv)
 
@@ -103,6 +105,140 @@ template <typename BLOC_TYPE> constexpr bool block_type_has_zp() {
     } else {
         assert(false);
         return false;
+    }
+}
+
+// Graph-level fusions, decided once per graph compute by ggml_spacemit_graph_prepare()
+// and recorded in spare op_params slots of the nodes involved:
+//  - conv: concat(conv_states, transpose(qkv)) -> ssm_conv. SSM_CONV reads the two concat inputs directly
+//    and CONCAT only writes the trailing columns that are read back through views (the conv state update).
+// GGML_SPACEMIT_FUSE_CONV=0 disables it.
+static bool fuse_env_enabled(const char * name) {
+    const char * e = getenv(name);
+    return !(e && e[0] == '0');
+}
+
+// The fused RMS_NORM + MUL runs as one RVV kernel instead of the scalar generic path
+// (GGML_SPACEMIT_RVV_RMS_MUL=0 turns it off)
+static bool rvv_rms_mul_enabled() {
+    static const bool v = fuse_env_enabled("GGML_SPACEMIT_RVV_RMS_MUL");
+    return v;
+}
+
+static bool fuse_conv_enabled() {
+    static const bool enabled = fuse_env_enabled("GGML_SPACEMIT_FUSE_CONV");
+    return enabled;
+}
+
+// op_params slots (int32 index); CONCAT uses [0] (dim).
+constexpr int FUSE_P_USES  = 11;  // scratch during graph prepare
+constexpr int FUSE_P_AUX   = 14;  // scratch during graph prepare
+constexpr int FUSE_P_STATE = 15;  // CONCAT: first column to write + 1 (0 = not fused)
+
+static bool is_transposed_concat_f32(const ggml_tensor * t) {
+    if (t->op != GGML_OP_CONCAT || ggml_get_op_params_i32(t, 0) != 0) {
+        return false;
+    }
+    const ggml_tensor * s0 = t->src[0];
+    const ggml_tensor * s1 = t->src[1];
+    return t->type == GGML_TYPE_F32 && s0->type == GGML_TYPE_F32 && s1->type == GGML_TYPE_F32 &&
+           t->nb[0] == sizeof(float) && s0->nb[0] == sizeof(float) && s1->nb[1] == sizeof(float) &&
+           s1->nb[0] != sizeof(float) && s0->ne[1] == t->ne[1] && s1->ne[1] == t->ne[1] && s0->ne[2] == t->ne[2] &&
+           s1->ne[2] == t->ne[2] && t->ne[3] == 1 && !(t->flags & GGML_TENSOR_FLAG_OUTPUT);
+}
+
+// First column of concat c covered by view v, or -1 if v is not a plain window of whole rows' trailing
+// columns (same row/plane strides, starting in row 0).
+static int64_t concat_view_first_col(const ggml_tensor * c, const ggml_tensor * v) {
+    if (v->type != c->type || v->nb[0] != c->nb[0] || (v->ne[1] > 1 && v->nb[1] != c->nb[1]) ||
+        (v->ne[2] > 1 && v->nb[2] != c->nb[2]) || v->ne[3] != 1 || v->view_offs / c->nb[1] != 0) {
+        return -1;
+    }
+    const int64_t col = (int64_t) ((v->view_offs % c->nb[1]) / c->nb[0]);
+    if (col + v->ne[0] > c->ne[0] || v->ne[1] > c->ne[1] || v->ne[2] > c->ne[2]) {
+        return -1;
+    }
+    return col;
+}
+
+// Debug: GGML_SPACEMIT_RVV_OFF=ADD,MUL,... (ggml_op_name) or ALL routes those ops to the generic CPU path.
+static bool rvv_op_disabled(const ggml_tensor * op) {
+    static const std::vector<bool> off = [] {
+        std::vector<bool> v(GGML_OP_COUNT, false);
+        const char * e = getenv("GGML_SPACEMIT_RVV_OFF");
+        if (!e) {
+            return v;
+        }
+        const std::string s = std::string(",") + e + ",";
+        for (int i = 0; i < GGML_OP_COUNT; i++) {
+            const std::string name = ggml_op_name((ggml_op) i);
+            v[i] = s.find(",ALL,") != std::string::npos || s.find("," + name + ",") != std::string::npos;
+        }
+        return v;
+    }();
+    return off[op->op];
+}
+
+// Both halves of the conv fusion must run in this backend's kernels (a generic fallback would read unwritten
+// concat columns), so ops routed elsewhere by GGML_SPACEMIT_RVV_OFF are never fused.
+static void graph_prepare_fusions(ggml_cgraph * gf) {
+    const int n = ggml_graph_n_nodes(gf);
+
+    // reset; mark candidates
+    for (int i = 0; i < n; ++i) {
+        ggml_tensor * t = ggml_graph_node(gf, i);
+        if (t->op == GGML_OP_CONCAT) {
+            const bool cand = fuse_conv_enabled() && is_transposed_concat_f32(t) && !rvv_op_disabled(t) &&
+                              t->src[0]->ne[0] == 3;
+            ggml_set_op_params_i32(t, FUSE_P_STATE, cand ? -1 : 0);  // -1: candidate, still valid
+            ggml_set_op_params_i32(t, FUSE_P_AUX, (int32_t) t->ne[0]);  // min column read through views
+            ggml_set_op_params_i32(t, FUSE_P_USES, 0);                  // ssm_conv users
+        }
+    }
+
+    auto concat_view_use = [](ggml_tensor * c, const ggml_tensor * v) {
+        const int64_t col = concat_view_first_col(c, v);
+        if (col < 0) {
+            ggml_set_op_params_i32(c, FUSE_P_STATE, 0);
+        } else if (col < ggml_get_op_params_i32(c, FUSE_P_AUX)) {
+            ggml_set_op_params_i32(c, FUSE_P_AUX, (int32_t) col);
+        }
+    };
+
+    // scan all uses
+    for (int i = 0; i < n; ++i) {
+        ggml_tensor * t = ggml_graph_node(gf, i);
+        if (t->view_src && t->view_src->op == GGML_OP_CONCAT && ggml_get_op_params_i32(t->view_src, FUSE_P_STATE)) {
+            concat_view_use(t->view_src, t);
+        }
+        for (int j = 0; j < GGML_MAX_SRC; ++j) {
+            ggml_tensor * s = t->src[j];
+            if (s == nullptr) {
+                continue;
+            }
+            if (s->op == GGML_OP_CONCAT && ggml_get_op_params_i32(s, FUSE_P_STATE)) {
+                if (t->view_src == s) {
+                    // the view node itself, handled above
+                } else if (t->op == GGML_OP_SSM_CONV && j == 0 && t->src[1]->ne[0] == 4 && !rvv_op_disabled(t) &&
+                           t->src[2] == s->src[1] && t->src[3] == s->src[0]) {
+                    // the graph keeps the concat inputs alive until this node (build_ssm_conv)
+                    ggml_set_op_params_i32(s, FUSE_P_USES, ggml_get_op_params_i32(s, FUSE_P_USES) + 1);
+                } else {
+                    ggml_set_op_params_i32(s, FUSE_P_STATE, 0);
+                }
+            } else if (s->view_src && s->view_src->op == GGML_OP_CONCAT &&
+                       ggml_get_op_params_i32(s->view_src, FUSE_P_STATE)) {
+                concat_view_use(s->view_src, s);
+            }
+        }
+    }
+
+    for (int i = 0; i < n; ++i) {
+        ggml_tensor * t = ggml_graph_node(gf, i);
+        if (t->op == GGML_OP_CONCAT) {
+            const bool ok = ggml_get_op_params_i32(t, FUSE_P_STATE) == -1 && ggml_get_op_params_i32(t, FUSE_P_USES) > 0;
+            ggml_set_op_params_i32(t, FUSE_P_STATE, ok ? ggml_get_op_params_i32(t, FUSE_P_AUX) + 1 : 0);
+        }
     }
 }
 
@@ -1271,7 +1407,9 @@ class tensor_traits_common : public ggml::spacemit::tensor_traits_base {
                 return true;
             case GGML_OP_CONCAT:
                 {
-                    if (spacemit_kernels::rvv::forward_concat_dim0_transposed_f32(ctx, op, 0)) {
+                    // fused with the ssm_conv: only the trailing columns read back through views are written
+                    const int32_t fused_col = ggml_get_op_params_i32(op, FUSE_P_STATE);
+                    if (spacemit_kernels::rvv::forward_concat_dim0_transposed_f32(ctx, op, fused_col > 0 ? fused_col - 1 : 0)) {
                         return true;
                     }
                     const int32_t dim = ggml_get_op_params_i32(op, 0);
@@ -1320,6 +1458,13 @@ class tensor_traits_common : public ggml::spacemit::tensor_traits_base {
                 spacemit_kernels::rvv::forward_gated_delta_net(ctx, op);
                 return true;
             case GGML_OP_SSM_CONV:
+                if (op->src[0]->op == GGML_OP_CONCAT && ggml_get_op_params_i32(op->src[0], FUSE_P_STATE) > 0) {
+                    // the concat only materialized its trailing columns; read its inputs directly
+                    if (!spacemit_kernels::rvv::forward_ssm_conv_concat_f32(ctx, op)) {
+                        GGML_ABORT("fused ssm_conv: unsupported shape");
+                    }
+                    return true;
+                }
                 if (!spacemit_kernels::rvv::forward_ssm_conv_f32(ctx, op)) {
                     spacemit_kernels::scalar::forward_ssm_conv_f32(ctx, op);
                 }
@@ -1696,6 +1841,27 @@ size_t ggml_spacemit_nbytes(ggml_backend_buffer_type_t buft, const ggml_tensor *
     }
 
     return nbytes;
+}
+
+// Graph-level fusions (concat -> ssm_conv, MoE routing weights), decided on the host before the graph launch.
+void ggml_spacemit_graph_prepare(ggml_cgraph * cgraph) {
+    ggml::cpu::riscv64_spacemit::graph_prepare_fusions(cgraph);
+}
+
+// RMS_NORM rms followed by MUL mul (rms, weight): true if the pair can run as one fused kernel
+bool ggml_spacemit_rms_norm_mul_supported(const ggml_tensor * rms, const ggml_tensor * mul) {
+    if (!ggml::cpu::riscv64_spacemit::rvv_rms_mul_enabled() || ggml::cpu::riscv64_spacemit::rvv_op_disabled(rms) ||
+        mul->op != GGML_OP_MUL || (mul->src[0] != rms && mul->src[1] != rms)) {
+        return false;
+    }
+    const ggml_tensor * w = mul->src[0] == rms ? mul->src[1] : mul->src[0];
+    return rms->src[0]->type == GGML_TYPE_F32 && rms->src[0]->nb[0] == sizeof(float) && mul->type == GGML_TYPE_F32 &&
+           mul->nb[0] == sizeof(float) && w->type == GGML_TYPE_F32 && w->nb[0] == sizeof(float) &&
+           w->ne[0] == rms->ne[0] && ggml_are_same_shape(rms->src[0], mul);
+}
+
+void ggml_spacemit_rms_norm_mul(ggml::spacemit::context & ctx, ggml_tensor * rms, ggml_tensor * mul) {
+    spacemit_kernels::rvv::forward_rms_norm_mul_f32(ctx, rms, mul);
 }
 
 const ggml::spacemit::tensor_traits_base * ggml_spacemit_get_tensor_traits(const ggml_tensor * op) {
