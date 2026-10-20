@@ -3539,22 +3539,7 @@ static inline void rvv_gdn_update_f32(float * state, const float * k, float delt
 // Default chunk 16: everything runs at the A100's fp32 vector rate, so smaller chunks (less C^2 work) are
 // faster (Qwen3.6 pp512 GDN ms/token: chunk 8 1.23, 16 1.29, 32 1.53, 64 1.98, 128 2.74; recurrence 2.56).
 // KLD vs the recurrence is 0.004-0.005 for all chunk sizes (rounding-level for this MoE model).
-static bool gdn_chunk_enabled() {
-    static const bool enabled = [] {
-        const char * e = getenv("GGML_SPACEMIT_GDN_CHUNK");
-        return !(e && e[0] == '0');
-    }();
-    return enabled;
-}
-
-static int64_t gdn_chunk_size() {
-    static const int64_t cs = [] {
-        const char * e = getenv("GGML_SPACEMIT_GDN_CHUNK_SIZE");
-        const int    v = e ? atoi(e) : 16;
-        return (int64_t) std::min(128, std::max(8, v));
-    }();
-    return cs;
-}
+constexpr int64_t GDN_CHUNK_SIZE = 16;
 
 // C[m x n] = (C0 ? c0s * C0 : 0) + A[m x k] B[k x n]. A rows strided by lda; B, C, C0 rows contiguous
 // with leading dims ldb, ldc, ldc0; n <= vlmax(e32m4). C may alias C0 (row-wise in place).
@@ -3618,7 +3603,7 @@ struct gdn_chunk_args {
 static void gdn_chunked_head(const gdn_chunk_args & a, int64_t iq1, int64_t ik1, int64_t iv1, int64_t iq3, int64_t ik3,
                              int64_t iv3, const float * s_in, float * s_out, float * attn_data) {
     const int64_t D  = a.S_v;
-    const int64_t CS = gdn_chunk_size();
+    const int64_t CS = GDN_CHUNK_SIZE;
 
     static thread_local std::vector<float> buf;
     const size_t need = D * D + 7 * CS * D + 3 * CS * CS + 4 * CS + 64;
@@ -3750,8 +3735,8 @@ void forward_gated_delta_net(ggml::spacemit::context & ctx, ggml_tensor * op) {
     const float scale = 1.0f / sqrtf((float) S_v);
     const bool  kda   = src_g->ne[0] == S_v;
 
-    // prefill: chunkwise form (GGML_SPACEMIT_GDN_CHUNK=0 keeps the token recurrence below)
-    if (K == 1 && !kda && n_tokens >= 16 && gdn_chunk_enabled() && S_v <= (int64_t) __riscv_vsetvlmax_e32m4() &&
+    // prefill: chunkwise form (the token recurrence below handles the remaining cases)
+    if (K == 1 && !kda && n_tokens >= 16 && S_v <= (int64_t) __riscv_vsetvlmax_e32m4() &&
         src_q->type == GGML_TYPE_F32 && src_k->type == GGML_TYPE_F32 && src_v->type == GGML_TYPE_F32 &&
         src_g->type == GGML_TYPE_F32 && src_beta->type == GGML_TYPE_F32 && ggml_is_contiguous_rows(src_q) &&
         ggml_is_contiguous_rows(src_k) && ggml_is_contiguous_rows(src_v) && ggml_is_contiguous(src_g) &&

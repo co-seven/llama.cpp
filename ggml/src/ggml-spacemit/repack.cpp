@@ -6,7 +6,6 @@
 #include "ggml-common.h"
 #include "ggml-cpu.h"
 #include "ggml-impl.h"
-#include "ggml-quants.h"
 #include "ime_kernels.h"
 
 #include <algorithm>
@@ -595,7 +594,7 @@ static int repack_q4_0_to_q4_0_256_32_bl_ref(ggml_tensor *              t,
                                              int                        interleave_block,
                                              const void * GGML_RESTRICT data,
                                              size_t                     data_size) {
-    GGML_ASSERT(t->type == GGML_TYPE_Q4_0 || t->type == GGML_TYPE_Q6_K);  // Q6_K: repack_q6_k_to_q4_0_256_32
+    GGML_ASSERT(t->type == GGML_TYPE_Q4_0);
     GGML_ASSERT(interleave_block == 32);  // unused
 
     constexpr int nrows_interleaved = 32;
@@ -1741,25 +1740,6 @@ template <> int repack<block_q4_0, 256, 32>(ggml_tensor * t, const void * data, 
 #else
     //return repack_q4_0_to_q4_0_256_32_bl(t, 32, data, data_size);
 #endif
-}
-
-// Q6_K -> Q4_0 at load (lossy; same as an offline requant without imatrix): dequantize each row, quantize it with
-// the Q4_0 reference quantizer, then repack as Q4_0 256x32.
-int repack_q6_k_to_q4_0_256_32(ggml_tensor * t, const void * data, size_t data_size) {
-    GGML_ASSERT(t->type == GGML_TYPE_Q6_K);
-    GGML_ASSERT(t->ne[0] % QK_K == 0);
-    const int64_t nrows = ggml_nrows(t);
-    const int64_t nb_k  = t->ne[0] / QK_K;
-    const int64_t nb_4  = t->ne[0] / QK4_0;
-    GGML_ASSERT(data_size == (size_t) nrows * nb_k * sizeof(block_q6_K));
-
-    std::vector<block_q4_0> q4(nrows * nb_4);
-    std::vector<float>      row(t->ne[0]);
-    for (int64_t r = 0; r < nrows; r++) {
-        dequantize_row_q6_K((const block_q6_K *) data + r * nb_k, row.data(), t->ne[0]);
-        quantize_row_q4_0_ref(row.data(), q4.data() + r * nb_4, t->ne[0]);
-    }
-    return repack<block_q4_0, 256, 32>(t, q4.data(), q4.size() * sizeof(block_q4_0));
 }
 
 template <> int repack<block_q4_1, 32, 32>(ggml_tensor * t, const void * data, size_t data_size) {

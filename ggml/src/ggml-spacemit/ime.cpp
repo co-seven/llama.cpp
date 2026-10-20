@@ -1410,12 +1410,8 @@ class tensor_traits_common : public ggml::spacemit::tensor_traits_base {
         // }
 
         // decode / MTP verification (1-4 query tokens): split the KV range across threads so each K/V row is
-        // read once, then merge the partials (GGML_SPACEMIT_FA_SPLITKV=0 disables; ported from ggml-cpu/spacemit)
-        static const bool split_kv = [] {
-            const char * e = getenv("GGML_SPACEMIT_FA_SPLITKV");
-            return !(e && e[0] == '0');
-        }();
-        const int n_split = (split_kv && !use_tiled && ctx.shared.data != nullptr) ?
+        // read once, then merge the partials (ported from ggml-cpu/spacemit)
+        const int n_split = (!use_tiled && ctx.shared.data != nullptr) ?
                                 spacemit_kernels::rvv::flash_attn_ext_f16_split_kv_chunks_vlen1024_vf16(dst, nth) :
                                 0;
         if (n_split > 0) {
@@ -1476,10 +1472,8 @@ static const tensor_traits<block_q8_0, 32, 32>  q8_0_32x32_q8_0;
 static const tensor_traits<block_mxfp4, 32, 32> mxfp4_32x32_q8_0;
 static const tensor_traits<block_q5_K, 32, 32>  q5_k_32x32_q8_0;
 static const tensor_traits<block_q5_1, 32, 32>  q5_1_32x32_q8_0;
-static const tensor_traits<block_q5_0, 32, 32>  q5_0_32x32_q8_0;
 
-// Q5_0 weights converted exactly to Q8_0 at load time and run on the Q8_0 IME path (the Q5_0 IME kernel is
-// opt-in: GGML_SPACEMIT_Q5_0_IME=1)
+// Q5_0 weights converted exactly to Q8_0 at load time and run on the Q8_0 IME path
 class tensor_traits_q5_0_as_q8_0 : public tensor_traits<block_q8_0, 32, 32> {
     int repack(ggml_tensor * t, const void * data, size_t data_size) const override {
         return repack_q5_0_to_q8_0_32(t, data, data_size);
@@ -1487,15 +1481,6 @@ class tensor_traits_q5_0_as_q8_0 : public tensor_traits<block_q8_0, 32, 32> {
 };
 
 static const tensor_traits_q5_0_as_q8_0 q5_0_as_q8_0_32x32;
-
-// Q6_K lm_head (output.weight) requantized to Q4_0 at load (GGML_SPACEMIT_LM_Q4=1; lossy)
-class tensor_traits_q6_k_as_q4_0 : public tensor_traits<block_q4_0, 256, 32> {
-    int repack(ggml_tensor * t, const void * data, size_t data_size) const override {
-        return repack_q6_k_to_q4_0_256_32(t, data, data_size);
-    }
-};
-
-static const tensor_traits_q6_k_as_q4_0 q6_k_as_q4_0_32x256;
 // Impl By RVV
 static const tensor_traits_common               rvv_impl;
 
@@ -1580,14 +1565,6 @@ const ggml::spacemit::tensor_traits_base * ggml_spacemit_get_optimal_repack_type
         case GGML_TYPE_Q6_K:
             {
 #if defined(RISCV64_SPACEMIT_IME2)
-                static const bool lm_q4 = [] {
-                    const char * e = getenv("GGML_SPACEMIT_LM_Q4");
-                    return e && e[0] == '1';
-                }();
-                if (lm_q4 && strcmp(cur->name, "output.weight") == 0 && ggml_n_dims(cur) == 2 && cur->ne[1] % 32 == 0 &&
-                    cur->ne[0] % QK_K == 0 && (ggml::cpu::riscv64_spacemit::global_spine_env_info.use_ime2)) {
-                    return &ggml::cpu::riscv64_spacemit::q6_k_as_q4_0_32x256;
-                }
                 if ((ggml::cpu::riscv64_spacemit::global_spine_env_info.use_ime2)) {
                     return &ggml::cpu::riscv64_spacemit::q6_k_32x32_q8_0;
                 }
@@ -1634,22 +1611,10 @@ const ggml::spacemit::tensor_traits_base * ggml_spacemit_get_optimal_repack_type
         case GGML_TYPE_Q5_0:
             {
 #if defined(RISCV64_SPACEMIT_IME2)
-                static const bool q5_0_ime = [] {
-                    const char * e = getenv("GGML_SPACEMIT_Q5_0_IME");
-                    return e && e[0] == '1';
-                }();
-                if (q5_0_ime && cur->ne[1] % 32 == 0 && (ggml::cpu::riscv64_spacemit::global_spine_env_info.use_ime2)) {
-                    return &ggml::cpu::riscv64_spacemit::q5_0_32x32_q8_0;
-                }
-                // default: exact conversion to Q8_0 at load (GGML_SPACEMIT_Q5_0_AS_Q8=0 keeps the Q5_0 kernel)
-                static const bool q5_0_as_q8 = [] {
-                    const char * e = getenv("GGML_SPACEMIT_Q5_0_AS_Q8");
-                    return !(e && e[0] == '0');
-                }();
+                // exact conversion to Q8_0 at load time, run on the Q8_0 IME path
                 if (cur->ne[1] % 32 == 0 && cur->ne[0] % QK8_0 == 0 &&
                     (ggml::cpu::riscv64_spacemit::global_spine_env_info.use_ime2)) {
-                    return q5_0_as_q8 ? (const ggml::spacemit::tensor_traits_base *) &ggml::cpu::riscv64_spacemit::q5_0_as_q8_0_32x32
-                                      : &ggml::cpu::riscv64_spacemit::q5_0_32x32_q8_0;
+                    return &ggml::cpu::riscv64_spacemit::q5_0_as_q8_0_32x32;
                 }
 #endif
             }
@@ -1711,11 +1676,7 @@ size_t ggml_spacemit_nbytes(ggml_backend_buffer_type_t buft, const ggml_tensor *
             nbytes = remap_block_nbytes(sizeof(block_q4_K), sizeof(block_q4_1) * 8);
             break;
         case GGML_TYPE_Q6_K:
-            if (ggml_spacemit_get_optimal_repack_type(tensor) == &ggml::cpu::riscv64_spacemit::q6_k_as_q4_0_32x256) {
-                nbytes = remap_block_nbytes(sizeof(block_q6_K), sizeof(block_q4_0) * (QK_K / QK4_0));
-            } else {
-                nbytes = remap_block_nbytes(sizeof(block_q6_K), sizeof(block_q8_0) * 8, 32);
-            }
+            nbytes = remap_block_nbytes(sizeof(block_q6_K), sizeof(block_q8_0) * 8, 32);
             break;
         case GGML_TYPE_Q8_0:
             nbytes = remap_block_nbytes(sizeof(block_q8_0), sizeof(block_q8_0), 32);
