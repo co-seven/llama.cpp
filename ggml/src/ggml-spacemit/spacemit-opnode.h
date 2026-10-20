@@ -20,7 +20,8 @@ enum spacemit_op_code {
     SPACEMIT_OP_MUL_MAT_FFN,
     SPACEMIT_OP_RMS_NORM,
     SPACEMIT_OP_RMS_NORM_MUL,
-    SPACEMIT_OP_CONCAT_SSM_CONV,
+    SPACEMIT_OP_CONCAT_STATE,    // concat writing only the trailing columns (fused with a later SSM_CONV)
+    SPACEMIT_OP_SSM_CONV_CONCAT, // ssm_conv reading the concat inputs directly (the concat was partial)
     SPACEMIT_OP_ADD,
     SPACEMIT_OP_UNARY_SILU,
     SPACEMIT_OP_UNARY_GELU,

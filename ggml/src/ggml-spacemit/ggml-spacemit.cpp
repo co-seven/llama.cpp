@@ -10,6 +10,7 @@
 #include <mutex>
 #include <stdexcept>
 #include <string>
+#include <unordered_set>
 #include <vector>
 
 #define GGML_COMMON_IMPL_CPP
@@ -176,8 +177,12 @@ static spacemit_op_code op_remap_to_spacemit(const ggml_tensor * t) {
 //** op fusion helpers
 //
 // Fusion patterns, matched on the graph when the opnode list is built:
-//   1. RMS_NORM + MUL    -> SPACEMIT_OP_RMS_NORM_MUL
-//   2. CONCAT + SSM_CONV -> SPACEMIT_OP_CONCAT_SSM_CONV
+//   1. RMS_NORM + MUL    -> SPACEMIT_OP_RMS_NORM_MUL (one opnode at the rms position)
+//   2. CONCAT + SSM_CONV -> SPACEMIT_OP_CONCAT_STATE at the concat position (partial write)
+//                           + SPACEMIT_OP_SSM_CONV_CONCAT at the ssm_conv position (reads the
+//                           concat inputs directly; the concat only materialized its trailing
+//                           columns). Both halves must keep their original node positions: the
+//                           graph allocator plans buffer reuse on the node order.
 //
 // Fused opnodes are dispatched by ggml_spacemit_compute_opnode through the
 // tensor traits of their primary node (compute_forward_fused).
@@ -285,7 +290,8 @@ static bool ssm_conv_concat_fusable(const ggml_cgraph * graph, int ci,
     return true;
 }
 
-static bool try_fuse_node(const ggml_cgraph * graph, int & i, std::vector<spacemit_opnode> & nodes) {
+static bool try_fuse_node(const ggml_cgraph * graph, int & i, std::vector<spacemit_opnode> & nodes,
+                          std::unordered_set<ggml_tensor *> & ssm_direct) {
     ggml_tensor * n = graph->nodes[i];
 
     // Find the next compute node, skipping empty (NONE) nodes. test-backend-ops
@@ -313,20 +319,22 @@ static bool try_fuse_node(const ggml_cgraph * graph, int & i, std::vector<spacem
         }
     }
 
-    // Pattern 2: CONCAT + SSM_CONV. The fused opnode runs at the concat position: it writes only the
-    // concat columns that views read back (the conv state update) and computes the ssm_conv output
-    // from the concat inputs directly, before the graph's conv-state CPY overwrites them. The nodes
-    // between the concat and the ssm_conv (views and the state update CPY) keep running as single ops.
+    // Pattern 2: CONCAT + SSM_CONV. Runs as TWO opnodes at the original node positions: the
+    // concat writes only the trailing columns that views read back (the conv state update), and
+    // the ssm_conv, at its own position after the state update CPY, reads the concat inputs
+    // directly. The ssm_conv must NOT be pulled to the concat position: the graph allocator
+    // plans buffer reuse on the original node order, so writing the ssm_conv output early can
+    // overwrite tensors that are still live between the two positions (bisected on Qwen3.5 GDN,
+    // 2026-10-20: fused-at-concat corrupted both 2B and 4B on K1/K3).
     if (n->op == GGML_OP_CONCAT) {
         ggml_tensor * ssm     = nullptr;
         int           ssm_idx = -1;
         int64_t       col0    = 0;
         if (ssm_conv_concat_fusable(graph, i, &ssm, &ssm_idx, &col0)) {
-            spacemit_opnode node(n, {}, SPACEMIT_OP_CONCAT_SSM_CONV);
-            node.add_fused(ssm);
-            node.kernel_params[0] = (int32_t) col0;
-            nodes.push_back(std::move(node));
-            i = ssm_idx;  // skip past the fused SSM_CONV node
+            spacemit_opnode cat(n, {}, SPACEMIT_OP_CONCAT_STATE);
+            cat.kernel_params[0] = (int32_t) col0;
+            nodes.push_back(std::move(cat));
+            ssm_direct.insert(ssm);  // emitted as its own opnode when the loop reaches it
             return true;
         }
     }
@@ -527,6 +535,7 @@ static ggml_status ggml_backend_spacemit_graph_compute(ggml_backend_t backend, g
         sess->cached_graph.uid = graph->uid;
         sess->cached_graph.nodes.clear();
         sess->cached_graph.nodes.reserve(graph->n_nodes);
+        std::unordered_set<ggml_tensor *> ssm_direct;  // ssm_conv nodes fused with an earlier concat
         for (int i = 0; i < graph->n_nodes; ++i) {
             ggml_tensor * n = graph->nodes[i];
             if (!op_is_compute(n)) {
@@ -534,15 +543,21 @@ static ggml_status ggml_backend_spacemit_graph_compute(ggml_backend_t backend, g
             }
             // On a match, try_fuse_node pushes a fused opnode and advances i past
             // the nodes it consumed; otherwise the node is appended as a single op.
-            if (try_fuse_node(graph, i, sess->cached_graph.nodes)) {
+            if (try_fuse_node(graph, i, sess->cached_graph.nodes, ssm_direct)) {
                 continue;
             }
-            sess->cached_graph.nodes.emplace_back(n);
+            if (ssm_direct.count(n)) {
+                // the ssm_conv half of a concat fusion: read the concat inputs directly
+                // (the concat only materialized its trailing columns)
+                sess->cached_graph.nodes.emplace_back(n, std::vector<ggml_tensor *>{}, SPACEMIT_OP_SSM_CONV_CONCAT);
+            } else {
+                sess->cached_graph.nodes.emplace_back(n);
+            }
         }
 
         int n_fused = 0;
         for (const auto & node : sess->cached_graph.nodes) {
-            if (!node.fused.empty()) {
+            if (!node.fused.empty() || node.opcode != SPACEMIT_OP_INVALID) {
                 n_fused++;
             }
         }

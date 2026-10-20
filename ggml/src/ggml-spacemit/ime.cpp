@@ -1349,16 +1349,6 @@ class tensor_traits_common : public ggml::spacemit::tensor_traits_base {
                 // out = rms_norm(x) * w in one pass; node.node = RMS_NORM, node.fused[0] = MUL
                 spacemit_kernels::rvv::forward_rms_norm_mul_f32(ctx, node.node, node.fused[0]);
                 return true;
-            case SPACEMIT_OP_CONCAT_SSM_CONV:
-                // node.node = CONCAT, node.fused[0] = SSM_CONV. The concat writes only the trailing
-                // columns (kernel_params[0] = first one) that views read back for the conv state
-                // update; the ssm_conv output is computed from the concat inputs directly.
-                if (!spacemit_kernels::rvv::forward_concat_dim0_transposed_f32(ctx, node.node,
-                                                                               (int64_t) node.kernel_params[0]) ||
-                    !spacemit_kernels::rvv::forward_ssm_conv_concat_f32(ctx, node.fused[0])) {
-                    GGML_ABORT("fused concat+ssm_conv: unsupported shape");
-                }
-                return true;
             default:
                 return false;
         }
@@ -1712,6 +1702,26 @@ size_t ggml_spacemit_nbytes(ggml_backend_buffer_type_t buft, const ggml_tensor *
 }
 
 bool ggml_spacemit_compute_opnode(ggml::spacemit::context & ctx, const spacemit_opnode & node) {
+    // Single-op opnodes with a special opcode: the two halves of the concat -> ssm_conv fusion.
+    // They run at their original graph positions (see try_fuse_node); the allocator plans buffer
+    // reuse on that order, so they must not be merged into one opnode at the concat position.
+    switch (node.opcode) {
+        case SPACEMIT_OP_CONCAT_STATE:
+            // only the trailing columns read back through views (the conv state update)
+            if (!spacemit_kernels::rvv::forward_concat_dim0_transposed_f32(ctx, node.node,
+                                                                           (int64_t) node.kernel_params[0])) {
+                GGML_ABORT("fused concat state update: unsupported shape");
+            }
+            return true;
+        case SPACEMIT_OP_SSM_CONV_CONCAT:
+            // the concat only materialized its trailing columns; read its inputs directly
+            if (!spacemit_kernels::rvv::forward_ssm_conv_concat_f32(ctx, node.node)) {
+                GGML_ABORT("fused ssm_conv: unsupported shape");
+            }
+            return true;
+        default:
+            break;
+    }
     // Fused opnodes dispatch through the fused-op table; single-op opnodes keep
     // the existing traits path.
     if (!node.fused.empty()) {
