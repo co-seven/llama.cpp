@@ -51,6 +51,8 @@ ggml_add_backend_library(${TARGET_NAME}
     scalar_kernels.cpp
     repack.cpp
     spacemit-context.h
+    spacemit-fused.cpp
+    spacemit-fused.h
     spacemit-env.h
     spine_mem_pool.cpp
     ../../include/ggml-spacemit.h)

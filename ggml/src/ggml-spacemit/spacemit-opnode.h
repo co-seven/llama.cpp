@@ -4,6 +4,7 @@
 #define GGML_COMMON_IMPL_CPP
 #include "ggml-backend-impl.h"
 #include "ggml-common.h"
+#include "ggml-impl.h"
 
 #include <algorithm>
 #include <string>
@@ -19,6 +20,7 @@ enum spacemit_op_code {
     SPACEMIT_OP_MUL_MAT_FFN,
     SPACEMIT_OP_RMS_NORM,
     SPACEMIT_OP_RMS_NORM_MUL,
+    SPACEMIT_OP_CONCAT_SSM_CONV,
     SPACEMIT_OP_ADD,
     SPACEMIT_OP_UNARY_SILU,
     SPACEMIT_OP_UNARY_GELU,
@@ -170,5 +172,11 @@ struct spacemit_opnode {
         return name;
     }
 };
+
+namespace ggml::spacemit {
+struct context;
+}
+
+bool ggml_spacemit_compute_opnode(ggml::spacemit::context & ctx, const spacemit_opnode & node);
 
 #endif // SPACEMIT_OPNODE_H

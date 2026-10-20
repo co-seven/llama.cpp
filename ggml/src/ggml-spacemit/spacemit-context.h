@@ -7,6 +7,8 @@
 #include <cstddef>
 #include <cstdint>
 
+struct spacemit_opnode;  // forward declaration (defined in spacemit-opnode.h)
+
 namespace ggml::spacemit {
 
 inline constexpr size_t cache_line_size_f32 = 64 / sizeof(float);
@@ -47,6 +49,12 @@ class tensor_traits_base {
 
     virtual bool work_size(int n_threads, const ggml_tensor * op, size_t & size) const = 0;
     virtual bool compute_forward(context & ctx, ggml_tensor * op) const                 = 0;
+    // Fused multi-op dispatch, keyed on spacemit_op_code. Default is "not supported".
+    virtual bool compute_forward_fused(context & ctx, const spacemit_opnode & node) const {
+        GGML_UNUSED(ctx);
+        GGML_UNUSED(node);
+        return false;
+    }
     virtual int  repack(ggml_tensor * tensor, const void * data, size_t size) const     = 0;
 };
 
