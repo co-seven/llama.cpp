@@ -1199,6 +1199,14 @@ class tensor_traits_common : public ggml::spacemit::tensor_traits_base {
                         spacemit_kernels::rvv::forward_cpy_strided_f32(ctx, op);
                         return true;
                     }
+                    // row-contiguous F32 copy with arbitrary outer strides (GDN rollback snapshots)
+                    if (op->type == GGML_TYPE_F32 && src0->type == GGML_TYPE_F32 &&
+                        op->nb[0] == sizeof(float) && src0->nb[0] == sizeof(float) &&
+                        op->ne[0] == src0->ne[0] && op->ne[1] == src0->ne[1] &&
+                        op->ne[2] == src0->ne[2] && op->ne[3] == src0->ne[3]) {
+                        spacemit_kernels::rvv::forward_cpy_f32_row_strided(ctx, op);
+                        return true;
+                    }
                     if (ggml_is_contiguous(op) && ggml_is_contiguous(src0) &&
                         ggml_nelements(src0) == ggml_nelements(op)) {
                         if (op->type == GGML_TYPE_F16 && src0->type == GGML_TYPE_F32) {
@@ -1845,6 +1853,13 @@ const ggml::spacemit::tensor_traits_base * ggml_spacemit_get_tensor_traits(const
             }
             if (op->src[0] && op->type == GGML_TYPE_F32 && op->src[0]->type == GGML_TYPE_F32 &&
                 ggml_is_contiguous(op) && ggml_nelements(op->src[0]) == ggml_nelements(op)) {
+                return common;
+            }
+            // row-contiguous F32 copy with arbitrary outer strides (GDN rollback-snapshot copies)
+            if (op->src[0] && op->type == GGML_TYPE_F32 && op->src[0]->type == GGML_TYPE_F32 &&
+                op->nb[0] == sizeof(float) && op->src[0]->nb[0] == sizeof(float) &&
+                op->ne[0] == op->src[0]->ne[0] && op->ne[1] == op->src[0]->ne[1] &&
+                op->ne[2] == op->src[0]->ne[2] && op->ne[3] == op->src[0]->ne[3]) {
                 return common;
             }
             if (op->src[0] &&

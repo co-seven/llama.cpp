@@ -93,6 +93,9 @@ template <ggml_op op_type, typename T> void forward_binary(ggml::spacemit::conte
 
 void forward_scale_f32(ggml::spacemit::context & ctx, ggml_tensor * op);
 void forward_cpy_strided_f32(ggml::spacemit::context & ctx, ggml_tensor * op);
+// F32 -> F32 with contiguous rows (nb[0] == sizeof(float)) but arbitrary outer strides on both sides;
+// used by the GDN rollback-snapshot copies into the row-strided cache_s views
+void forward_cpy_f32_row_strided(ggml::spacemit::context & ctx, ggml_tensor * op);
 void forward_cpy_f32_to_f16(ggml::spacemit::context & ctx, ggml_tensor * op);
 void forward_cpy_f16_to_f32(ggml::spacemit::context & ctx, ggml_tensor * op);
 void forward_unary_tanh_f32(ggml::spacemit::context & ctx, ggml_tensor * op);

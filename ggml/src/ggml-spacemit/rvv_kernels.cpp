@@ -3998,6 +3998,46 @@ void forward_cpy_strided_f32(ggml::spacemit::context & ctx, ggml_tensor * op) {
     }
 }
 
+void forward_cpy_f32_row_strided(ggml::spacemit::context & ctx, ggml_tensor * op) {
+    const ggml_tensor * src0 = op->src[0];
+    ggml_tensor *       dst  = op;
+
+    GGML_ASSERT(op->type == GGML_TYPE_F32 && src0->type == GGML_TYPE_F32);
+    GGML_ASSERT(op->nb[0] == sizeof(float) && src0->nb[0] == sizeof(float));
+    GGML_ASSERT(ggml_nelements(src0) == ggml_nelements(dst));
+
+    const int64_t nc  = src0->ne[0];
+    const int64_t nr1 = src0->ne[1];
+    const int64_t nr2 = src0->ne[2];
+    const int64_t nr3 = src0->ne[3];
+    const int64_t nrows = nr1 * nr2 * nr3; // rows of nc floats
+
+    const int64_t ith = ctx.ith;
+    const int64_t nth = ctx.nth;
+
+    // rows per thread, flattened over the outer dims
+    const int64_t dr = (nrows + nth - 1) / nth;
+    const int64_t r0 = dr * ith;
+    const int64_t r1 = MIN(r0 + dr, nrows);
+    if (r0 >= r1) {
+        return;
+    }
+
+    // each row is contiguous (nb[0] == sizeof(float)); the row strides (nb[1..3]) are arbitrary on
+    // either side, e.g. the GDN rollback-snapshot copies into row-strided cache_s views
+    const size_t row_bytes = nc * sizeof(float);
+    for (int64_t r = r0; r < r1; ++r) {
+        int64_t rem = r;
+        const int64_t i3 = rem / (nr1 * nr2); rem -= i3 * nr1 * nr2;
+        const int64_t i2 = rem / nr1;
+        const int64_t i1 = rem - i2 * nr1;
+
+        const char * sp = (const char *) src0->data + i1 * src0->nb[1] + i2 * src0->nb[2] + i3 * src0->nb[3];
+        char *       dp = (char *)       dst->data + i1 * dst->nb[1]  + i2 * dst->nb[2]  + i3 * dst->nb[3];
+        memcpy1d(dp, sp, row_bytes);
+    }
+}
+
 void forward_cpy_f32_to_f16(ggml::spacemit::context & ctx, ggml_tensor * op) {
     const ggml_tensor * src0 = op->src[0];
     ggml_tensor *       dst  = op;
