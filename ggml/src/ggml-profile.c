@@ -65,8 +65,8 @@ static void ggml_profile_log_backend_op(struct ggml_tensor * t,int ith,int nth,c
         lane_event(n, "SpacemitOperator", 'E', NULL, 3, ith);
     }
 }
-void ggml_profile_log_spacemit_op_begin(struct ggml_tensor * t,int ith,int nth) { ggml_profile_log_backend_op(t,ith,nth,'B'); }
-void ggml_profile_log_spacemit_op_end(struct ggml_tensor * t,int ith,int nth) { ggml_profile_log_backend_op(t,ith,nth,'E'); }
+GGML_API void ggml_profile_log_spacemit_op_begin(struct ggml_tensor * t,int ith,int nth) { ggml_profile_log_backend_op(t,ith,nth,'B'); }
+GGML_API void ggml_profile_log_spacemit_op_end(struct ggml_tensor * t,int ith,int nth) { ggml_profile_log_backend_op(t,ith,nth,'E'); }
 void ggml_profile_init_trace_file(void) { if(!TRACE_ENABLED())return; pthread_mutex_lock(&g_trace_mutex);init_locked();pthread_mutex_unlock(&g_trace_mutex); }
 void ggml_profile_flush_tls(void) { if(!TRACE_ENABLED())return; pthread_mutex_lock(&g_trace_mutex);init_locked();flush_tls_locked();pthread_mutex_unlock(&g_trace_mutex); }
 void ggml_profile_flush_trace(void) { if(!TRACE_ENABLED())return; pthread_mutex_lock(&g_trace_mutex);if(g_trace_file){flush_tls_locked();long p=ftell(g_trace_file);if(p>=2)fseek(g_trace_file,p-2,SEEK_SET);fputs("\n]\n",g_trace_file);fclose(g_trace_file);g_trace_file=NULL;}pthread_mutex_unlock(&g_trace_mutex); }
