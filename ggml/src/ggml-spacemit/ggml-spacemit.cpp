@@ -186,6 +186,11 @@ static spacemit_op_code op_remap_to_spacemit(const ggml_tensor * t) {
 //
 // Fused opnodes are dispatched by ggml_spacemit_compute_opnode through the
 // tensor traits of their primary node (compute_forward_fused).
+//
+// try_fuse_node contains ALL fusion matching and emission: Pattern 2 consumes
+// two nodes at different positions (the concat now, the ssm_conv when the loop
+// reaches it — opnode list order is execution order, so the halves keep their
+// original node positions); `emitted` carries the pairing across the gap.
 
 // RMS_NORM followed by MUL (rms, weight) that can run as one fused RVV kernel.
 static bool rms_norm_mul_fusable(const ggml_tensor * rms, const ggml_tensor * mul) {
@@ -284,6 +289,18 @@ static bool ssm_conv_concat_fusable(const ggml_cgraph * graph, int ci,
     if (ssm == nullptr || ssm_idx <= ci) {
         return false;
     }
+
+    // The fused kernels re-check their layouts at compute time and abort on a mismatch (there is no
+    // fallback once the concat half has materialized only its trailing columns), so the gate must be
+    // a superset of forward_concat_dim0_transposed_f32 + forward_ssm_conv_concat_f32: types, element
+    // strides and the n_t / d_inner shape agreement between the concat and the ssm_conv output.
+    const ggml_tensor * w = ssm->src[1];
+    if (ssm->type != GGML_TYPE_F32 || ssm->nb[0] != sizeof(float) ||
+        w->type != GGML_TYPE_F32 || w->nb[0] != sizeof(float) ||
+        c->src[1]->ne[0] != ssm->ne[1] || c->ne[1] != ssm->ne[0]) {
+        return false;
+    }
+
     *ssm_out     = ssm;
     *ssm_idx_out = ssm_idx;
     *col0_out    = col0;
@@ -291,8 +308,16 @@ static bool ssm_conv_concat_fusable(const ggml_cgraph * graph, int ci,
 }
 
 static bool try_fuse_node(const ggml_cgraph * graph, int & i, std::vector<spacemit_opnode> & nodes,
-                          std::unordered_set<ggml_tensor *> & ssm_direct) {
+                          std::unordered_set<ggml_tensor *> & emitted) {
     ggml_tensor * n = graph->nodes[i];
+
+    // Second half of Pattern 2, arriving here: an ssm_conv paired with an earlier concat.
+    // Emitted at its own position — opnode list order is execution order, and the graph
+    // allocator planned the ssm_conv output buffer on the original node order (see Pattern 2).
+    if (emitted.count(n)) {
+        nodes.emplace_back(n, std::vector<ggml_tensor *>{}, SPACEMIT_OP_SSM_CONV_CONCAT);
+        return true;
+    }
 
     // Find the next compute node, skipping empty (NONE) nodes. test-backend-ops
     // inserts NONE sentinels between ops for out-of-bounds detection, which must
@@ -334,7 +359,9 @@ static bool try_fuse_node(const ggml_cgraph * graph, int & i, std::vector<spacem
             spacemit_opnode cat(n, {}, SPACEMIT_OP_CONCAT_STATE);
             cat.kernel_params[0] = (int32_t) col0;
             nodes.push_back(std::move(cat));
-            ssm_direct.insert(ssm);  // emitted as its own opnode when the loop reaches it
+            // the ssm_conv half is emitted by try_fuse_node when the loop reaches its own
+            // node position (see the top of this function) — never here at the concat position
+            emitted.insert(ssm);
             return true;
         }
     }
@@ -529,30 +556,24 @@ static ggml_status ggml_backend_spacemit_graph_compute(ggml_backend_t backend, g
 
     // Build (or reuse) the opnode list for this graph. The graph uid identifies a
     // stable shape-class, so the list is only rebuilt when the topology changes.
-    // try_fuse_node folds matching patterns into fused opnodes; non-matching
-    // nodes are appended as single ops.
+    // try_fuse_node folds matching patterns into fused opnodes and consumes their
+    // nodes; non-matching nodes are appended as single ops.
     if (!(graph->uid != 0 && sess->cached_graph.uid == graph->uid)) {
         sess->cached_graph.uid = graph->uid;
         sess->cached_graph.nodes.clear();
         sess->cached_graph.nodes.reserve(graph->n_nodes);
-        std::unordered_set<ggml_tensor *> ssm_direct;  // ssm_conv nodes fused with an earlier concat
+        std::unordered_set<ggml_tensor *> emitted;  // nodes already emitted by try_fuse_node
         for (int i = 0; i < graph->n_nodes; ++i) {
             ggml_tensor * n = graph->nodes[i];
             if (!op_is_compute(n)) {
                 continue;
             }
-            // On a match, try_fuse_node pushes a fused opnode and advances i past
+            // On a match, try_fuse_node pushes the fused opnodes and advances i past
             // the nodes it consumed; otherwise the node is appended as a single op.
-            if (try_fuse_node(graph, i, sess->cached_graph.nodes, ssm_direct)) {
+            if (try_fuse_node(graph, i, sess->cached_graph.nodes, emitted)) {
                 continue;
             }
-            if (ssm_direct.count(n)) {
-                // the ssm_conv half of a concat fusion: read the concat inputs directly
-                // (the concat only materialized its trailing columns)
-                sess->cached_graph.nodes.emplace_back(n, std::vector<ggml_tensor *>{}, SPACEMIT_OP_SSM_CONV_CONCAT);
-            } else {
-                sess->cached_graph.nodes.emplace_back(n);
-            }
+            sess->cached_graph.nodes.emplace_back(n);
         }
 
         int n_fused = 0;
