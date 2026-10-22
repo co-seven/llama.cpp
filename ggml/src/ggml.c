@@ -5699,13 +5699,12 @@ struct ggml_tensor * ggml_ssm_conv(
     result->op     = GGML_OP_SSM_CONV;
     result->src[0] = sx;
     result->src[1] = c;
+#ifdef GGML_USE_SPACEMIT
     if (sx->op == GGML_OP_CONCAT) {
-        // expose the concat pieces as extra srcs so the graph allocator keeps them alive
-        // until this node: a backend may then read them directly and skip materializing
-        // the concat. Backends that ignore the extra srcs are unaffected.
         result->src[2] = sx->src[1];
         result->src[3] = sx->src[0];
     }
+#endif
 
     return result;
 }
