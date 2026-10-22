@@ -2681,11 +2681,7 @@ size_t ggml_spacemit_nbytes(ggml_backend_buffer_type_t buft, const ggml_tensor *
             nbytes = remap_block_nbytes(sizeof(block_q4_K), sizeof(block_q4_1) * 8);
             break;
         case GGML_TYPE_Q6_K:
-            if (ggml_spacemit_get_optimal_repack_type(tensor) == &ggml::cpu::riscv64_spacemit::q6_k_as_q4_0_32x256) {
-                nbytes = remap_block_nbytes(sizeof(block_q6_K), sizeof(block_q4_0) * (QK_K / QK4_0));
-            } else {
-                nbytes = remap_block_nbytes(sizeof(block_q6_K), sizeof(block_q8_0) * 8, 32);
-            }
+            nbytes = remap_block_nbytes(sizeof(block_q6_K), sizeof(block_q8_0) * 8, 32);
             break;
         case GGML_TYPE_Q8_0:
             nbytes = remap_block_nbytes(sizeof(block_q8_0), sizeof(block_q8_0), 32);

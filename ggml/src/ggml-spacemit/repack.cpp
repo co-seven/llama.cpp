@@ -1869,7 +1869,6 @@ int repack_f32_to_q8_0_32(ggml_tensor * t, const void * data, size_t data_size) 
     }
     return q8_0x32_finish(t, repack_q8_0_to_q8_0_32_bl(t, 32, q8.data(), q8.size() * sizeof(block_q8_0)));
 }
-}
 
 template <> int repack<block_q8_0, 32, 32>(ggml_tensor * t, const void * data, size_t data_size) {
 #if 1

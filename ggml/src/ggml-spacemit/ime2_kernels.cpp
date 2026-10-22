@@ -4055,11 +4055,16 @@ void gemm_kernel_i8i4_hp_m8(size_t          blk_len,
               "v6", "v7", "v8", "v9", "v10", "v11", "v12", "v13", "v14", "v15", "v16", "v17", "v18", "v19", "v20",
               "v21", "v22", "v23", "v24", "v25", "v26", "v27", "v28", "v29", "v30", "v31", "memory");
 
+        // NOTE: the asm above leaves vl/vtype in an arbitrary state (vector state cannot be an asm clobber),
+        // so the acc -> C copy below must not be vectorized: a vectorized copy compiled with a different
+        // assumed vtype runs with the stale one and writes wrong-width vectors (this corrupted the first
+        // tile's output and overflowed past each row's tail for ldc in {64, 128}). Volatile loads keep the
+        // copy scalar. The m4 kernel avoids this class of bug by storing to C inside the asm.
         for (size_t r = 0; r < 8; ++r) {
             float * c_row = c_ptr + r * ldc + ni;
-            for (size_t g = 0; g < 4; ++g) {
-                memcpy(c_row + g * 8, &acc[g][r * 8], 8 * sizeof(float));
-            }
+            for (size_t g = 0; g < 4; ++g)
+                for (size_t i = 0; i < 8; ++i)
+                    c_row[g * 8 + i] = *(const volatile float *) &acc[g][r * 8 + i];
         }
     }
 }
